@@ -10,7 +10,7 @@ st.set_page_config(page_title="Terrain-Aware AGM Distance Checker", layout="cent
 st.title("🗺️ Terrain-Aware AGM Distance Checker")
 
 def get_elevation(lat, lon):
-    return 1000  # Replace with real elevation lookup as needed
+    return 1000  # Replace with actual elevation lookup
 
 def haversine_3d(p1, p2):
     R = 6371000
@@ -31,43 +31,42 @@ def extract_kml_from_kmz(file):
                 return z.read(name)
     return None
 
-def find_folder_by_name(feature, name):
-    """Recursively search for a folder by name (case-insensitive)"""
+def find_folder_by_name(feature_obj, target_name):
     matches = []
-    if hasattr(feature, 'name') and feature.name.strip().upper() == name.upper():
-        matches.append(feature)
-    if hasattr(feature, 'features'):
-        for f in list(feature.features):
-            matches.extend(find_folder_by_name(f, name))
+    if hasattr(feature_obj, 'name') and feature_obj.name and feature_obj.name.strip().upper() == target_name.upper():
+        matches.append(feature_obj)
+    if hasattr(feature_obj, 'features'):
+        for sub in feature_obj.features():
+            matches.extend(find_folder_by_name(sub, target_name))
     return matches
 
 def parse_kml(kml_bytes):
     k = kml.KML()
-    k.from_string(kml_bytes)  # use raw bytes
-    features = list(k.features())
+    k.from_string(kml_bytes)
+    top_features = list(k.features())
 
-    all_centerlines = []
-    all_agms = []
+    centerlines = []
+    agms = []
 
-    for f in features:
+    for f in top_features:
         centerline_folders = find_folder_by_name(f, "CENTERLINE")
         agm_folders = find_folder_by_name(f, "AGMs")
 
         for folder in centerline_folders:
-            for placemark in list(folder.features):
+            for placemark in folder.features():
                 if hasattr(placemark, "geometry") and isinstance(placemark.geometry, LineString):
-                    all_centerlines.append(placemark.geometry)
+                    centerlines.append(placemark.geometry)
 
         for folder in agm_folders:
-            for placemark in list(folder.features):
+            for placemark in folder.features():
                 if hasattr(placemark, "geometry") and isinstance(placemark.geometry, Point):
                     if placemark.name and placemark.name.strip().isdigit():
-                        all_agms.append((int(placemark.name.strip()), placemark.geometry))
+                        agms.append((int(placemark.name.strip()), placemark.geometry))
 
-    if not all_centerlines or not all_agms:
-        raise ValueError("No red centerline or AGMs found in correct folders.")
+    if not centerlines or not agms:
+        raise ValueError("Centerline or AGMs not found. They must be under folders named 'CENTERLINE' and 'AGMs'.")
 
-    return all_centerlines[0], sorted(all_agms, key=lambda x: x[0])
+    return centerlines[0], sorted(agms, key=lambda x: x[0])
 
 def snap_to_line(line: LineString, point: Point, num_samples=1000):
     min_dist = float('inf')
@@ -102,15 +101,15 @@ uploaded_file = st.file_uploader("📁 Upload a KMZ or KML file", type=["kmz", "
 
 if uploaded_file:
     try:
-        raw_data = uploaded_file.read()
+        file_data = uploaded_file.read()
         if uploaded_file.name.endswith(".kmz"):
-            kml_data = extract_kml_from_kmz(io.BytesIO(raw_data))
+            kml_data = extract_kml_from_kmz(io.BytesIO(file_data))
         else:
-            kml_data = raw_data
+            kml_data = file_data
 
         centerline, agms = parse_kml(kml_data)
-
         df = calculate_terrain_distances(centerline, agms)
+
         st.success("✅ Distances calculated successfully!")
         st.dataframe(df, use_container_width=True)
 
@@ -118,4 +117,3 @@ if uploaded_file:
         st.download_button("📥 Download CSV", csv, "terrain_distances.csv", "text/csv")
     except Exception as e:
         st.error(f"❌ Failed to parse KMZ/KML: {e}")
-

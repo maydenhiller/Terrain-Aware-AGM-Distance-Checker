@@ -11,9 +11,9 @@ st.title("Terrain-Aware AGM Distance Checker")
 uploaded_file = st.file_uploader("Upload a KMZ or KML file with a red centerline and numbered AGMs", type=["kmz", "kml"])
 
 def parse_kml(kml_data):
-    k = kml.KML()
+    k = KML()
     k.from_string(kml_data)
-    features = list(k.features())
+    features = list(k.features()) if callable(k.features) else k.feature
     document = features[0]
     folder = list(document.features())[0]
 

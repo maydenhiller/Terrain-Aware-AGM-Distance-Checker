@@ -6,114 +6,118 @@ import io
 import math
 import pandas as pd
 
-st.set_page_config(page_title="Terrain-Aware AGM Distance Checker", layout="centered")
-st.title("🗺️ Terrain-Aware AGM Distance Checker")
+# ✅ Reset built-in list (in case it's overwritten)
+list = __builtins__.list
 
-def get_elevation(lat, lon):
-    return 1000  # Replace with actual elevation lookup
+st.set_page_config(layout="wide")
+st.title("📏 Terrain-Aware Distance Calculator")
+st.markdown("Upload a KMZ or KML file with:")
+st.markdown("- A red centerline under the `CENTERLINE` folder (style: `#ff0000`)")
+st.markdown("- Numbered AGMs under the `AGMs` folder")
+
+uploaded_file = st.file_uploader("Upload KMZ or KML", type=["kmz", "kml"])
 
 def haversine_3d(p1, p2):
-    R = 6371000
-    lat1, lon1, ele1 = map(math.radians, [p1[0], p1[1], p1[2]])
-    lat2, lon2, ele2 = map(math.radians, [p2[0], p2[1], p2[2]])
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = math.sin(dlat / 2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    horizontal = R * c
-    vertical = ele2 - ele1
-    return math.sqrt(horizontal**2 + vertical**2)
+    R = 6371000  # Earth radius in meters
+    lat1, lon1, ele1 = p1
+    lat2, lon2, ele2 = p2
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = phi2 - phi1
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+    horiz = 2 * R * math.asin(math.sqrt(a))
+    elev_diff = ele2 - ele1
+    return math.sqrt(horiz**2 + elev_diff**2)
 
-def extract_kml_from_kmz(file):
-    with zipfile.ZipFile(file) as z:
-        for name in z.namelist():
-            if name.endswith('.kml'):
-                return z.read(name)
-    return None
-
-def find_folder_by_name(feature_obj, target_name):
-    matches = []
-    if hasattr(feature_obj, 'name') and feature_obj.name and feature_obj.name.strip().upper() == target_name.upper():
-        matches.append(feature_obj)
-    if hasattr(feature_obj, 'features'):
-        for sub in feature_obj.features():
-            matches.extend(find_folder_by_name(sub, target_name))
-    return matches
-
-def parse_kml(kml_bytes):
+def extract_centerline_and_agms(kml_data):
     k = kml.KML()
-    k.from_string(kml_bytes)
-    top_features = list(k.features())
+    k.from_string(kml_data)
+    centerline = None
+    agms = {}
 
-    centerlines = []
-    agms = []
+    def extract_from_features(features):
+        nonlocal centerline, agms
+        for f in features:
+            if hasattr(f, 'features'):
+                extract_from_features(f.features())
+            elif hasattr(f, 'geometry'):
+                if f.name and f.name.isnumeric():
+                    agms[int(f.name)] = f.geometry
+                elif isinstance(f.geometry, LineString):
+                    style = getattr(f, 'styleUrl', '')
+                    desc = getattr(f, 'description', '')
+                    if '#ff0000' in str(style) or '#ff0000' in str(desc).lower():
+                        centerline = f.geometry
 
-    for f in top_features:
-        centerline_folders = find_folder_by_name(f, "CENTERLINE")
-        agm_folders = find_folder_by_name(f, "AGMs")
+    extract_from_features(k.features())
+    return centerline, dict(sorted(agms.items()))
 
-        for folder in centerline_folders:
-            for placemark in folder.features():
-                if hasattr(placemark, "geometry") and isinstance(placemark.geometry, LineString):
-                    centerlines.append(placemark.geometry)
-
-        for folder in agm_folders:
-            for placemark in folder.features():
-                if hasattr(placemark, "geometry") and isinstance(placemark.geometry, Point):
-                    if placemark.name and placemark.name.strip().isdigit():
-                        agms.append((int(placemark.name.strip()), placemark.geometry))
-
-    if not centerlines or not agms:
-        raise ValueError("Centerline or AGMs not found. They must be under folders named 'CENTERLINE' and 'AGMs'.")
-
-    return centerlines[0], sorted(agms, key=lambda x: x[0])
-
-def snap_to_line(line: LineString, point: Point, num_samples=1000):
+def interpolate_along_line(line, point):
+    # Return the distance along the line to the closest point on the line to AGM
     min_dist = float('inf')
-    closest_point = None
-    for i in range(num_samples + 1):
-        frac = i / num_samples
-        candidate = line.interpolate(frac, normalized=True)
-        dist = point.distance(candidate)
+    min_proj = 0
+    total = 0
+    coords = list(line.coords)
+    for i in range(len(coords) - 1):
+        segment = LineString([coords[i], coords[i + 1]])
+        proj = segment.project(point)
+        dist = point.distance(segment)
         if dist < min_dist:
             min_dist = dist
-            closest_point = candidate
-    return closest_point
+            min_proj = total + proj
+        total += segment.length
+    return min_proj
 
-def calculate_terrain_distances(centerline, agms):
-    snapped = [snap_to_line(centerline, pt) for _, pt in agms]
-    with_elev = [(pt.y, pt.x, get_elevation(pt.y, pt.x)) for pt in snapped]
-
-    distances = []
-    cumulative = 0
-    for i in range(1, len(with_elev)):
-        d = haversine_3d(with_elev[i - 1], with_elev[i])
-        cumulative += d
-        distances.append({
-            "From": agms[i - 1][0],
-            "To": agms[i][0],
-            "Segment Distance (ft)": round(d * 3.28084, 2),
-            "Cumulative Distance (mi)": round(cumulative * 0.000621371, 3)
-        })
-    return pd.DataFrame(distances)
-
-uploaded_file = st.file_uploader("📁 Upload a KMZ or KML file", type=["kmz", "kml"])
+def get_elevation(lat, lon):
+    # Placeholder for elevation. You can later connect to a real elevation API.
+    return 0.0
 
 if uploaded_file:
     try:
-        file_data = uploaded_file.read()
-        if uploaded_file.name.endswith(".kmz"):
-            kml_data = extract_kml_from_kmz(io.BytesIO(file_data))
+        file_ext = uploaded_file.name.split(".")[-1].lower()
+        if file_ext == "kmz":
+            with zipfile.ZipFile(uploaded_file) as zf:
+                kml_name = [name for name in zf.namelist() if name.endswith(".kml")][0]
+                kml_data = zf.read(kml_name)
         else:
-            kml_data = file_data
+            kml_data = uploaded_file.read()
 
-        centerline, agms = parse_kml(kml_data)
-        df = calculate_terrain_distances(centerline, agms)
+        centerline, agms = extract_centerline_and_agms(kml_data)
 
-        st.success("✅ Distances calculated successfully!")
-        st.dataframe(df, use_container_width=True)
+        if centerline is None or not agms:
+            st.error("❌ Centerline or AGMs not found. They must be under folders named 'CENTERLINE' and 'AGMs'.")
+        else:
+            coords = []
+            for i in range(len(agms) - 1):
+                p1 = agms[list(agms.keys())[i]]
+                p2 = agms[list(agms.keys())[i+1]]
+                dist1 = interpolate_along_line(centerline, p1)
+                dist2 = interpolate_along_line(centerline, p2)
+                if dist2 < dist1:
+                    dist1, dist2 = dist2, dist1
+                segment = LineString(centerline.interpolate(dist1).coords[:] + centerline.interpolate(dist2).coords[:])
+                points = list(segment.coords)
+                seg_dist = 0
+                for j in range(len(points) - 1):
+                    lat1, lon1 = points[j][1], points[j][0]
+                    lat2, lon2 = points[j+1][1], points[j+1][0]
+                    ele1 = get_elevation(lat1, lon1)
+                    ele2 = get_elevation(lat2, lon2)
+                    seg_dist += haversine_3d((lat1, lon1, ele1), (lat2, lon2, ele2))
+                coords.append({
+                    "From": list(agms.keys())[i],
+                    "To": list(agms.keys())[i+1],
+                    "Segment Distance (ft)": round(seg_dist * 3.28084, 2),
+                    "Cumulative Distance (mi)": round(sum(c["Segment Distance (ft)"] for c in coords) / 5280, 2)
+                })
 
-        csv = df.to_csv(index=False).encode()
-        st.download_button("📥 Download CSV", csv, "terrain_distances.csv", "text/csv")
+            df = pd.DataFrame(coords)
+            st.success("✅ Distances calculated.")
+            st.dataframe(df)
+
+            csv = df.to_csv(index=False).encode()
+            st.download_button("📥 Download CSV", csv, file_name="terrain_distances.csv", mime="text/csv")
+
     except Exception as e:
         st.error(f"❌ Failed to parse KMZ/KML: {e}")
+

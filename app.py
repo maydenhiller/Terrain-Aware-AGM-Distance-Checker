@@ -1,20 +1,17 @@
 import streamlit as st
 from fastkml import kml
 from shapely.geometry import LineString, Point
-from zipfile import ZipFile
-import xml.etree.ElementTree as ET
+import zipfile
 import io
 import math
 import pandas as pd
-import base64
-import zipfile
+import xml.etree.ElementTree as ET
 
 st.set_page_config(page_title="Terrain-Aware AGM Distance Checker", layout="centered")
 st.title("🗺️ Terrain-Aware AGM Distance Checker")
 
-# Elevation mock (replace this with real API or offline DEM later)
 def get_elevation(lat, lon):
-    return 1000  # Dummy constant elevation
+    return 1000  # dummy elevation for now
 
 def haversine_3d(p1, p2):
     R = 6371000
@@ -59,9 +56,7 @@ def parse_kml(kml_data):
             if f.name.upper() == "CENTERLINE":
                 for subf in f.features():
                     if hasattr(subf, 'geometry') and isinstance(subf.geometry, LineString):
-                        # Check for red color
-                        if "#ff0000" in ET.tostring(ET.fromstring(subf._etree)).decode().lower():
-                            centerline = subf.geometry
+                        centerline = subf.geometry
             elif f.name.upper() == "AGMS":
                 for subf in f.features():
                     if hasattr(subf, 'geometry') and isinstance(subf.geometry, Point):
@@ -100,7 +95,6 @@ def calculate_terrain_distances(centerline, agms):
         })
     return pd.DataFrame(distances)
 
-# File Upload
 uploaded_file = st.file_uploader("📁 Upload a KMZ or KML file", type=["kmz", "kml"])
 
 if uploaded_file:
@@ -120,7 +114,6 @@ if uploaded_file:
             csv = df.to_csv(index=False).encode()
             st.download_button("📥 Download CSV", csv, "terrain_distances.csv", "text/csv")
         else:
-            st.warning("⚠️ Centerline or AGMs not found. Ensure the line is red (#ff0000) and placemark names are numeric.")
+            st.warning("⚠️ Centerline or AGMs not found. They must be under the correct folders: 'CENTERLINE' and 'AGMs'.")
     except Exception as e:
         st.error(f"❌ Failed to parse KMZ/KML: {e}")
-

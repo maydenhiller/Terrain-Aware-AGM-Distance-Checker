@@ -2,19 +2,15 @@ import streamlit as st
 import zipfile
 import os
 import tempfile
-import xml.etree.ElementTree as ET
-import simplekml
 from fastkml import kml
 import math
 import folium
 from streamlit_folium import st_folium
-import base64
-from io import BytesIO
+from xml.etree import ElementTree as ET
 
 st.set_page_config(page_title="Terrain-Aware AGM Distance Checker", layout="wide")
 st.title("🗺️ Terrain-Aware AGM Distance Checker")
 
-# Accept KMZ or KML file
 uploaded_file = st.file_uploader("Upload a KMZ or KML file with a red centerline and numbered AGMs", type=["kmz", "kml"])
 
 def extract_kml_from_kmz(kmz_file):
@@ -41,22 +37,28 @@ def parse_kml(kml_data):
 
     try:
         k = kml.KML()
-        k.from_string(kml_data)
-        doc = list(k.features())[0]
-        folder = list(doc.features())[0]
+        if isinstance(kml_data, bytes):
+            k.from_string(kml_data)
+        else:
+            k.from_string(kml_data.encode("utf-8"))
 
-        for feature in folder.features():
-            if isinstance(feature, kml.Placemark):
-                if hasattr(feature.geometry, 'coords'):  # Point
-                    name = feature.name.strip()
-                    if name.isnumeric():
-                        coord = list(feature.geometry.coords)[0]
-                        agms.append((name, coord))
-                elif feature.geometry.geom_type == 'LineString':
-                    # Check for red color
-                    if '#ff0000' in feature.description.lower():
-                        centerline = list(feature.geometry.coords)
-
+        documents = list(k.features())
+        for doc in documents:
+            folders = list(doc.features())
+            for folder in folders:
+                for feature in folder.features():
+                    if hasattr(feature, 'geometry'):
+                        if feature.geometry.geom_type == 'LineString':
+                            # Try checking red color in description or style
+                            if feature.style_url and 'ff0000' in feature.style_url.lower():
+                                centerline = list(feature.geometry.coords)
+                            elif feature.description and 'ff0000' in feature.description.lower():
+                                centerline = list(feature.geometry.coords)
+                        elif feature.geometry.geom_type == 'Point':
+                            name = feature.name.strip()
+                            if name.isnumeric():
+                                coord = list(feature.geometry.coords)[0]
+                                agms.append((name, coord))
     except Exception as e:
         st.error(f"Failed to parse KML: {e}")
         return [], []
@@ -99,13 +101,12 @@ def generate_csv(data):
         output += f"{row['From']},{row['To']},{row['Segment Distance (ft)']},{row['Cumulative Distance (mi)']}\n"
     return output
 
-# Main logic
 if uploaded_file:
-    file_ext = os.path.splitext(uploaded_file.name)[1].lower()
-    if file_ext == ".kmz":
+    ext = os.path.splitext(uploaded_file.name)[1].lower()
+    if ext == ".kmz":
         kml_raw = extract_kml_from_kmz(uploaded_file)
         if not kml_raw:
-            st.error("No KML found in the KMZ file.")
+            st.error("No KML found in KMZ.")
         else:
             centerline, agms = parse_kml(kml_raw)
     else:
@@ -119,7 +120,6 @@ if uploaded_file:
         csv_data = generate_csv(result)
         st.download_button("📥 Download Results as CSV", csv_data, file_name="terrain_distances.csv", mime="text/csv")
 
-        # Show map
         m = folium.Map(location=[agms[0][1][1], agms[0][1][0]], zoom_start=13)
         folium.PolyLine(locations=[(lat, lon) for lon, lat, *_ in centerline], color="red").add_to(m)
         for name, (lon, lat, *_ ) in agms:
@@ -127,3 +127,4 @@ if uploaded_file:
         st_folium(m, width=700, height=500)
     else:
         st.warning("Centerline or AGMs not found. Ensure the line is red (#ff0000) and placemark names are purely numeric.")
+

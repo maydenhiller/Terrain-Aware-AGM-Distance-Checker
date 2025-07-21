@@ -1,119 +1,121 @@
 import streamlit as st
+from fastkml import kml
+from shapely.geometry import LineString, Point
 import zipfile
 import io
-import xml.etree.ElementTree as ET
-from shapely.geometry import LineString, Point
-import math
+import re
+import pandas as pd
+from xml.etree import ElementTree as ET
 
-st.set_page_config(page_title="Terrain Distance Checker", layout="centered")
+st.set_page_config(page_title="Terrain-Aware AGM Distance Checker", layout="wide")
 st.title("📏 Terrain-Aware AGM Distance Checker")
+st.write("Upload a `.kmz` or `.kml` file with a red centerline (from `CENTERLINE` folder) and numbered AGM placemarks (in `AGMs` folder).")
 
-uploaded_file = st.file_uploader("Upload a KMZ or KML file with a red centerline and numbered AGMs", type=["kmz", "kml"])
-
-def extract_kml_from_kmz(kmz_file):
-    with zipfile.ZipFile(kmz_file, 'r') as z:
-        for filename in z.namelist():
-            if filename.endswith('.kml'):
-                with z.open(filename) as kmlfile:
-                    return kmlfile.read()
+def extract_kml_from_kmz(file) -> str:
+    with zipfile.ZipFile(file, 'r') as zf:
+        for name in zf.namelist():
+            if name.endswith('.kml'):
+                return zf.read(name).decode('utf-8')
     return None
 
-def parse_kml(kml_bytes):
-    try:
-        if isinstance(kml_bytes, bytes):
-            root = ET.fromstring(kml_bytes)
-        else:
-            root = ET.fromstring(kml_bytes.encode("utf-8"))
+def parse_style_map(kml_root):
+    style_map = {}
+    for style in kml_root.findall(".//{http://www.opengis.net/kml/2.2}Style"):
+        style_id = style.attrib.get('id')
+        line_style = style.find('{http://www.opengis.net/kml/2.2}LineStyle')
+        if style_id and line_style is not None:
+            color = line_style.find('{http://www.opengis.net/kml/2.2}color')
+            if color is not None:
+                style_map[f"#{style_id}"] = color.text
+    return style_map
 
-        ns = {'kml': 'http://www.opengis.net/kml/2.2'}
+def extract_geometry_from_folder(folder_elem, tag='Placemark'):
+    return folder_elem.findall(f".//{{http://www.opengis.net/kml/2.2}}{tag}")
 
-        # Collect red style ids
-        red_styles = set()
-        for style in root.findall('.//kml:Style', ns):
-            style_id = style.attrib.get('id')
-            line_color = style.find('.//kml:LineStyle/kml:color', ns)
-            if line_color is not None:
-                color_val = line_color.text.strip().lower()
-                if color_val in ['ff0000ff']:  # red in ABGR format
-                    if style_id:
-                        red_styles.add(style_id)
+def parse_kml_file(kml_str):
+    ns = {'kml': 'http://www.opengis.net/kml/2.2'}
+    root = ET.fromstring(kml_str.encode('utf-8'))
+    document = root.find('kml:Document', ns)
+    if document is None:
+        raise ValueError("KML Document not found.")
 
-        centerline = None
-        agm_points = []
+    # Parse styles
+    style_map = parse_style_map(document)
 
-        for placemark in root.findall('.//kml:Placemark', ns):
-            name = placemark.find('kml:name', ns)
-            linestr = placemark.find('.//kml:LineString', ns)
-            point = placemark.find('.//kml:Point', ns)
+    centerline = None
+    agms = []
 
-            if linestr is not None:
-                coords_text = linestr.find('kml:coordinates', ns).text.strip()
-                coords = [tuple(map(float, c.split(',')[:2])) for c in coords_text.strip().split()]
-                style_url = placemark.find('kml:styleUrl', ns)
-                style_ref = style_url.text.strip()[1:] if style_url is not None and style_url.text.startswith('#') else ''
-                if style_ref in red_styles:
-                    centerline = LineString(coords)
+    for folder in document.findall("kml:Folder", ns):
+        folder_name = folder.find("kml:name", ns)
+        if folder_name is not None and folder_name.text == "CENTERLINE":
+            for placemark in extract_geometry_from_folder(folder):
+                line = placemark.find(".//kml:LineString", ns)
+                style_url = placemark.find("kml:styleUrl", ns)
+                if line is not None and style_url is not None:
+                    style_color = style_map.get(style_url.text, "")
+                    if style_color.lower() == "ffff0000":  # red
+                        coords_text = line.find("kml:coordinates", ns).text.strip()
+                        coords = [(float(x), float(y)) for x, y, *_ in [c.split(",") for c in coords_text.split()]]
+                        centerline = LineString(coords)
+        elif folder_name is not None and folder_name.text == "AGMs":
+            for placemark in extract_geometry_from_folder(folder):
+                name_elem = placemark.find("kml:name", ns)
+                point_elem = placemark.find(".//kml:Point", ns)
+                if name_elem is not None and re.fullmatch(r"\d+", name_elem.text) and point_elem is not None:
+                    coord_text = point_elem.find("kml:coordinates", ns).text.strip()
+                    x, y, *_ = coord_text.split(",")
+                    agms.append((name_elem.text, Point(float(x), float(y))))
 
-            elif point is not None and name is not None:
-                if name.text.strip().isdigit():
-                    coords_text = point.find('kml:coordinates', ns).text.strip()
-                    lon, lat = map(float, coords_text.split(',')[:2])
-                    agm_points.append((name.text.strip(), Point(lon, lat)))
+    if centerline is None:
+        raise ValueError("No red centerline found.")
+    if not agms:
+        raise ValueError("No valid AGMs found.")
+    agms.sort(key=lambda a: a[0])  # Sort by name like "000", "010", etc.
+    return centerline, agms
 
-        if not centerline:
-            raise ValueError("No red centerline found.")
-        if not agm_points:
-            raise ValueError("No AGMs with numeric names found.")
+def project_points_to_line(line, points):
+    projected = []
+    for label, pt in points:
+        dist = line.project(pt)
+        projected.append((dist, label, pt))
+    projected.sort()
+    return [(label, pt) for _, label, pt in projected]
 
-        agm_points.sort(key=lambda x: int(x[0]))
-        return centerline, agm_points
+def compute_distances(centerline, agms):
+    projected = project_points_to_line(centerline, agms)
+    distances = []
+    cumulative = 0.0
 
-    except Exception as e:
-        raise ValueError(f"Failed to parse KMZ/KML: {e}")
+    for i in range(len(projected) - 1):
+        pt1 = projected[i][1]
+        pt2 = projected[i + 1][1]
+        seg_line = centerline.interpolate(centerline.project(pt1)), centerline.interpolate(centerline.project(pt2))
+        segment_distance = seg_line[0].distance(seg_line[1]) * 364000  # rough conversion degrees to feet
+        cumulative += segment_distance
+        distances.append({
+            "From": projected[i][0],
+            "To": projected[i + 1][0],
+            "Segment_Distance_ft": round(segment_distance, 2),
+            "Cumulative_Distance_ft": round(cumulative, 2),
+            "Cumulative_Distance_mi": round(cumulative / 5280, 4)
+        })
+    return pd.DataFrame(distances)
 
-def haversine(p1, p2):
-    lon1, lat1 = p1.x, p1.y
-    lon2, lat2 = p2.x, p2.y
-    R = 6371000  # meters
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda/2)**2
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+uploaded_file = st.file_uploader("Upload KMZ or KML", type=["kmz", "kml"])
 
 if uploaded_file:
     try:
-        if uploaded_file.name.endswith('.kmz'):
-            kml_data = extract_kml_from_kmz(uploaded_file)
+        if uploaded_file.name.endswith(".kmz"):
+            kml_str = extract_kml_from_kmz(uploaded_file)
         else:
-            kml_data = uploaded_file.read()
+            kml_str = uploaded_file.read().decode("utf-8")
 
-        centerline, agms = parse_kml(kml_data)
+        centerline, agms = parse_kml_file(kml_str)
+        df = compute_distances(centerline, agms)
+        st.success("✅ Distance calculation complete.")
+        st.dataframe(df)
 
-        st.success("✅ Centerline and AGMs loaded.")
-
-        rows = []
-        total = 0
-        for i in range(1, len(agms)):
-            prev_name, prev_point = agms[i - 1]
-            curr_name, curr_point = agms[i]
-            dist = haversine(prev_point, curr_point)
-            total += dist
-            rows.append({
-                "From": prev_name,
-                "To": curr_name,
-                "Segment (ft)": round(dist * 3.28084, 1),
-                "Cumulative (mi)": round(total * 0.000621371, 3)
-            })
-
-        st.write("### 📄 Distance Table")
-        st.dataframe(rows)
-
-        csv = "From,To,Segment (ft),Cumulative (mi)\n" + "\n".join(
-            f"{r['From']},{r['To']},{r['Segment (ft)']},{r['Cumulative (mi)']}" for r in rows
-        )
-        st.download_button("📥 Download CSV", csv.encode(), "AGM_Distances.csv", "text/csv")
-
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button("📥 Download CSV", data=csv, file_name="Terrain_Distances.csv", mime="text/csv")
     except Exception as e:
-        st.error(f"⚠️ {str(e)}")
+        st.error(f"⚠️ Failed to parse KMZ/KML: {e}")

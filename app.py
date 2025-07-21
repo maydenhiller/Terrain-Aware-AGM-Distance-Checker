@@ -10,10 +10,10 @@ st.set_page_config(page_title="Terrain-Aware AGM Distance Checker", layout="cent
 st.title("🗺️ Terrain-Aware AGM Distance Checker")
 
 def get_elevation(lat, lon):
-    return 1000  # stub elevation — replace with real if needed
+    return 1000  # Stub: Replace with real elevation data if needed
 
 def haversine_3d(p1, p2):
-    R = 6371000
+    R = 6371000  # Radius of Earth in meters
     lat1, lon1, ele1 = map(math.radians, [p1[0], p1[1], p1[2]])
     lat2, lon2, ele2 = map(math.radians, [p2[0], p2[1], p2[2]])
     dlat = lat2 - lat1
@@ -33,29 +33,30 @@ def extract_kml_from_kmz(file):
 
 def parse_kml(kml_bytes):
     k = kml.KML()
-    k.from_string(kml_bytes)  # Pass raw bytes directly
+    k.from_string(kml_bytes)  # Don't decode to string
     ns = '{http://www.opengis.net/kml/2.2}'
 
-    def extract_features(container):
+    def extract_features(obj):
         all_features = []
-        for f in container.features():
-            all_features.append(f)
-            if hasattr(f, 'features'):
+        if hasattr(obj, 'features'):
+            for f in list(obj.features):
+                all_features.append(f)
                 all_features.extend(extract_features(f))
         return all_features
 
-    features = extract_features(k)
+    all_features = extract_features(k)
+
     centerline = None
     agms = []
 
-    for f in features:
+    for f in all_features:
         if hasattr(f, 'name'):
-            if f.name.upper() == "CENTERLINE":
-                for subf in f.features():
+            if f.name and f.name.strip().upper() == "CENTERLINE":
+                for subf in list(f.features):
                     if hasattr(subf, 'geometry') and isinstance(subf.geometry, LineString):
                         centerline = subf.geometry
-            elif f.name.upper() == "AGMS":
-                for subf in f.features():
+            elif f.name and f.name.strip().upper() == "AGMS":
+                for subf in list(f.features):
                     if hasattr(subf, 'geometry') and isinstance(subf.geometry, Point):
                         if subf.name and subf.name.strip().isdigit():
                             agms.append((int(subf.name.strip()), subf.geometry))

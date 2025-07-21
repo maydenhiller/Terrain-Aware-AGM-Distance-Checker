@@ -27,41 +27,46 @@ def parse_kml(kml_bytes):
 
         ns = {'kml': 'http://www.opengis.net/kml/2.2'}
 
+        # Collect red style ids
         red_styles = set()
         for style in root.findall('.//kml:Style', ns):
+            style_id = style.attrib.get('id')
             line_color = style.find('.//kml:LineStyle/kml:color', ns)
-            if line_color is not None and line_color.text.strip().lower() == 'ff0000ff':  # ABGR red
-                red_styles.add(style.attrib.get('id'))
+            if line_color is not None:
+                color_val = line_color.text.strip().lower()
+                if color_val in ['ff0000ff']:  # red in ABGR format
+                    if style_id:
+                        red_styles.add(style_id)
 
-        line = None
+        centerline = None
         agm_points = []
 
         for placemark in root.findall('.//kml:Placemark', ns):
             name = placemark.find('kml:name', ns)
-            line_str = placemark.find('.//kml:LineString', ns)
+            linestr = placemark.find('.//kml:LineString', ns)
             point = placemark.find('.//kml:Point', ns)
 
-            if line_str is not None:
-                # Check if red line
+            if linestr is not None:
+                coords_text = linestr.find('kml:coordinates', ns).text.strip()
+                coords = [tuple(map(float, c.split(',')[:2])) for c in coords_text.strip().split()]
                 style_url = placemark.find('kml:styleUrl', ns)
-                if style_url is not None and style_url.text.startswith('#'):
-                    style_id = style_url.text[1:]
-                    if style_id in red_styles:
-                        coords_text = line_str.find('kml:coordinates', ns).text.strip()
-                        coords = [tuple(map(float, c.strip().split(',')[:2])) for c in coords_text.split()]
-                        line = LineString(coords)
+                style_ref = style_url.text.strip()[1:] if style_url is not None and style_url.text.startswith('#') else ''
+                if style_ref in red_styles:
+                    centerline = LineString(coords)
 
             elif point is not None and name is not None:
-                if name.text.isdigit():
+                if name.text.strip().isdigit():
                     coords_text = point.find('kml:coordinates', ns).text.strip()
                     lon, lat = map(float, coords_text.split(',')[:2])
-                    agm_points.append((name.text, Point(lon, lat)))
+                    agm_points.append((name.text.strip(), Point(lon, lat)))
 
-        if not line or not agm_points:
-            raise ValueError("Centerline or AGMs not found.")
+        if not centerline:
+            raise ValueError("No red centerline found.")
+        if not agm_points:
+            raise ValueError("No AGMs with numeric names found.")
 
         agm_points.sort(key=lambda x: int(x[0]))
-        return line, agm_points
+        return centerline, agm_points
 
     except Exception as e:
         raise ValueError(f"Failed to parse KMZ/KML: {e}")
@@ -69,7 +74,7 @@ def parse_kml(kml_bytes):
 def haversine(p1, p2):
     lon1, lat1 = p1.x, p1.y
     lon2, lat2 = p2.x, p2.y
-    R = 6371000  # Earth radius in meters
+    R = 6371000  # meters
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
@@ -79,14 +84,14 @@ def haversine(p1, p2):
 
 if uploaded_file:
     try:
-        if uploaded_file.name.endswith(".kmz"):
+        if uploaded_file.name.endswith('.kmz'):
             kml_data = extract_kml_from_kmz(uploaded_file)
         else:
             kml_data = uploaded_file.read()
 
         centerline, agms = parse_kml(kml_data)
 
-        st.success("✅ Centerline and AGMs loaded successfully.")
+        st.success("✅ Centerline and AGMs loaded.")
 
         rows = []
         total = 0
@@ -108,7 +113,6 @@ if uploaded_file:
         csv = "From,To,Segment (ft),Cumulative (mi)\n" + "\n".join(
             f"{r['From']},{r['To']},{r['Segment (ft)']},{r['Cumulative (mi)']}" for r in rows
         )
-
         st.download_button("📥 Download CSV", csv.encode(), "AGM_Distances.csv", "text/csv")
 
     except Exception as e:

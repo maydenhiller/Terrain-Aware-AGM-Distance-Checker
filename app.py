@@ -1,36 +1,3 @@
-import streamlit as st
-import zipfile
-import os
-import tempfile
-from fastkml import kml
-import math
-import folium
-from streamlit_folium import st_folium
-from xml.etree import ElementTree as ET
-
-st.set_page_config(page_title="Terrain-Aware AGM Distance Checker", layout="wide")
-st.title("🗺️ Terrain-Aware AGM Distance Checker")
-
-uploaded_file = st.file_uploader("Upload a KMZ or KML file with a red centerline and numbered AGMs", type=["kmz", "kml"])
-
-def extract_kml_from_kmz(kmz_file):
-    with zipfile.ZipFile(kmz_file, 'r') as zf:
-        for name in zf.namelist():
-            if name.endswith('.kml'):
-                return zf.read(name)
-    return None
-
-def haversine(lat1, lon1, lat2, lon2):
-    R = 6371000  # meters
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-
-    a = math.sin(dphi/2.0)**2 + \
-        math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2.0)**2
-    return 2*R*math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
 def parse_kml(kml_data):
     agms = []
     centerline = []
@@ -42,14 +9,18 @@ def parse_kml(kml_data):
         else:
             k.from_string(kml_data.encode("utf-8"))
 
-        documents = list(k.features())
-        for doc in documents:
-            folders = list(doc.features())
-            for folder in folders:
-                for feature in folder.features():
+        # Defensive navigation of KML levels
+        def safe_features(obj):
+            try:
+                return list(obj.features())
+            except TypeError:
+                return list(obj.features) if hasattr(obj, 'features') else []
+
+        for doc in safe_features(k):
+            for folder in safe_features(doc):
+                for feature in safe_features(folder):
                     if hasattr(feature, 'geometry'):
                         if feature.geometry.geom_type == 'LineString':
-                            # Try checking red color in description or style
                             if feature.style_url and 'ff0000' in feature.style_url.lower():
                                 centerline = list(feature.geometry.coords)
                             elif feature.description and 'ff0000' in feature.description.lower():
@@ -65,66 +36,3 @@ def parse_kml(kml_data):
 
     agms.sort(key=lambda x: int(x[0]))
     return centerline, agms
-
-def calculate_distances(centerline, agms):
-    distances = []
-    cumulative = 0
-
-    for i in range(len(agms)-1):
-        name1, coord1 = agms[i]
-        name2, coord2 = agms[i+1]
-
-        min_seg_distance = float('inf')
-
-        for j in range(len(centerline)-1):
-            c1 = centerline[j]
-            c2 = centerline[j+1]
-            d1 = haversine(coord1[1], coord1[0], c1[1], c1[0])
-            d2 = haversine(coord2[1], coord2[0], c2[1], c2[0])
-            total_d = d1 + d2
-            if total_d < min_seg_distance:
-                min_seg_distance = total_d
-
-        cumulative += min_seg_distance
-        distances.append({
-            "From": name1,
-            "To": name2,
-            "Segment Distance (ft)": round(min_seg_distance * 3.28084, 2),
-            "Cumulative Distance (mi)": round(cumulative * 0.000621371, 3)
-        })
-
-    return distances
-
-def generate_csv(data):
-    output = "From,To,Segment Distance (ft),Cumulative Distance (mi)\n"
-    for row in data:
-        output += f"{row['From']},{row['To']},{row['Segment Distance (ft)']},{row['Cumulative Distance (mi)']}\n"
-    return output
-
-if uploaded_file:
-    ext = os.path.splitext(uploaded_file.name)[1].lower()
-    if ext == ".kmz":
-        kml_raw = extract_kml_from_kmz(uploaded_file)
-        if not kml_raw:
-            st.error("No KML found in KMZ.")
-        else:
-            centerline, agms = parse_kml(kml_raw)
-    else:
-        centerline, agms = parse_kml(uploaded_file.read())
-
-    if centerline and agms:
-        st.success(f"Parsed {len(agms)} AGMs and {len(centerline)} points in centerline.")
-        result = calculate_distances(centerline, agms)
-        st.dataframe(result)
-
-        csv_data = generate_csv(result)
-        st.download_button("📥 Download Results as CSV", csv_data, file_name="terrain_distances.csv", mime="text/csv")
-
-        m = folium.Map(location=[agms[0][1][1], agms[0][1][0]], zoom_start=13)
-        folium.PolyLine(locations=[(lat, lon) for lon, lat, *_ in centerline], color="red").add_to(m)
-        for name, (lon, lat, *_ ) in agms:
-            folium.Marker([lat, lon], tooltip=name).add_to(m)
-        st_folium(m, width=700, height=500)
-    else:
-        st.warning("Centerline or AGMs not found. Ensure the line is red (#ff0000) and placemark names are purely numeric.")
-

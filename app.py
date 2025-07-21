@@ -5,13 +5,12 @@ import zipfile
 import io
 import math
 import pandas as pd
-import xml.etree.ElementTree as ET
 
 st.set_page_config(page_title="Terrain-Aware AGM Distance Checker", layout="centered")
 st.title("🗺️ Terrain-Aware AGM Distance Checker")
 
 def get_elevation(lat, lon):
-    return 1000  # dummy elevation for now
+    return 1000  # stub elevation — replace with real if needed
 
 def haversine_3d(p1, p2):
     R = 6371000
@@ -19,11 +18,11 @@ def haversine_3d(p1, p2):
     lat2, lon2, ele2 = map(math.radians, [p2[0], p2[1], p2[2]])
     dlat = lat2 - lat1
     dlon = lon2 - lon1
-    a = math.sin(dlat/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2)**2
+    a = math.sin(dlat / 2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2)**2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     horizontal = R * c
-    elevation_change = p2[2] - p1[2]
-    return math.sqrt(horizontal**2 + elevation_change**2)
+    vertical = ele2 - ele1
+    return math.sqrt(horizontal**2 + vertical**2)
 
 def extract_kml_from_kmz(file):
     with zipfile.ZipFile(file) as z:
@@ -32,11 +31,9 @@ def extract_kml_from_kmz(file):
                 return z.read(name)
     return None
 
-def parse_kml(kml_data):
-    if isinstance(kml_data, bytes):
-        kml_data = kml_data.decode('utf-8', errors='ignore')
+def parse_kml(kml_bytes):
     k = kml.KML()
-    k.from_string(kml_data)
+    k.from_string(kml_bytes)  # Pass raw bytes directly
     ns = '{http://www.opengis.net/kml/2.2}'
 
     def extract_features(container):
@@ -106,6 +103,7 @@ if uploaded_file:
             kml_data = raw_data
 
         centerline, agms = parse_kml(kml_data)
+
         if centerline and agms:
             df = calculate_terrain_distances(centerline, agms)
             st.success("✅ Distances calculated successfully!")
@@ -114,6 +112,6 @@ if uploaded_file:
             csv = df.to_csv(index=False).encode()
             st.download_button("📥 Download CSV", csv, "terrain_distances.csv", "text/csv")
         else:
-            st.warning("⚠️ Centerline or AGMs not found. They must be under the correct folders: 'CENTERLINE' and 'AGMs'.")
+            st.warning("⚠️ Centerline or AGMs not found. They must be under folders named 'CENTERLINE' and 'AGMs'.")
     except Exception as e:
         st.error(f"❌ Failed to parse KMZ/KML: {e}")

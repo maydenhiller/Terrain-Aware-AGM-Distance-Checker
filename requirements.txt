@@ -8,3 +8,7 @@ pyproj
 lxml
 requests
 shapely
+streamlit-folium
+pyproj
+requests
+folium

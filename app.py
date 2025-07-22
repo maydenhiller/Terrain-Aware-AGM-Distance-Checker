@@ -43,15 +43,15 @@ def parse_kml(path):
     return k
 
 def find_folder(kml_obj, name):
-    for doc in kml_obj.features():
-        for folder in doc.features():
-            if folder.name.strip().upper() == name.upper():
-                return folder
+    for doc in list(kml_obj.features()):
+        for f in list(doc.features()):
+            if f.name and f.name.strip().upper() == name.upper():
+                return f
     return None
 
 def extract_agms(folder):
     agms = []
-    for placemark in folder.features():
+    for placemark in list(folder.features()):
         if placemark.name.strip().isdigit():
             pt = placemark.geometry
             agms.append((placemark.name.strip(), pt.y, pt.x))
@@ -59,7 +59,7 @@ def extract_agms(folder):
     return agms
 
 def extract_red_line(folder):
-    for placemark in folder.features():
+    for placemark in list(folder.features()):
         if hasattr(placemark, "styleUrl") and placemark.styleUrl and placemark.styleUrl.lower() == "#red":
             geom = placemark.geometry
             if isinstance(geom, LineString):

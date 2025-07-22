@@ -1,122 +1,125 @@
 import streamlit as st
-from fastkml import kml
-from shapely.geometry import LineString, Point
 import zipfile
-import io
-import math
+import simplekml
+import tempfile
+import xml.etree.ElementTree as ET
+import numpy as np
 import pandas as pd
+import folium
+from folium.plugins import MarkerCluster
+from streamlit_folium import st_folium
+import math
+import os
 
+# --- App Config ---
 st.set_page_config(layout="wide")
 st.title("📏 Terrain-Aware Distance Calculator")
-st.markdown("Upload a KMZ or KML file with:")
-st.markdown("- A red centerline under the `CENTERLINE` folder (style: `#ff0000`)")
-st.markdown("- Numbered AGMs under the `AGMs` folder")
 
-uploaded_file = st.file_uploader("Upload KMZ or KML", type=["kmz", "kml"])
+# --- Helper Functions ---
 
-def haversine_3d(p1, p2):
-    R = 6371000  # meters
-    lat1, lon1, ele1 = p1
-    lat2, lon2, ele2 = p2
+def haversine_3d(lat1, lon1, ele1, lat2, lon2, ele2):
+    R = 6371000  # Radius of Earth in meters
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = phi2 - phi1
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
-    horiz = 2 * R * math.asin(math.sqrt(a))
-    elev_diff = ele2 - ele1
-    return math.sqrt(horiz**2 + elev_diff**2)
+    d_phi = math.radians(lat2 - lat1)
+    d_lambda = math.radians(lon2 - lon1)
+    dx = R * d_lambda * math.cos((phi1 + phi2) / 2)
+    dy = R * d_phi
+    dz = ele2 - ele1
+    return math.sqrt(dx**2 + dy**2 + dz**2)
 
-def extract_centerline_and_agms(kml_data):
-    k = kml.KML()
-    k.from_string(kml_data)
-    centerline = None
-    agms = {}
+def parse_kml_root(root):
+    ns = {'kml': 'http://www.opengis.net/kml/2.2'}
+    centerline_coords = None
+    agm_points = []
 
-    def extract_from_features(features):
-        nonlocal centerline, agms
-        for f in features:
-            if hasattr(f, 'features'):
-                extract_from_features(f.features())
-            elif hasattr(f, 'geometry'):
-                if f.name and f.name.strip().isnumeric():
-                    agms[int(f.name.strip())] = f.geometry
-                elif isinstance(f.geometry, LineString):
-                    style = getattr(f, 'styleUrl', '')
-                    desc = getattr(f, 'description', '')
-                    if '#ff0000' in str(style).lower() or '#ff0000' in str(desc).lower():
-                        centerline = f.geometry
+    for folder in root.findall(".//kml:Folder", ns):
+        name = folder.find("kml:name", ns)
+        if name is None:
+            continue
+        if name.text.strip().upper() == "CENTERLINE":
+            for pl in folder.findall(".//kml:Placemark", ns):
+                style = pl.find("kml:Style", ns)
+                if style is not None:
+                    line_style = style.find("kml:LineStyle/kml:color", ns)
+                    if line_style is not None and line_style.text.strip().lower() == "ff0000ff":  # Red (ABGR)
+                        coords = pl.find(".//kml:coordinates", ns)
+                        if coords is not None:
+                            raw = coords.text.strip().split()
+                            centerline_coords = [tuple(map(float, pt.split(',')[:3])) for pt in raw]
+        elif name.text.strip().upper() == "AGMS":
+            for pl in folder.findall(".//kml:Placemark", ns):
+                pname = pl.find("kml:name", ns)
+                if pname is None or not pname.text.strip().isdigit():
+                    continue
+                coords = pl.find(".//kml:coordinates", ns)
+                if coords is not None:
+                    lon, lat, ele = map(float, coords.text.strip().split(',')[:3])
+                    agm_points.append((pname.text.strip(), lat, lon, ele))
 
-    extract_from_features(k.features())
-    return centerline, dict(sorted(agms.items()))
+    return centerline_coords, sorted(agm_points, key=lambda x: int(x[0]))
 
-def interpolate_along_line(line, point):
-    min_dist = float('inf')
-    min_proj = 0
-    total = 0
-    coords = list(line.coords)
-    for i in range(len(coords) - 1):
-        segment = LineString([coords[i], coords[i + 1]])
-        proj = segment.project(point)
-        dist = point.distance(segment)
-        if dist < min_dist:
-            min_dist = dist
-            min_proj = total + proj
-        total += segment.length
-    return min_proj
-
-def get_elevation(lat, lon):
-    # Placeholder for elevation (replace with real API if needed)
-    return 0.0
-
-if uploaded_file:
+def load_kml_or_kmz(file) -> tuple:
     try:
-        file_ext = uploaded_file.name.split(".")[-1].lower()
-        if file_ext == "kmz":
-            with zipfile.ZipFile(uploaded_file) as zf:
-                kml_name = [name for name in zf.namelist() if name.endswith(".kml")][0]
-                kml_data = zf.read(kml_name)
-        else:
-            kml_data = uploaded_file.read()
-
-        centerline, agms = extract_centerline_and_agms(kml_data)
-
-        if centerline is None or not agms:
-            st.error("❌ Centerline or AGMs not found. They must be under folders named 'CENTERLINE' and 'AGMs'.")
-        else:
-            coords = []
-            keys = sorted(agms.keys())
-            cumulative_ft = 0
-            for i in range(len(keys) - 1):
-                p1 = agms[keys[i]]
-                p2 = agms[keys[i + 1]]
-                dist1 = interpolate_along_line(centerline, p1)
-                dist2 = interpolate_along_line(centerline, p2)
-                if dist2 < dist1:
-                    dist1, dist2 = dist2, dist1
-                segment = centerline.interpolate(dist1), centerline.interpolate(dist2)
-                segment_line = LineString([segment[0], segment[1]])
-                points = list(segment_line.coords)
-                seg_dist = 0
-                for j in range(len(points) - 1):
-                    lat1, lon1 = points[j][1], points[j][0]
-                    lat2, lon2 = points[j+1][1], points[j+1][0]
-                    ele1 = get_elevation(lat1, lon1)
-                    ele2 = get_elevation(lat2, lon2)
-                    seg_dist += haversine_3d((lat1, lon1, ele1), (lat2, lon2, ele2))
-                cumulative_ft += seg_dist * 3.28084
-                coords.append({
-                    "From": keys[i],
-                    "To": keys[i + 1],
-                    "Segment Distance (ft)": round(seg_dist * 3.28084, 2),
-                    "Cumulative Distance (mi)": round(cumulative_ft / 5280, 2)
-                })
-
-            df = pd.DataFrame(coords)
-            st.success("✅ Distances calculated.")
-            st.dataframe(df)
-
-            csv = df.to_csv(index=False).encode()
-            st.download_button("📥 Download CSV", csv, file_name="terrain_distances.csv", mime="text/csv")
-
+        ext = os.path.splitext(file.name)[1].lower()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            if ext == ".kmz":
+                with zipfile.ZipFile(file) as kmz:
+                    kmz.extractall(tmpdir)
+                    for fname in os.listdir(tmpdir):
+                        if fname.endswith(".kml"):
+                            path = os.path.join(tmpdir, fname)
+                            tree = ET.parse(path)
+                            return parse_kml_root(tree.getroot())
+            elif ext == ".kml":
+                tree = ET.parse(file)
+                return parse_kml_root(tree.getroot())
     except Exception as e:
         st.error(f"❌ Failed to parse KMZ/KML: {e}")
+        return None, None
+
+# --- Upload ---
+uploaded = st.file_uploader("📂 Upload your KML or KMZ file", type=["kml", "kmz"])
+
+if uploaded:
+    centerline, agms = load_kml_or_kmz(uploaded)
+
+    if not centerline:
+        st.warning("⚠️ No red centerline found inside the CENTERLINE folder.")
+    elif not agms:
+        st.warning("⚠️ No numeric AGMs found in AGMs folder.")
+    else:
+        # Interpolate points along the centerline to follow its path between AGMs
+        def snap_to_path(lat, lon, path):
+            return min(path, key=lambda pt: math.hypot(lat - pt[1], lon - pt[0]))
+
+        snapped_agms = [(name, *snap_to_path(lat, lon, centerline)) for name, lat, lon, ele in agms]
+
+        distances = []
+        cum_dist = 0
+        for i in range(1, len(snapped_agms)):
+            prev = snapped_agms[i - 1]
+            curr = snapped_agms[i]
+            seg_dist = haversine_3d(prev[2], prev[1], prev[3], curr[2], curr[1], curr[3])
+            cum_dist += seg_dist
+            distances.append({
+                "From": prev[0],
+                "To": curr[0],
+                "Segment_Distance_ft": round(seg_dist * 3.28084, 2),
+                "Cumulative_Distance_mi": round(cum_dist * 0.000621371, 3)
+            })
+
+        df = pd.DataFrame(distances)
+        st.subheader("📊 Distance Table")
+        st.dataframe(df, use_container_width=True)
+
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button("📥 Download CSV", data=csv, file_name="terrain_distances.csv", mime="text/csv")
+
+        # --- Map ---
+        st.subheader("🗺️ Map View")
+        m = folium.Map(location=[agms[0][1], agms[0][2]], zoom_start=13)
+        folium.PolyLine([(lat, lon) for _, lat, lon, _ in agms], color="red").add_to(m)
+        MarkerCluster().add_to(m)
+        for name, lat, lon, ele in agms:
+            folium.Marker(location=(lat, lon), tooltip=name).add_to(m)
+        st_folium(m, width=1000, height=500)

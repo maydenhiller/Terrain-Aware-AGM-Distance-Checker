@@ -1,17 +1,49 @@
 import streamlit as st
 import zipfile
-import xml.etree.ElementTree as ET
-import tempfile
 import os
+import tempfile
+import xml.etree.ElementTree as ET
+import simplekml
 import math
+import pandas as pd
 import requests
 from io import BytesIO
 
-API_KEY = "AIzaSyB9HxznAvlGb02e-K1rhld_CPeAm_wvPWU"
-EARTH_RADIUS_FT = 20925524.9
+# Auto-inject your API key
+GOOGLE_ELEVATION_API_KEY = "AIzaSyB9HxznAvlGb02e-K1rhld_CPeAm_wvPWU"
 
+st.set_page_config(layout="wide")
+st.title("📏 Terrain-Aware Distance Calculator")
+
+# Helper: Convert lat/lon/elev to 3D distance
+def distance_3d(p1, p2):
+    lat1, lon1, ele1 = p1
+    lat2, lon2, ele2 = p2
+    R = 6371000  # Radius of Earth in meters
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    horizontal = R * c
+    vertical = ele2 - ele1
+    return math.sqrt(horizontal ** 2 + vertical ** 2)
+
+# Helper: Query Google Elevation API
+def get_elevations(coords):
+    url = (
+        "https://maps.googleapis.com/maps/api/elevation/json"
+        f"?locations={'|'.join([f'{lat},{lon}' for lat, lon in coords])}"
+        f"&key={GOOGLE_ELEVATION_API_KEY}"
+    )
+    r = requests.get(url)
+    results = r.json().get("results", [])
+    return [pt["elevation"] for pt in results] if results else [0] * len(coords)
+
+# Extract uploaded KMZ or KML file
 def extract_kml(uploaded_file):
-    content = uploaded_file.read()
+    content = uploaded_file.getvalue()
     with tempfile.TemporaryDirectory() as tmpdir:
         if uploaded_file.name.endswith(".kmz"):
             with zipfile.ZipFile(BytesIO(content), 'r') as kmz:
@@ -26,122 +58,145 @@ def extract_kml(uploaded_file):
             return path
     return None
 
-def recursive_find_folders_by_name(elem, target_name, ns):
-    found = []
-    if elem.tag.endswith("Folder"):
-        name_elem = elem.find("kml:name", ns)
-        if name_elem is not None and name_elem.text.strip() == target_name:
-            found.append(elem)
-    for child in elem:
-        found.extend(recursive_find_folders_by_name(child, target_name, ns))
-    return found
+# Parse KML for placemarks and line coordinates
+def parse_kml(kml_path):
+    tree = ET.parse(kml_path)
+    root = tree.getroot()
+    ns = {'kml': 'http://www.opengis.net/kml/2.2'}
 
-def extract_agms(folder, ns):
+    def find_folder(root, name):
+        for folder in root.findall(".//kml:Folder", ns):
+            fname = folder.find("kml:name", ns)
+            if fname is not None and fname.text.strip().upper() == name:
+                return folder
+        return None
+
+    centerline_folder = find_folder(root, "CENTERLINE")
+    agms_folder = find_folder(root, "AGMs")
+
+    if centerline_folder is None or agms_folder is None:
+        raise ValueError("CENTERLINE or AGMs folder not found.")
+
+    # Get red line path from CENTERLINE
+    for pm in centerline_folder.findall(".//kml:Placemark", ns):
+        coords = pm.find(".//kml:coordinates", ns)
+        if coords is not None:
+            points = [
+                tuple(map(float, coord.strip().split(",")[:2]))
+                for coord in coords.text.strip().split()
+            ]
+            if len(points) > 1:
+                centerline = points
+                break
+    else:
+        raise ValueError("No red centerline found inside the CENTERLINE folder.")
+
+    # Get AGMs (numeric placemarks only)
     agms = []
-    for placemark in folder.findall(".//kml:Placemark", ns):
-        name_elem = placemark.find("kml:name", ns)
-        coord_elem = placemark.find(".//kml:Point/kml:coordinates", ns)
-        if name_elem is not None and coord_elem is not None:
-            name = name_elem.text.strip()
-            if name.isdigit():
-                lon, lat, *_ = map(float, coord_elem.text.strip().split(','))
+    for pm in agms_folder.findall(".//kml:Placemark", ns):
+        name_el = pm.find("kml:name", ns)
+        coords_el = pm.find(".//kml:coordinates", ns)
+        if name_el is not None and coords_el is not None:
+            name = name_el.text.strip()
+            if name.isnumeric():
+                lon, lat = map(float, coords_el.text.strip().split(",")[:2])
                 agms.append((name, lat, lon))
-    return sorted(agms, key=lambda x: int(x[0]))
 
-def extract_red_centerline(folder, ns):
-    for placemark in folder.findall(".//kml:Placemark", ns):
-        style_elem = placemark.find("kml:styleUrl", ns)
-        coords_elem = placemark.find(".//kml:LineString/kml:coordinates", ns)
-        if coords_elem is not None and (style_elem is None or 'red' in style_elem.text.lower()):
-            coords = []
-            for line in coords_elem.text.strip().split():
-                lon, lat, *_ = map(float, line.split(','))
-                coords.append((lat, lon))
-            return coords
-    return None
+    agms.sort(key=lambda x: int(x[0]))
+    return centerline, agms
 
-def get_elevation(lat, lon):
-    url = f"https://maps.googleapis.com/maps/api/elevation/json?locations={lat},{lon}&key={API_KEY}"
-    response = requests.get(url).json()
-    if "results" in response and response["results"]:
-        return response["results"][0]["elevation"]
-    return 0
+# Project a point onto a line segment
+def project_point_to_segment(p, a, b):
+    ax, ay = a
+    bx, by = b
+    px, py = p
 
-def distance_3d(p1, p2):
-    lat1, lon1, ele1 = p1
-    lat2, lon2, ele2 = p2
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat / 2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    horiz = EARTH_RADIUS_FT * c
-    elev_diff = ele2 - ele1
-    return math.sqrt(horiz**2 + elev_diff**2)
+    dx, dy = bx - ax, by - ay
+    if dx == dy == 0:
+        return a
 
-def find_nearest_index(point, line_coords):
-    return min(range(len(line_coords)), key=lambda i: (point[0] - line_coords[i][0])**2 + (point[1] - line_coords[i][1])**2)
+    t = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)
+    t = max(0, min(1, t))
+    proj = (ax + t * dx, ay + t * dy)
+    return proj
 
-def main():
-    st.title("📏 Terrain-Aware AGM Distance Checker")
-    uploaded = st.file_uploader("Upload KMZ or KML", type=["kmz", "kml"])
-    st.text_input("Google Elevation API Key", value=API_KEY, type="password", disabled=True)
+# Find projected AGM locations on centerline
+def snap_agms_to_centerline(centerline, agms):
+    snapped = []
+    for name, lat, lon in agms:
+        min_dist = float('inf')
+        closest_point = None
+        for i in range(len(centerline) - 1):
+            a = centerline[i]
+            b = centerline[i + 1]
+            proj = project_point_to_segment((lon, lat), a, b)
+            dist = math.hypot(proj[0] - lon, proj[1] - lat)
+            if dist < min_dist:
+                min_dist = dist
+                closest_point = (proj[1], proj[0])  # back to (lat, lon)
+        snapped.append((name, *closest_point))
+    return snapped
 
-    if uploaded:
-        try:
-            kml_path = extract_kml(uploaded)
-            if not kml_path:
-                st.error("❌ Failed to extract KML from uploaded file.")
-                return
+# Compute distances
+def compute_distances(centerline, snapped_agms):
+    coords_with_elev = []
+    for i in range(len(centerline)):
+        coords_with_elev.append((centerline[i][1], centerline[i][0]))  # lat, lon
+    elevations = get_elevations(coords_with_elev)
+    centerline_3d = [
+        (lat, lon, elev) for (lat, lon), elev in zip(coords_with_elev, elevations)
+    ]
 
-            tree = ET.parse(kml_path)
-            root = tree.getroot()
-            ns = {'kml': 'http://www.opengis.net/kml/2.2'}
+    # Interpolate distances along centerline between AGMs
+    results = []
+    cum_distance = 0
+    for i in range(len(snapped_agms) - 1):
+        name1, lat1, lon1 = snapped_agms[i]
+        name2, lat2, lon2 = snapped_agms[i + 1]
 
-            agm_folders = recursive_find_folders_by_name(root, 'AGMs', ns)
-            cl_folders = recursive_find_folders_by_name(root, 'CENTERLINE', ns)
+        # Traverse centerline to measure 3D segment
+        segment_dist = 0
+        start_found = False
+        for j in range(len(centerline_3d) - 1):
+            lat_a, lon_a, ele_a = centerline_3d[j]
+            lat_b, lon_b, ele_b = centerline_3d[j + 1]
 
-            if not agm_folders or not cl_folders:
-                st.error("❌ Error: CENTERLINE or AGMs folder not found.")
-                return
+            if not start_found:
+                if math.isclose(lat_a, lat1, abs_tol=1e-5) and math.isclose(lon_a, lon1, abs_tol=1e-5):
+                    start_found = True
+                else:
+                    continue
 
-            agms = extract_agms(agm_folders[0], ns)
-            centerline = extract_red_centerline(cl_folders[0], ns)
+            segment_dist += distance_3d((lat_a, lon_a, ele_a), (lat_b, lon_b, ele_b))
 
-            if not centerline or not agms:
-                st.error("❌ No AGMs or red centerline found.")
-                return
+            if math.isclose(lat_b, lat2, abs_tol=1e-5) and math.isclose(lon_b, lon2, abs_tol=1e-5):
+                break
 
-            st.info("Fetching elevation data...")
-            cl_with_elev = [(lat, lon, get_elevation(lat, lon)) for lat, lon in centerline]
-            agm_with_elev = [(name, lat, lon, get_elevation(lat, lon)) for name, lat, lon in agms]
+        segment_miles = segment_dist / 1609.344
+        cum_distance += segment_dist
+        cum_miles = cum_distance / 1609.344
 
-            results = []
-            total_ft = 0
-            for i in range(len(agm_with_elev) - 1):
-                name1, lat1, lon1, ele1 = agm_with_elev[i]
-                name2, lat2, lon2, ele2 = agm_with_elev[i + 1]
+        results.append({
+            "From": name1,
+            "To": name2,
+            "Segment Distance (ft)": round(segment_dist * 3.28084, 2),
+            "Segment Distance (mi)": round(segment_miles, 4),
+            "Cumulative Distance (mi)": round(cum_miles, 4)
+        })
 
-                idx1 = find_nearest_index((lat1, lon1), centerline)
-                idx2 = find_nearest_index((lat2, lon2), centerline)
-                if idx1 > idx2:
-                    idx1, idx2 = idx2, idx1
+    return pd.DataFrame(results)
 
-                segment = cl_with_elev[idx1:idx2 + 1]
-                seg_dist = sum(distance_3d(segment[j], segment[j + 1]) for j in range(len(segment) - 1))
-                total_ft += seg_dist
-                results.append({
-                    "From": name1,
-                    "To": name2,
-                    "Segment (ft)": round(seg_dist, 2),
-                    "Segment (mi)": round(seg_dist / 5280, 3),
-                    "Cumulative (mi)": round(total_ft / 5280, 3)
-                })
-
-            st.success("✅ Distances calculated!")
-            st.dataframe(results)
-
-        except Exception as e:
-            st.error(f"❌ Error: {e}")
-
-if __name__ == "__main__":
-    main()
+# Upload UI
+uploaded_file = st.file_uploader("📂 Upload KMZ or KML file", type=["kmz", "kml"])
+if uploaded_file:
+    try:
+        kml_path = extract_kml(uploaded_file)
+        centerline, agms = parse_kml(kml_path)
+        snapped = snap_agms_to_centerline(centerline, agms)
+        df = compute_distances(centerline, snapped)
+        st.success("✅ Distances calculated successfully!")
+        st.dataframe(df, use_container_width=True)
+        csv = df.to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Download CSV", csv, "terrain_distances.csv", "text/csv")
+    except Exception as e:
+        st.error(f"❌ Error: {e}")

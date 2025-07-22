@@ -8,12 +8,13 @@ import requests
 from io import BytesIO
 
 API_KEY = "AIzaSyB9HxznAvlGb02e-K1rhld_CPeAm_wvPWU"
-EARTH_RADIUS_FT = 20925524.9  # Earth's radius in feet
+EARTH_RADIUS_FT = 20925524.9
 
-def extract_kml_from_kmz_or_kml(uploaded_file):
+def extract_kml_from_uploaded(uploaded_file):
+    content = uploaded_file.read()
     with tempfile.TemporaryDirectory() as tmpdir:
         if uploaded_file.name.endswith('.kmz'):
-            with zipfile.ZipFile(uploaded_file, 'r') as zf:
+            with zipfile.ZipFile(BytesIO(content), 'r') as zf:
                 zf.extractall(tmpdir)
                 for name in zf.namelist():
                     if name.endswith('.kml'):
@@ -21,8 +22,9 @@ def extract_kml_from_kmz_or_kml(uploaded_file):
         else:
             path = os.path.join(tmpdir, 'temp.kml')
             with open(path, 'wb') as f:
-                f.write(uploaded_file.read())
+                f.write(content)
             return path
+    return None
 
 def recursive_find_folders_by_name(element, target_name, ns):
     found = []
@@ -85,7 +87,7 @@ def main():
 
     if uploaded:
         try:
-            kml_path = extract_kml_from_kmz_or_kml(uploaded)
+            kml_path = extract_kml_from_uploaded(uploaded)
             tree = ET.parse(kml_path)
             root = tree.getroot()
             ns = {'kml': 'http://www.opengis.net/kml/2.2'}
@@ -103,12 +105,10 @@ def main():
                 st.error("❌ Red centerline not found.")
                 return
 
-            # Fetch elevations
             st.info("Fetching elevation data. Please wait...")
             cl_with_elev = [(lat, lon, get_elevation(lat, lon)) for lat, lon in centerline]
             agm_with_elev = [(name, lat, lon, get_elevation(lat, lon)) for name, lat, lon in agms]
 
-            # Calculate distances
             results = []
             total_ft = 0
             for i in range(len(agm_with_elev) - 1):
@@ -133,7 +133,6 @@ def main():
                 total_ft += dist
                 results.append((name1, name2, round(dist, 2), round(total_ft, 2)))
 
-            # Display
             st.success("✅ Distances calculated successfully.")
             st.dataframe([
                 {

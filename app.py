@@ -347,8 +347,8 @@ if uploaded_file is not None:
     else:
         st.info("Please upload a .kml or .kmz file to begin.")
 
-st.markdown("---")
 st.markdown("""
+---
 **How Terrain-Aware Distance is Calculated:**
 This application now uses the Google Maps Elevation API to fetch the altitude for each point in your linestring and AGMs.
 The "terrain-aware" (3D) distance between two points is calculated using a simplified
@@ -358,3 +358,4 @@ between the points on the Earth's surface, and $(alt_2 - alt_1)$ is the differen
 The "Distance from Path Start" for each AGM is the cumulative 3D distance along the CENTERLINE path
 to the closest vertex on the path to that AGM. The "Shortest Distance to Path" is the direct 3D distance
 from the AGM to its closest vertex on the CENTERLINE.
+""")

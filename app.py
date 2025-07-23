@@ -1,11 +1,12 @@
 import streamlit as st
-import xml.etree.ElementTree as ET # New import for XML parsing
+import xml.etree.ElementTree as ET
 from geopy.distance import geodesic
 import zipfile
 import io
 import pandas as pd
 import requests
 import numpy as np
+from shapely.geometry import LineString, Point # New import for Shapely
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -145,7 +146,8 @@ def get_elevations(coordinates, api_key):
 
 def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
     """
-    Calculates terrain-aware (3D) distances between sorted AGMs along the path.
+    Calculates terrain-aware (3D) distances between sorted AGMs along the path,
+    using projection to the centerline.
     Assumes path_coords are ordered and represent the CENTERLINE.
     agm_coords_with_elevations should be a list of {'name': ..., 'coordinates': (lon, lat, alt)}
     """
@@ -165,9 +167,16 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
         return results
 
     # Create a list of (lat, lon, alt) for the path
-    path_3d_points = [(c[1], c[0], path_elevations[i]) for i, c in enumerate(path_coords)]
+    path_3d_points = []
+    path_2d_coords_for_shapely = [] # (lon, lat) for Shapely LineString
+    for i, c in enumerate(path_coords):
+        path_3d_points.append((c[1], c[0], path_elevations[i])) # (lat, lon, alt)
+        path_2d_coords_for_shapely.append((c[0], c[1])) # (lon, lat) for Shapely
 
-    # Calculate cumulative distance along the path
+    centerline_2d_shapely = LineString(path_2d_coords_for_shapely)
+
+    # Calculate cumulative 3D distance along the path segments
+    # This is the true length of the centerline in 3D
     cumulative_path_distances_km = [0.0]
     for i in range(1, len(path_3d_points)):
         p0 = path_3d_points[i-1] # (lat, lon, alt)
@@ -181,45 +190,76 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
         segment_3d_m = np.sqrt(dist_2d_m**2 + delta_alt_m**2)
         cumulative_path_distances_km.append(cumulative_path_distances_km[-1] + (segment_3d_m / 1000.0))
 
-    # Calculate distance along path for each AGM
+    # Calculate distance along path for each AGM using Shapely's project
     agms_with_path_distances = []
     for agm in agm_coords_with_elevations:
-        agm_lat, agm_lon = agm['coordinates'][1], agm['coordinates'][0]
-        agm_alt = agm['coordinates'][2]
+        agm_name = agm['name']
+        agm_lon, agm_lat, agm_alt = agm['coordinates'] # (lon, lat, alt)
 
-        min_distance_to_path_point_km = float('inf')
-        distance_along_path_km = 0.0 # Initialize to 0.0
+        # Create a Shapely Point for the AGM (2D for projection)
+        agm_2d_point = Point(agm_lon, agm_lat)
 
-        closest_path_point_index = -1
-        for i, path_p in enumerate(path_3d_points):
-            path_p_lat, path_p_lon, path_p_alt = path_p[0], path_p[1], path_p[2]
+        # Project the AGM onto the 2D centerline to get distance along the line (in degrees)
+        distance_along_line_degrees = centerline_2d_shapely.project(agm_2d_point)
+
+        # Interpolate to get the projected point's (lon, lat) on the 2D centerline
+        projected_2d_point_shapely = centerline_2d_shapely.interpolate(distance_along_line_degrees)
+        projected_lon, projected_lat = projected_2d_point_shapely.x, projected_2d_point_shapely.y
+
+        # Fetch elevation for the projected point
+        projected_elevation = get_elevations([(projected_lon, projected_lat)], st.session_state.google_api_key)
+        if projected_elevation:
+            projected_alt = projected_elevation[0]
+        else:
+            st.warning(f"Could not fetch elevation for projected point of AGM {agm_name}. Using AGM's original elevation for 3D distance to projected point.")
+            projected_alt = agm_alt # Fallback
+
+        # Calculate 3D distance from AGM to its projected point on the centerline (shortest perpendicular distance)
+        dist_2d_m_to_proj = geodesic((agm_lat, agm_lon), (projected_lat, projected_lon)).m
+        delta_alt_m_to_proj = agm_alt - projected_alt
+        shortest_distance_to_path_km = np.sqrt(dist_2d_m_to_proj**2 + delta_alt_m_to_proj**2) / 1000.0
+
+
+        # Calculate the cumulative 3D distance along the centerline to the projected point of the AGM
+        # This requires finding the segment where the projection occurs and summing 3D lengths.
+        distance_along_path_km = 0.0
+        
+        # Iterate through segments of the 3D path
+        for j in range(len(path_3d_points) - 1):
+            p_start_3d = path_3d_points[j]
+            p_end_3d = path_3d_points[j+1]
             
-            dist_2d_m = geodesic((agm_lat, agm_lon), (path_p_lat, path_p_lon)).m
-            delta_alt_m = agm_alt - path_p_alt
-            distance_3d_to_path_point_km = np.sqrt(dist_2d_m**2 + delta_alt_m**2) / 1000.0
-
-            if distance_3d_to_path_point_km < min_distance_to_path_point_km:
-                min_distance_to_path_point_km = distance_3d_to_path_point_km
-                closest_path_point_index = i
-        
-        if closest_path_point_index != -1:
-            distance_along_path_km = cumulative_path_distances_km[closest_path_point_index]
-        
+            # Check if the projected 2D point falls within the current 2D segment's bounds
+            # This is a simplified check; a more robust one would involve Shapely's `line_locate_point`
+            # or checking if `projected_2d_point_shapely` is between `Point(path_2d_coords_for_shapely[j])` and `Point(path_2d_coords_for_shapely[j+1])`
+            
+            # Use Shapely's project on the segment to see if it's within this segment
+            segment_2d_shapely = LineString([path_2d_coords_for_shapely[j], path_2d_coords_for_shapely[j+1]])
+            
+            # If the projected point is on this segment, calculate the distance along this segment
+            # and add to the cumulative distance up to the start of this segment.
+            if segment_2d_shapely.contains(projected_2d_point_shapely) or segment_2d_shapely.boundary.contains(projected_2d_point_shapely):
+                # Calculate 3D distance from segment start to projected point
+                dist_2d_m_on_segment = geodesic((p_start_3d[0], p_start_3d[1]), (projected_lat, projected_lon)).m
+                delta_alt_m_on_segment = projected_alt - p_start_3d[2]
+                segment_proj_3d_m = np.sqrt(dist_2d_m_on_segment**2 + delta_alt_m_on_segment**2)
+                
+                distance_along_path_km = cumulative_path_distances_km[j] + (segment_proj_3d_m / 1000.0)
+                break # Found the segment, break the loop
+            
         agms_with_path_distances.append({
-            "name": agm['name'],
-            "coordinates": agm['coordinates'], # (lon, lat, alt)
+            "name": agm_name,
+            "coordinates": agm['coordinates'], # Original (lon, lat, alt)
             "distance_along_path_km": distance_along_path_km,
-            "shortest_distance_to_path_km": min_distance_to_path_point_km
+            "shortest_distance_to_path_km": shortest_distance_to_path_km
         })
 
     # Sort AGMs by their distance along the path
-    # This is crucial for "From AGM / To AGM" to make sense sequentially
     agms_with_path_distances.sort(key=lambda x: x['distance_along_path_km'])
 
     # Prepare results in the requested format
     final_results = []
-    running_total_distance_km = 0.0
-
+    
     if len(agms_with_path_distances) < 2:
         st.warning("At least two AGMs are required to calculate segments between them.")
         return final_results
@@ -230,15 +270,17 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
         to_agm = agms_with_path_distances[i+1]
 
         segment_dist_km = to_agm['distance_along_path_km'] - from_agm['distance_along_path_km']
-        running_total_distance_km += segment_dist_km
+        
+        # The "Total Distance" should be the distance along the path to the 'To AGM'
+        total_distance_km = to_agm['distance_along_path_km']
 
         final_results.append({
             "From AGM": from_agm['name'],
             "To AGM": to_agm['name'],
             "Segment Distance (feet)": f"{segment_dist_km * KM_TO_FEET:.2f}",
             "Segment Distance (miles)": f"{segment_dist_km * KM_TO_MILES:.3f}",
-            "Total Distance (feet)": f"{running_total_distance_km * KM_TO_FEET:.2f}",
-            "Total Distance (miles)": f"{running_total_distance_km * KM_TO_MILES:.3f}"
+            "Total Distance (feet)": f"{total_distance_km * KM_TO_FEET:.2f}",
+            "Total Distance (miles)": f"{total_distance_km * KM_TO_MILES:.3f}"
         })
     
     return final_results
@@ -250,7 +292,7 @@ st.title("🗺️ KML/KMZ Terrain-Aware Distance Calculator")
 
 st.markdown("""
 Upload your `.kml` or `.kmz` file to calculate the terrain-aware (3D) distances
-of "AGMs" (points) from the start of the "CENTERLINE" (linestring) found within the file.
+of "AGMs" (points) along the "CENTERLINE" (linestring) found within the file.
 """)
 
 # IMPORTANT: Hardcoding API keys is generally not recommended for security.
@@ -303,7 +345,7 @@ if uploaded_file is not None:
 
             st.write(f"Number of points in CENTERLINE: {len(centerline_coords)}")
             st.write(f"Number of AGMs found: {len(agm_points)}")
-            st.write("Fetching elevation data for AGMs...")
+            st.write("Fetching elevation data for AGMs and projected points...")
 
             # Fetch elevations for AGMs
             # agm_points coords are (longitude, latitude, altitude), need (lon, lat) for elevation API
@@ -317,7 +359,7 @@ if uploaded_file is not None:
                     agm['coordinates'] = (agm['coordinates'][0], agm['coordinates'][1], agm_elevations[i])
 
                 st.success("Elevation data for AGMs fetched successfully!")
-                st.write("Calculating terrain-aware distances from CENTERLINE start to AGMs...")
+                st.write("Calculating terrain-aware distances along CENTERLINE...")
 
                 # Calculate distances
                 distance_results = calculate_terrain_aware_distances(centerline_coords, agm_points)
@@ -343,6 +385,6 @@ Pythagorean theorem: $D_{3D} = \sqrt{D_{2D}^2 + (alt_2 - alt_1)^2}$, where $D_{2
 between the points on the Earth's surface, and $(alt_2 - alt_1)$ is the difference in their elevations.
 
 The "Distance from Path Start" for each AGM is the cumulative 3D distance along the CENTERLINE path
-to the closest vertex on the path to that AGM. The "Shortest Distance to Path" is the direct 3D distance
-from the AGM to its closest vertex on the CENTERLINE.
+to the closest *perpendicular point* on that path to the AGM. The "Shortest Distance to Path" is the direct 3D distance
+from the AGM to its closest perpendicular point on the CENTERLINE.
 """)

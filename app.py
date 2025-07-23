@@ -145,8 +145,7 @@ def get_elevations(coordinates, api_key):
 
 def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
     """
-    Calculates terrain-aware (3D) distances from the start of the path to each AGM,
-    and then segment distances between sorted AGMs along the path.
+    Calculates terrain-aware (3D) distances between sorted AGMs along the path.
     Assumes path_coords are ordered and represent the CENTERLINE.
     agm_coords_with_elevations should be a list of {'name': ..., 'coordinates': (lon, lat, alt)}
     """
@@ -214,44 +213,32 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
         })
 
     # Sort AGMs by their distance along the path
+    # This is crucial for "From AGM / To AGM" to make sense sequentially
     agms_with_path_distances.sort(key=lambda x: x['distance_along_path_km'])
 
     # Prepare results in the requested format
     final_results = []
-    total_cumulative_distance_km = 0.0
+    running_total_distance_km = 0.0
 
-    if not agms_with_path_distances:
+    if len(agms_with_path_distances) < 2:
+        st.warning("At least two AGMs are required to calculate segments between them.")
         return final_results
 
-    # Add a "start" point for the first segment
-    final_results.append({
-        "From AGM": "CENTERLINE Start",
-        "To AGM": agms_with_path_distances[0]['name'],
-        "Segment Distance (km)": f"{agms_with_path_distances[0]['distance_along_path_km']:.3f}",
-        "Segment Distance (feet)": f"{agms_with_path_distances[0]['distance_along_path_km'] * KM_TO_FEET:.2f}",
-        "Segment Distance (miles)": f"{agms_with_path_distances[0]['distance_along_path_km'] * KM_TO_MILES:.3f}",
-        "Total Distance (km)": f"{agms_with_path_distances[0]['distance_along_path_km']:.3f}",
-        "Total Distance (feet)": f"{agms_with_path_distances[0]['distance_along_path_km'] * KM_TO_FEET:.2f}",
-        "Total Distance (miles)": f"{agms_with_path_distances[0]['distance_along_path_km'] * KM_TO_MILES:.3f}"
-    })
-    total_cumulative_distance_km = agms_with_path_distances[0]['distance_along_path_km']
+    # Calculate segments between consecutive sorted AGMs
+    for i in range(len(agms_with_path_distances) - 1):
+        from_agm = agms_with_path_distances[i]
+        to_agm = agms_with_path_distances[i+1]
 
-    for i in range(1, len(agms_with_path_distances)):
-        prev_agm = agms_with_path_distances[i-1]
-        current_agm = agms_with_path_distances[i]
-
-        segment_dist_km = current_agm['distance_along_path_km'] - prev_agm['distance_along_path_km']
-        total_cumulative_distance_km += segment_dist_km
+        segment_dist_km = to_agm['distance_along_path_km'] - from_agm['distance_along_path_km']
+        running_total_distance_km += segment_dist_km
 
         final_results.append({
-            "From AGM": prev_agm['name'],
-            "To AGM": current_agm['name'],
-            "Segment Distance (km)": f"{segment_dist_km:.3f}",
+            "From AGM": from_agm['name'],
+            "To AGM": to_agm['name'],
             "Segment Distance (feet)": f"{segment_dist_km * KM_TO_FEET:.2f}",
             "Segment Distance (miles)": f"{segment_dist_km * KM_TO_MILES:.3f}",
-            "Total Distance (km)": f"{total_cumulative_distance_km:.3f}",
-            "Total Distance (feet)": f"{total_cumulative_distance_km * KM_TO_FEET:.2f}",
-            "Total Distance (miles)": f"{total_cumulative_distance_km * KM_TO_MILES:.3f}"
+            "Total Distance (feet)": f"{running_total_distance_km * KM_TO_FEET:.2f}",
+            "Total Distance (miles)": f"{running_total_distance_km * KM_TO_MILES:.3f}"
         })
     
     return final_results

@@ -171,6 +171,10 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
     for i, c in enumerate(path_coords):
         path_3d_points.append((c[1], c[0], path_elevations[i])) # (lat, lon, alt)
 
+    # Create a 2D Shapely LineString from (lon, lat) for projection
+    path_2d_coords_for_shapely = [(c[0], c[1]) for c in path_coords] # (lon, lat) for Shapely
+    centerline_2d_shapely = LineString(path_2d_coords_for_shapely)
+
     # Calculate cumulative 3D distances along the centerline vertices
     cumulative_3d_distances_along_path_km = [0.0]
     for i in range(1, len(path_3d_points)):
@@ -182,7 +186,7 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
         segment_3d_m = np.sqrt(dist_2d_m**2 + delta_alt_m**2)
         cumulative_3d_distances_along_path_km.append(cumulative_3d_distances_along_path_km[-1] + (segment_3d_m / 1000.0))
 
-    # Calculate distance along path for each AGM by projecting onto centerline segments
+    # Calculate distance along path for each AGM by projecting onto centerline
     agms_with_path_distances = []
     for agm in agm_coords_with_elevations:
         agm_name = agm['name']
@@ -190,64 +194,79 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
 
         agm_point_2d = Point(agm_lon, agm_lat)
 
-        min_distance_to_line_km = float('inf')
-        distance_along_path_km_for_agm = 0.0 # Initialize for this AGM
+        # Project AGM onto 2D centerline to get linear referencing measure (in units of LineString)
+        projected_measure_2d = centerline_2d_shapely.project(agm_point_2d)
 
-        # Iterate through each segment of the centerline to find the closest projection
-        for i in range(len(path_3d_points) - 1):
-            p_start_3d = path_3d_points[i] # (lat, lon, alt)
-            p_end_3d = path_3d_points[i+1] # (lat, lon, alt)
+        # Interpolate to get the projected point's (lon, lat) on the 2D centerline
+        projected_2d_point_shapely = centerline_2d_shapely.interpolate(projected_measure_2d)
+        projected_lon, projected_lat = projected_2d_point_shapely.x, projected_2d_point_shapely.y
 
-            # Create 2D Shapely LineString for the current segment
-            segment_2d_shapely = LineString([(p_start_3d[1], p_start_3d[0]), (p_end_3d[1], p_end_3d[0])]) # (lon, lat)
-
-            # Find the closest point on this 2D segment to the AGM
-            closest_point_on_segment_2d_shapely = nearest_points(segment_2d_shapely, agm_point_2d)[0]
-            projected_lon, projected_lat = closest_point_on_segment_2d_shapely.x, closest_point_on_segment_2d_shapely.y
-
-            # Fetch elevation for this projected point on the segment
-            projected_elevation = get_elevations([(projected_lon, projected_lat)], st.session_state.google_api_key)
-            if projected_elevation:
-                projected_alt = projected_elevation[0]
-            else:
-                # Fallback: interpolate altitude along the 3D segment
-                segment_2d_len_actual = segment_2d_shapely.length
-                # Project the AGM point onto the current 2D segment to get the measure along it
-                measure_on_segment = segment_2d_shapely.project(agm_point_2d)
-
-                if segment_2d_len_actual > 0:
-                    fraction_along_segment = measure_on_segment / segment_2d_len_actual
+        # Fetch elevation for this projected point on the segment
+        projected_elevation = get_elevations([(projected_lon, projected_lat)], st.session_state.google_api_key)
+        if projected_elevation:
+            projected_alt = projected_elevation[0]
+        else:
+            # Fallback: interpolate altitude along the 3D centerline based on 2D projection
+            # Find the segment where the projection falls
+            segment_index = -1
+            for idx in range(len(path_2d_coords_for_shapely) - 1):
+                segment_2d_line = LineString([path_2d_coords_for_shapely[idx], path_2d_coords_for_shapely[idx+1]])
+                if segment_2d_line.project(projected_2d_point_shapely) >= 0 and segment_2d_line.project(projected_2d_point_shapely) <= segment_2d_line.length:
+                    segment_index = idx
+                    break
+            
+            if segment_index != -1:
+                p_start_3d_interp = path_3d_points[segment_index]
+                p_end_3d_interp = path_3d_points[segment_index+1]
+                
+                segment_length_2d_actual = LineString([(p_start_3d_interp[1], p_start_3d_interp[0]), (p_end_3d_interp[1], p_end_3d_interp[0])]).length
+                
+                if segment_length_2d_actual > 0:
+                    fraction_along_segment = geodesic((p_start_3d_interp[0], p_start_3d_interp[1]), (projected_lat, projected_lon)).m / segment_length_2d_actual
                 else:
-                    fraction_along_segment = 0.0 # Zero length segment
+                    fraction_along_segment = 0.0
 
-                projected_alt = p_start_3d[2] + fraction_along_segment * (p_end_3d[2] - p_start_3d[2])
-                st.warning(f"Could not fetch elevation for AGM {agm_name}'s projected point on segment {i}-{i+1}. Interpolating altitude.")
+                projected_alt = p_start_3d_interp[2] + fraction_along_segment * (p_end_3d_interp[2] - p_start_3d_interp[2])
+                st.warning(f"Could not fetch elevation for AGM {agm_name}'s projected point. Interpolating altitude.")
+            else:
+                projected_alt = agm_alt # Last resort fallback
+                st.warning(f"Projected point for AGM {agm_name} not clearly on a segment. Using AGM's original elevation.")
 
 
-            # Calculate 3D distance from AGM to its projected point on this segment
-            dist_2d_m_to_proj = geodesic((agm_lat, agm_lon), (projected_lat, projected_lon)).m
-            delta_alt_m_to_proj = agm_alt - projected_alt
-            current_distance_to_line_km = np.sqrt(dist_2d_m_to_proj**2 + delta_alt_m_to_proj**2) / 1000.0
+        # Calculate shortest 3D distance from AGM to its projected point on centerline
+        dist_2d_m_to_proj = geodesic((agm_lat, agm_lon), (projected_lat, projected_lon)).m
+        delta_alt_m_to_proj = agm_alt - projected_alt
+        shortest_distance_to_path_km = np.sqrt(dist_2d_m_to_proj**2 + delta_alt_m_to_proj**2) / 1000.0
 
-            # If this is the shortest distance found so far, update the AGM's overall path distance
-            if current_distance_to_line_km < min_distance_to_line_km:
-                min_distance_to_line_km = current_distance_to_line_km
-                
-                # Calculate 3D distance from start of centerline to this projected point.
-                # This involves the cumulative distance up to the start of the current segment,
-                # plus the 3D distance from the start of the current segment to the projected point.
-                
-                dist_2d_m_from_seg_start = geodesic((p_start_3d[0], p_start_3d[1]), (projected_lat, projected_lon)).m
-                delta_alt_m_from_seg_start = projected_alt - p_start_3d[2]
-                dist_from_segment_start_3d_km = np.sqrt(dist_2d_m_from_seg_start**2 + delta_alt_m_from_seg_start**2) / 1000.0
+        # Map the 2D projected measure to the 3D cumulative distance along the path
+        distance_along_path_km_for_agm = 0.0
+        
+        # This is the crucial part for correct ordering and cumulative distance
+        # We need to find where `projected_measure_2d` falls within the `centerline_2d_shapely`'s 2D length
+        # and then map that fraction to the `cumulative_3d_distances_along_path_km`.
 
-                distance_along_path_km_for_agm = cumulative_3d_distances_along_path_km[i] + dist_from_segment_start_3d_km
+        # Create a linear interpolation function for 2D measure to 3D cumulative distance
+        # X-values: cumulative 2D lengths of centerline vertices (from Shapely's perspective)
+        # Y-values: cumulative 3D distances of centerline vertices (our calculated 3D path length)
+        
+        # Calculate cumulative 2D lengths for interpolation mapping
+        cumulative_2d_lengths_for_interp = [0.0]
+        for i in range(1, len(path_2d_coords_for_shapely)):
+            p0_2d = Point(path_2d_coords_for_shapely[i-1])
+            p1_2d = Point(path_2d_coords_for_shapely[i])
+            cumulative_2d_lengths_for_interp.append(cumulative_2d_lengths_for_interp[-1] + p0_2d.distance(p1_2d))
+
+        distance_along_path_km_for_agm = np.interp(
+            projected_measure_2d,
+            cumulative_2d_lengths_for_interp,
+            cumulative_3d_distances_along_path_km
+        )
         
         agms_with_path_distances.append({
             "name": agm_name,
             "coordinates": agm['coordinates'], # Original (lon, lat, alt)
             "distance_along_path_km": distance_along_path_km_for_agm, # Cumulative 3D distance along centerline
-            "shortest_distance_to_path_km": min_distance_to_line_km # Direct 3D distance to centerline
+            "shortest_distance_to_path_km": shortest_distance_to_path_km # Direct 3D distance to centerline
         })
 
     # Sort AGMs by their calculated distance along the path

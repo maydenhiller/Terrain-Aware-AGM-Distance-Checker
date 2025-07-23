@@ -24,7 +24,8 @@ def parse_kml_content(kml_data):
     linestrings = []
     try:
         kml = simplekml.Kml()
-        kml.parse(kml_data)
+        # Corrected: Use from_string to parse KML content
+        kml.from_string(kml_data)
 
         for feature in kml.features():
             if isinstance(feature, simplekml.features.Folder):

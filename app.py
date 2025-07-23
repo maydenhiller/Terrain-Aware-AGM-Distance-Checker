@@ -8,6 +8,7 @@ import requests
 import numpy as np
 from shapely.geometry import LineString, Point
 from shapely.ops import nearest_points
+import re # Import for natural sorting
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -51,7 +52,7 @@ def parse_kml_content(kml_data):
         main_folder = find_element_by_name(root, "1GOOGLE EARTH SEED FILE V2.0")
         target_scope = main_folder if main_folder is not None else root
 
-        # Find CENTERLINE linestring (could be directly a linestring or inside a folder)
+        # --- REVERTED: Find CENTERLINE linestring directly under target_scope ---
         centerline_container = find_element_by_name(target_scope, "CENTERLINE")
         if centerline_container:
             if centerline_container.tag == f"{KML_NAMESPACE}Placemark":
@@ -66,6 +67,8 @@ def parse_kml_content(kml_data):
                             alt = float(parts[2]) if len(parts) > 2 else 0.0
                             coords.append((lon, lat, alt)) # (lon, lat, alt)
                     centerline_linestrings.append({"name": centerline_container.find(f"{KML_NAMESPACE}name").text, "coordinates": coords})
+                else:
+                    st.warning("Found 'CENTERLINE' Placemark but no LineString geometry within it.")
             elif centerline_container.tag == f"{KML_NAMESPACE}Folder":
                 # If CENTERLINE is a folder, look for linestrings inside it
                 for placemark in centerline_container.iter(f"{KML_NAMESPACE}Placemark"):
@@ -81,7 +84,8 @@ def parse_kml_content(kml_data):
                                 coords.append((lon, lat, alt))
                         centerline_linestrings.append({"name": placemark.find(f"{KML_NAMESPACE}name").text, "coordinates": coords})
         else:
-            st.warning("Could not find a 'CENTERLINE' linestring or folder containing one.")
+            st.warning("Could not find a 'CENTERLINE' linestring or folder containing one directly under the main document.")
+
 
         # Find AGMs points (Placemarks, usually inside an 'AGMs' folder)
         agms_container = find_element_by_name(target_scope, "AGMs")
@@ -116,7 +120,7 @@ def get_elevations(coordinates, api_key):
     Returns a list of elevations in meters, or None if API call fails.
     """
     if not api_key:
-        st.error("Google Maps API Key is required for terrain-aware distance calculation.")
+        st.error("Google Maps API Key is required for terrain-aware distance calculation. Please ensure it's valid and enabled for Elevation API.")
         return None
 
     # Google Elevation API accepts locations as "latitude,longitude|latitude,longitude|..."
@@ -139,20 +143,19 @@ def get_elevations(coordinates, api_key):
             st.error(f"Google Maps Elevation API Error: {data['status']}. {data.get('error_message', '')}")
             return None
     except requests.exceptions.RequestException as e:
-        st.error(f"Network error or API request failed: {e}")
+        st.error(f"Network error or API request failed: {e}. Check your internet connection or API key restrictions.")
         return None
     except Exception as e:
         st.error(f"Error processing elevation data: {e}")
         return None
 
-def extract_numeric_from_agm_name(agm_name):
-    """Extracts the numeric part from an AGM name (e.g., '000', '010') for sorting."""
-    try:
-        # Assumes names are always numeric strings that can be converted to int
-        return int(agm_name)
-    except ValueError:
-        # Fallback for non-numeric names, assign a very large number to put them at the end
-        return float('inf')
+def natural_sort_key(s):
+    """
+    Key for natural sorting (e.g., '240A' before '240B', '9' before '10').
+    Splits the string into numeric and non-numeric parts for comparison.
+    """
+    return [int(text) if text.isdigit() else text.lower()
+            for text in re.split('([0-9]+)', s)]
 
 def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
     """
@@ -270,8 +273,8 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
             "shortest_distance_to_path_km": shortest_distance_to_path_km # Direct 3D distance to centerline
         })
 
-    # Sort AGMs explicitly by their numerical name to ensure "000", "010", etc. order
-    agms_with_path_distances.sort(key=lambda x: extract_numeric_from_agm_name(x['name']))
+    # MODIFIED: Sort AGMs explicitly by their natural name order
+    agms_with_path_distances.sort(key=lambda x: natural_sort_key(x['name']))
 
     # Prepare results in the requested format
     final_results = []
@@ -281,7 +284,6 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
         return final_results
 
     # Calculate segments between consecutive sorted AGMs
-    running_total_distance_km = 0.0
     # The 'total distance' for the first segment (000 to 010) should be the distance
     # from the projected point of 000 to the projected point of 010.
     # And then subsequent totals are cumulative from the projected point of 000.
@@ -364,14 +366,14 @@ if uploaded_file is not None:
         centerline_linestrings, agm_points = parse_kml_content(kml_content)
 
         if not centerline_linestrings:
-            st.warning("No 'CENTERLINE' linestring found in the uploaded file. Please ensure it exists.")
+            st.warning("No 'CENTERLINE' linestring or folder containing one found directly under the main document. Please ensure it exists.")
         if not agm_points:
-            st.warning("No 'AGMs' (points) found in the uploaded file. Please ensure they exist.")
+            st.warning("No 'AGMs' (points) found in the uploaded file. Please ensure they exist in a folder named 'AGMs'.")
 
         if centerline_linestrings and agm_points:
             st.success("Found CENTERLINE and AGMs. Proceeding with calculations.")
 
-            # Assuming we take the first CENTERLINE found
+            # Assuming we take the first CENTERLINE found (which should be the correct one now)
             centerline_coords = centerline_linestrings[0]['coordinates']
 
             st.write(f"Number of points in CENTERLINE: {len(centerline_coords)}")

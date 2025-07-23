@@ -410,4 +410,4 @@ between the points on the Earth's surface, and $(alt_2 - alt_1)$ is the differen
 The "Distance from Path Start" for each AGM is the cumulative 3D distance along the CENTERLINE path
 to the closest *perpendicular point* on that path to the AGM. The "Shortest Distance to Path" is the direct 3D distance
 from the AGM to its closest perpendicular point on the CENTERLINE.
-"
+""")

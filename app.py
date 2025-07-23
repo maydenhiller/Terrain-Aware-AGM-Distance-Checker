@@ -10,7 +10,7 @@ from shapely.ops import nearest_points
 # --- Page Setup ---
 st.set_page_config(page_title="🗺️ Terrain Distance Debugger", layout="centered")
 st.title("🚧 Terrain-Aware Distance Debugger")
-st.write("Upload a KMZ or KML file and trace exactly how distances are calculated.")
+st.write("Upload a KMZ or KML file. Placemark folders 'MAP NOTES' and 'ACCESS' will be ignored.")
 
 # --- Constants ---
 KML_NAMESPACE = "{http://www.opengis.net/kml/2.2}"
@@ -29,13 +29,23 @@ def parse_coordinates(text):
             st.warning(f"Skipping malformed coordinate: {pair} — {e}")
     return coords
 
-# --- KML Parser ---
+# --- KML Parser with Folder Filtering ---
 def parse_kml(kml_data):
     centerline, agms = [], []
     try:
         root = ET.fromstring(kml_data)
-        placemarks = root.findall(f".//{KML_NAMESPACE}Placemark")
-        for placemark in placemarks:
+
+        # Include placemarks outside folders
+        for placemark in root.findall(f".//{KML_NAMESPACE}Placemark"):
+            parent_folder = placemark.find(f"..")
+            folder_name = ""
+            if parent_folder.tag.endswith("Folder"):
+                name_tag = parent_folder.find(f"{KML_NAMESPACE}name")
+                folder_name = name_tag.text.strip().upper() if name_tag is not None else ""
+
+            if folder_name in ["MAP NOTES", "ACCESS"]:
+                continue  # Skip unwanted folders
+
             name_tag = placemark.find(f"{KML_NAMESPACE}name")
             name = name_tag.text.strip() if name_tag is not None else "Unnamed"
 
@@ -52,7 +62,7 @@ def parse_kml(kml_data):
                 centerline.extend(coords)
 
     except ET.ParseError as e:
-        st.error(f"KML Parse Error: {e}")
+        st.error(f"❌ KML Parse Error: {e}")
     return centerline, agms
 
 # --- Elevation API Fetch ---

@@ -16,7 +16,7 @@ st.write("Upload a KMZ or KML file with AGM Points and CENTERLINE path. ACCESS a
 KML_NAMESPACE = "{http://www.opengis.net/kml/2.2}"
 KM_TO_FEET = 3280.84
 KM_TO_MILES = 0.621371
-API_KEY = "YOUR_ELEVATION_API_KEY"  # <-- Replace with your actual key
+API_KEY = "AIzaSyB9HxznAvlGb02e-K1rhld_CPeAm_wvPWU"  # <-- Replace with your actual key
 
 # --- Coordinate Parser ---
 def parse_coordinates(text):

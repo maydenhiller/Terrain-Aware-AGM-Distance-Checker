@@ -173,7 +173,4 @@ if file:
         kml = file.read().decode("utf-8")
     elif ext == "kmz":
         with zipfile.ZipFile(io.BytesIO(file.read()), 'r') as zf:
-            kml_files = [n for n in zf.namelist() if n.endswith(".kml")]
-            st.write("📦 KMZ contents:", kml_files)
-            if kml_files:
-                kml = zf.read(kml_files[0]).
+            kml_files = [n for n in zf.namelist() if n.endswith

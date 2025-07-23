@@ -10,7 +10,7 @@ from shapely.ops import nearest_points
 # --- Page Setup ---
 st.set_page_config(page_title="🗺️ Terrain Distance Debugger", layout="centered")
 st.title("🚧 Terrain-Aware Distance Debugger")
-st.write("Upload a KMZ or KML file. Placemark folders 'MAP NOTES' and 'ACCESS' will be ignored.")
+st.write("Upload a KMZ or KML file. 'MAP NOTES' and 'ACCESS' folders will be ignored.")
 
 # --- Constants ---
 KML_NAMESPACE = "{http://www.opengis.net/kml/2.2}"
@@ -35,17 +35,33 @@ def parse_kml(kml_data):
     try:
         root = ET.fromstring(kml_data)
 
-        # Include placemarks outside folders
-        for placemark in root.findall(f".//{KML_NAMESPACE}Placemark"):
-            parent_folder = placemark.find(f"..")
-            folder_name = ""
-            if parent_folder.tag.endswith("Folder"):
-                name_tag = parent_folder.find(f"{KML_NAMESPACE}name")
-                folder_name = name_tag.text.strip().upper() if name_tag is not None else ""
-
+        # --- Process <Folder> placemarks
+        folders = root.findall(f".//{KML_NAMESPACE}Folder")
+        for folder in folders:
+            name_tag = folder.find(f"{KML_NAMESPACE}name")
+            folder_name = name_tag.text.strip().upper() if name_tag is not None and name_tag.text else ""
             if folder_name in ["MAP NOTES", "ACCESS"]:
-                continue  # Skip unwanted folders
+                continue  # Skip these folders
 
+            placemarks = folder.findall(f"{KML_NAMESPACE}Placemark")
+            for placemark in placemarks:
+                name_tag = placemark.find(f"{KML_NAMESPACE}name")
+                name = name_tag.text.strip() if name_tag is not None else "Unnamed"
+
+                point = placemark.find(f"{KML_NAMESPACE}Point")
+                line = placemark.find(f"{KML_NAMESPACE}LineString")
+
+                if point is not None:
+                    coords = parse_coordinates(point.find(f"{KML_NAMESPACE}coordinates").text)
+                    if coords:
+                        agms.append({"name": name, "coordinates": coords[0]})
+
+                elif line is not None:
+                    coords = parse_coordinates(line.find(f"{KML_NAMESPACE}coordinates").text)
+                    centerline.extend(coords)
+
+        # --- Also process placemarks under <Document> directly
+        for placemark in root.findall(f".//{KML_NAMESPACE}Document/{KML_NAMESPACE}Placemark"):
             name_tag = placemark.find(f"{KML_NAMESPACE}name")
             name = name_tag.text.strip() if name_tag is not None else "Unnamed"
 
@@ -56,16 +72,15 @@ def parse_kml(kml_data):
                 coords = parse_coordinates(point.find(f"{KML_NAMESPACE}coordinates").text)
                 if coords:
                     agms.append({"name": name, "coordinates": coords[0]})
-
             elif line is not None:
                 coords = parse_coordinates(line.find(f"{KML_NAMESPACE}coordinates").text)
                 centerline.extend(coords)
 
     except ET.ParseError as e:
-        st.error(f"❌ KML Parse Error: {e}")
+        st.error(f"KML Parse Error: {e}")
     return centerline, agms
 
-# --- Elevation API Fetch ---
+# --- Elevation Fetcher ---
 @st.cache_data(ttl=3600)
 def get_elevations(coords):
     elevations = []
@@ -88,7 +103,7 @@ def get_elevations(coords):
             st.error(f"Elevation fetch failed: {e}")
     return elevations
 
-# --- Distance Calculator ---
+# --- Distance Calculation ---
 def calculate_distances(centerline, agms):
     if len(centerline) < 2 or len(agms) < 2:
         st.error("Need at least 2 centerline points and 2 AGMs.")
@@ -144,7 +159,7 @@ def calculate_distances(centerline, agms):
         })
     return output
 
-# --- File Upload ---
+# --- Upload and Analyze ---
 file = st.file_uploader("📤 Upload KMZ or KML", type=["kmz", "kml"])
 if file:
     ext = file.name.split('.')[-1].lower()
@@ -160,15 +175,6 @@ if file:
 
     if kml:
         centerline, agms = parse_kml(kml)
+        st.write(f"✅ Parsed AGMs: {len(agms)}, CENTERLINE points: {len(centerline)}")
         if centerline and agms:
-            results = calculate_distances(centerline, agms)
-            if results:
-                df = pd.DataFrame(results)
-                st.dataframe(df.set_index("From AGM"))
-                st.download_button("📥 Export CSV", df.to_csv(index=False), "agm_distances.csv")
-            else:
-                st.error("📉 No distances calculated.")
-        else:
-            st.error("❌ AGMs or CENTERLINE data missing.")
-else:
-    st.info("⏳ Waiting for KMZ or KML upload...")
+            results = calculate_distances(centerline

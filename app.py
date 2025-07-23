@@ -165,3 +165,4 @@ if file:
             st.error("Failed to locate required data in the file.")
 else:
     st.info("Awaiting KMZ or KML upload to begin analysis.")
+st.write("Elevation test URL:", url)

@@ -289,4 +289,132 @@ def calculate_terrain_aware_distances(path_coords, agm_points, api_key):
         
         st.write(f"AGM {agm['name']}: {distance_along_path_km:.3f} km along path")
     
-    #
+    # Sort AGMs by natural order
+    agm_distances.sort(key=lambda x: natural_sort_key(x['name']))
+    
+    # Calculate segment distances between consecutive AGMs
+    results = []
+    if len(agm_distances) < 2:
+        return results
+    
+    base_distance = agm_distances[0]['distance_along_path_km']
+    
+    for i in range(len(agm_distances) - 1):
+        from_agm = agm_distances[i]
+        to_agm = agm_distances[i + 1]
+        
+        # Segment distance
+        segment_km = to_agm['distance_along_path_km'] - from_agm['distance_along_path_km']
+        segment_km = max(0, segment_km)  # Ensure non-negative
+        
+        # Total distance from first AGM
+        total_km = to_agm['distance_along_path_km'] - base_distance
+        total_km = max(0, total_km)
+        
+        results.append({
+            "From AGM": from_agm['name'],
+            "To AGM": to_agm['name'],
+            "Segment Distance (feet)": f"{segment_km * KM_TO_FEET:.2f}",
+            "Segment Distance (miles)": f"{segment_km * KM_TO_MILES:.3f}",
+            "Total Distance (feet)": f"{total_km * KM_TO_FEET:.2f}",
+            "Total Distance (miles)": f"{total_km * KM_TO_MILES:.3f}"
+        })
+        
+        st.write(f"Segment {from_agm['name']} → {to_agm['name']}: {segment_km:.3f} km")
+    
+    return results
+
+
+# --- Streamlit UI ---
+
+st.title("🗺️ KML/KMZ Terrain-Aware Distance Calculator")
+
+st.markdown("""
+Upload your `.kml` or `.kmz` file to calculate the terrain-aware (3D) distances
+of "AGMs" (points) along the "CENTERLINE" (linestring) found within the file.
+""")
+
+# Hardcoded API key as requested
+google_api_key = "AIzaSyB9HxznAvlGb02e-K1rhld_CPeAm_wvPWU"
+
+if 'google_api_key' not in st.session_state:
+    st.session_state.google_api_key = google_api_key
+
+uploaded_file = st.file_uploader(
+    "Choose a .kml or .kmz file",
+    type=["kml", "kmz"],
+    help="Upload a KML or KMZ file containing linestring and point data."
+)
+
+if uploaded_file is not None:
+    file_extension = uploaded_file.name.split('.')[-1].lower()
+    kml_content = None
+
+    if file_extension == "kml":
+        kml_content = uploaded_file.read().decode("utf-8")
+    elif file_extension == "kmz":
+        try:
+            with zipfile.ZipFile(io.BytesIO(uploaded_file.read()), 'r') as kmz_file:
+                kml_filenames = [name for name in kmz_file.namelist() if name.lower().endswith('.kml')]
+                if kml_filenames:
+                    kml_content = kmz_file.read(kml_filenames[0]).decode("utf-8")
+                else:
+                    st.error("No KML file found inside the KMZ archive.")
+        except zipfile.BadZipFile:
+            st.error("Invalid KMZ file. It might be corrupted or not a valid zip archive.")
+        except Exception as e:
+            st.error(f"Error processing KMZ file: {e}")
+
+    if kml_content:
+        st.subheader("Processing KML/KMZ Data...")
+        centerline_linestrings, agm_points = parse_kml_content(kml_content)
+
+        if centerline_linestrings and agm_points:
+            st.success(f"✅ Found {len(centerline_linestrings)} centerline(s) and {len(agm_points)} AGM points")
+            
+            # Use first centerline
+            centerline_coords = centerline_linestrings[0]['coordinates']
+            
+            st.write("🔄 Calculating terrain-aware distances...")
+            
+            # Calculate distances
+            distance_results = calculate_terrain_aware_distances(
+                centerline_coords, 
+                agm_points, 
+                st.session_state.google_api_key
+            )
+
+            if distance_results:
+                st.success("✅ Distance calculations completed!")
+                
+                # Display results
+                df = pd.DataFrame(distance_results)
+                st.dataframe(df.set_index("From AGM"))
+
+                # Export button
+                csv_data = df.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    label="📥 Export to CSV",
+                    data=csv_data,
+                    file_name="agm_distances.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.error("❌ No distances calculated. Check the debug output above.")
+        else:
+            if not centerline_linestrings:
+                st.error("❌ No CENTERLINE found")
+            if not agm_points:
+                st.error("❌ No AGM points found")
+
+st.markdown("""
+---
+**How it works:**
+1. Parses KML/KMZ files to find CENTERLINE path and AGM points
+2. Fetches real elevation data using Google Maps Elevation API
+3. Projects each AGM point onto the centerline path
+4. Calculates 3D distances accounting for terrain elevation changes
+5. Provides segment distances between consecutive AGMs and cumulative totals
+
+**3D Distance Formula:** $D_{3D} = \sqrt{D_{2D}^2 + (alt_2 - alt_1)^2}$
+""")

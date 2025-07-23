@@ -213,8 +213,9 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
                 p0_2d_len = centerline_2d_shapely.project(Point(path_2d_coords_for_shapely[idx]))
                 p1_2d_len = centerline_2d_shapely.project(Point(path_2d_coords_for_shapely[idx+1]))
 
-                if (p0_2d_len <= projected_measure_2d <= p1_2d_len) or \
-                   (p1_2d_len <= projected_measure_2d <= p0_2d_len): # Handle reversed segments
+                # Check if projected_measure_2d is within the bounds of the segment's 2D measures
+                # Handle cases where segments might be defined in reverse order or have very small lengths
+                if (min(p0_2d_len, p1_2d_len) <= projected_measure_2d <= max(p0_2d_len, p1_2d_len)):
                     segment_index = idx
                     break
             
@@ -271,6 +272,7 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
         })
 
     # Sort AGMs by their calculated distance along the path
+    # This is the crucial step to ensure "000" comes first, then "010", etc.
     agms_with_path_distances.sort(key=lambda x: x['distance_along_path_km'])
 
     # Prepare results in the requested format
@@ -281,14 +283,21 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
         return final_results
 
     # Calculate segments between consecutive sorted AGMs
+    # The running total will now correctly accumulate based on the sorted order
+    running_total_distance_km = 0.0
     for i in range(len(agms_with_path_distances) - 1):
         from_agm = agms_with_path_distances[i]
         to_agm = agms_with_path_distances[i+1]
 
+        # Segment distance is the difference in their cumulative distances along the centerline
         segment_dist_km = to_agm['distance_along_path_km'] - from_agm['distance_along_path_km']
         
+        # Accumulate total distance
+        running_total_distance_km += segment_dist_km
+        
         # The "Total Distance" for a row is the cumulative distance along the centerline to the 'To AGM'
-        total_distance_km = to_agm['distance_along_path_km']
+        # This is equivalent to running_total_distance_km at this point
+        total_distance_km = running_total_distance_km
 
         final_results.append({
             "From AGM": from_agm['name'],

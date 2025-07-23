@@ -84,6 +84,7 @@ def parse_kml_content(kml_data):
             st.warning("Could not find a 'CENTERLINE' linestring or folder containing one.")
 
         # Find AGMs points (Placemarks, usually inside an 'AGMs' folder)
+        # ET.iter traverses in document order, so this will preserve the KML order
         agms_container = find_element_by_name(target_scope, "AGMs")
         if agms_container and agms_container.tag == f"{KML_NAMESPACE}Folder":
             for placemark in agms_container.iter(f"{KML_NAMESPACE}Placemark"):
@@ -145,19 +146,10 @@ def get_elevations(coordinates, api_key):
         st.error(f"Error processing elevation data: {e}")
         return None
 
-def extract_numeric_from_agm_name(agm_name):
-    """Extracts the numeric part from an AGM name like '000', '010' for sorting."""
-    try:
-        # Assuming names are always numeric strings like "000", "010", etc.
-        return int(agm_name)
-    except ValueError:
-        # Fallback for non-numeric names, just return 0 or handle as needed
-        return 0 # Or float('inf') to put them at the end
-
 def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
     """
-    Calculates terrain-aware (3D) distances between sorted AGMs along the path,
-    using projection to the centerline.
+    Calculates terrain-aware (3D) distances between AGMs along the path,
+    using projection to the centerline, maintaining the original KML order of AGMs.
     Assumes path_coords are ordered and represent the CENTERLINE.
     agm_coords_with_elevations should be a list of {'name': ..., 'coordinates': (lon, lat, alt)}
     """
@@ -196,8 +188,9 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
         cumulative_3d_distances_along_path_km.append(cumulative_3d_distances_along_path_km[-1] + (segment_3d_m / 1000.0))
 
     # Calculate distance along path for each AGM by projecting onto centerline
+    # This list will maintain the original KML order of AGMs
     agms_with_path_distances = []
-    for agm in agm_coords_with_elevations:
+    for agm in agm_coords_with_elevations: # Iterate in the original KML order
         agm_name = agm['name']
         agm_lon, agm_lat, agm_alt = agm['coordinates'] # (lon, lat, alt) from input
 
@@ -215,7 +208,6 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
             # Fallback: interpolate altitude along the 3D centerline based on 2D projection
             projected_measure_2d = centerline_2d_shapely.project(closest_point_on_centerline_2d)
             
-            # Find the two closest vertices on the 2D line that bracket the projected_measure_2d
             segment_index = -1
             for idx in range(len(path_2d_coords_for_shapely) - 1):
                 p0_2d_len = centerline_2d_shapely.project(Point(path_2d_coords_for_shapely[idx]))
@@ -271,8 +263,8 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
             "shortest_distance_to_path_km": shortest_distance_to_path_km # Direct 3D distance to centerline
         })
 
-    # Sort AGMs explicitly by their numerical name to ensure "000", "010", etc. order
-    agms_with_path_distances.sort(key=lambda x: extract_numeric_from_agm_name(x['name']))
+    # NO SORTING HERE: The AGMs are already in KML document order from parse_kml_content
+    # and we want to maintain that order for the output table.
 
     # Prepare results in the requested format
     final_results = []
@@ -281,7 +273,7 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
         st.warning("At least two AGMs are required to calculate segments between them.")
         return final_results
 
-    # Calculate segments between consecutive sorted AGMs
+    # Calculate segments between consecutive AGMs in their original KML order
     running_total_distance_km = 0.0
     for i in range(len(agms_with_path_distances) - 1):
         from_agm = agms_with_path_distances[i]
@@ -293,14 +285,13 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
         # Ensure segment distance is not negative (can happen due to floating point or slight deviations)
         segment_dist_km = max(0, segment_dist_km)
 
-        # Accumulate total distance
-        # The total distance should be the cumulative distance to the 'To AGM'
-        # from the very first AGM (000) in the sorted list.
-        # So, we need to calculate the running total from the start of the sorted list.
+        # Accumulate total distance based on the segment distances
         if i == 0:
+            # For the very first segment, total distance is just the segment distance
             running_total_distance_km = segment_dist_km
         else:
-            running_total_distance_km = agms_with_path_distances[i+1]['distance_along_path_km'] - agms_with_path_distances[0]['distance_along_path_km']
+            # For subsequent segments, add the current segment distance to the running total
+            running_total_distance_km += segment_dist_km
         
         final_results.append({
             "From AGM": from_agm['name'],

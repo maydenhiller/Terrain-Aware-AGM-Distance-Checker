@@ -1,5 +1,5 @@
 import streamlit as st
-import simplekml
+import xml.etree.ElementTree as ET # New import for XML parsing
 from geopy.distance import geodesic
 import zipfile
 import io
@@ -14,81 +14,92 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# --- KML Namespace ---
+KML_NAMESPACE = "{http://www.opengis.net/kml/2.2}"
+
 # --- Helper Functions ---
 
-def find_feature_by_name(kml_object, name):
-    """Recursively searches for a feature (Folder, Placemark, Linestring) by name."""
-    for feature in kml_object.features():
-        if feature.name == name:
-            return feature
-        if isinstance(feature, simplekml.features.Folder):
-            found = find_feature_by_name(feature, name)
-            if found:
-                return found
+def find_element_by_name(parent_element, name_to_find):
+    """Recursively searches for an XML element (Folder or Placemark) by its KML name tag."""
+    for element in parent_element.iter(f"{KML_NAMESPACE}Folder"):
+        name_tag = element.find(f"{KML_NAMESPACE}name")
+        if name_tag is not None and name_tag.text == name_to_find:
+            return element
+    for element in parent_element.iter(f"{KML_NAMESPACE}Placemark"):
+        name_tag = element.find(f"{KML_NAMESPACE}name")
+        if name_tag is not None and name_tag.text == name_to_find:
+            return element
     return None
 
 def parse_kml_content(kml_data):
     """
-    Parses KML content to extract linestring coordinates and AGM points.
+    Parses KML content using ElementTree to extract linestring coordinates and AGM points.
     Supports both KML and KMZ (by extracting KML from KMZ).
     """
     centerline_linestrings = []
     agm_points = []
     try:
-        # Use simplekml.parse() with a file-like object
-        kml_doc = simplekml.parse(io.StringIO(kml_data))
+        root = ET.fromstring(kml_data)
 
-        # First, try to find the main folder "1GOOGLE EARTH SEED FILE V2.0"
-        main_folder = find_feature_by_name(kml_doc, "1GOOGLE EARTH SEED FILE V2.0")
-
-        if not main_folder:
-            st.warning("Could not find the main folder '1GOOGLE EARTH SEED FILE V2.0'. Searching globally for CENTERLINE and AGMs.")
-            # If main folder not found, search globally
-            target_scope = kml_doc
-        else:
-            target_scope = main_folder
+        # Find the main folder "1GOOGLE EARTH SEED FILE V2.0"
+        main_folder = find_element_by_name(root, "1GOOGLE EARTH SEED FILE V2.0")
+        target_scope = main_folder if main_folder is not None else root
 
         # Find CENTERLINE linestring (could be directly a linestring or inside a folder)
-        centerline_container = find_feature_by_name(target_scope, "CENTERLINE")
+        centerline_container = find_element_by_name(target_scope, "CENTERLINE")
         if centerline_container:
-            if isinstance(centerline_container, simplekml.features.Linestring):
-                centerline_linestrings.append({
-                    "name": centerline_container.name,
-                    "coordinates": centerline_container.coords
-                })
-            elif isinstance(centerline_container, simplekml.features.Folder):
+            if centerline_container.tag == f"{KML_NAMESPACE}Placemark":
+                linestring_geom = centerline_container.find(f"{KML_NAMESPACE}LineString")
+                if linestring_geom is not None:
+                    coords_text = linestring_geom.find(f"{KML_NAMESPACE}coordinates").text
+                    coords = []
+                    for pair in coords_text.strip().split(' '):
+                        if pair:
+                            parts = pair.split(',')
+                            lon, lat = float(parts[0]), float(parts[1])
+                            alt = float(parts[2]) if len(parts) > 2 else 0.0
+                            coords.append((lon, lat, alt)) # (lon, lat, alt)
+                    centerline_linestrings.append({"name": centerline_container.find(f"{KML_NAMESPACE}name").text, "coordinates": coords})
+            elif centerline_container.tag == f"{KML_NAMESPACE}Folder":
                 # If CENTERLINE is a folder, look for linestrings inside it
-                for sub_feature in centerline_container.features():
-                    if isinstance(sub_feature, simplekml.features.Linestring):
-                        centerline_linestrings.append({
-                            "name": sub_feature.name,
-                            "coordinates": sub_feature.coords
-                        })
+                for placemark in centerline_container.iter(f"{KML_NAMESPACE}Placemark"):
+                    linestring_geom = placemark.find(f"{KML_NAMESPACE}LineString")
+                    if linestring_geom is not None:
+                        coords_text = linestring_geom.find(f"{KML_NAMESPACE}coordinates").text
+                        coords = []
+                        for pair in coords_text.strip().split(' '):
+                            if pair:
+                                parts = pair.split(',')
+                                lon, lat = float(parts[0]), float(parts[1])
+                                alt = float(parts[2]) if len(parts) > 2 else 0.0
+                                coords.append((lon, lat, alt))
+                        centerline_linestrings.append({"name": placemark.find(f"{KML_NAMESPACE}name").text, "coordinates": coords})
         else:
             st.warning("Could not find a 'CENTERLINE' linestring or folder containing one.")
 
         # Find AGMs points (Placemarks, usually inside an 'AGMs' folder)
-        agms_container = find_feature_by_name(target_scope, "AGMs")
-        if agms_container and isinstance(agms_container, simplekml.features.Folder):
-            for feature in agms_container.features():
-                if isinstance(feature, simplekml.features.Placemark) and feature.geometry and feature.geometry.geom_type == 'Point':
+        agms_container = find_element_by_name(target_scope, "AGMs")
+        if agms_container and agms_container.tag == f"{KML_NAMESPACE}Folder":
+            for placemark in agms_container.iter(f"{KML_NAMESPACE}Placemark"):
+                point_geom = placemark.find(f"{KML_NAMESPACE}Point")
+                if point_geom is not None:
+                    coords_text = point_geom.find(f"{KML_NAMESPACE}coordinates").text
+                    parts = coords_text.strip().split(',')
+                    lon, lat = float(parts[0]), float(parts[1])
+                    alt = float(parts[2]) if len(parts) > 2 else 0.0
                     agm_points.append({
-                        "name": feature.name,
-                        "coordinates": feature.coords[0] # Point has single coordinate (lon, lat, alt)
+                        "name": placemark.find(f"{KML_NAMESPACE}name").text,
+                        "coordinates": (lon, lat, alt) # (lon, lat, alt)
                     })
-        elif agms_container and isinstance(agms_container, simplekml.features.Placemark) and agms_container.geometry and agms_container.geometry.geom_type == 'Point':
-            # Handle case where 'AGMs' might directly be a placemark (less likely but for robustness)
-            agm_points.append({
-                "name": agms_container.name,
-                "coordinates": agms_container.coords[0]
-            })
         else:
-            st.warning("Could not find an 'AGMs' folder containing points, or direct AGM points.")
+            st.warning("Could not find an 'AGMs' folder containing points.")
 
+    except ET.ParseError as e:
+        st.error(f"XML parsing error in KML content: {e}. Please ensure your KML is valid XML.")
+        return [], []
     except Exception as e:
         st.error(f"Error parsing KML content: {e}")
-        return [], [] # Return empty lists for both
-
+        return [], []
     return centerline_linestrings, agm_points
 
 @st.cache_data(ttl=3600) # Cache results for 1 hour to avoid repeated API calls for same points
@@ -141,6 +152,7 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
         return results
 
     # Get elevations for the entire CENTERLINE path
+    # path_coords are (lon, lat, alt), need (lon, lat) for elevation API
     path_coords_for_elevation = [(c[0], c[1]) for c in path_coords]
     path_elevations = get_elevations(path_coords_for_elevation, st.session_state.google_api_key)
 
@@ -264,14 +276,13 @@ if uploaded_file is not None:
             st.write("Fetching elevation data for AGMs...")
 
             # Fetch elevations for AGMs
-            # simplekml point coords are (longitude, latitude, altitude)
+            # agm_points coords are (longitude, latitude, altitude), need (lon, lat) for elevation API
             agm_coords_for_elevation_api = [(p['coordinates'][0], p['coordinates'][1]) for p in agm_points]
             agm_elevations = get_elevations(agm_coords_for_elevation_api, st.session_state.google_api_key)
 
             if agm_elevations:
                 # Update AGM points with fetched elevations
                 for i, agm in enumerate(agm_points):
-                    # simplekml coords are (longitude, latitude, altitude)
                     # We store (longitude, latitude, fetched_altitude)
                     agm['coordinates'] = (agm['coordinates'][0], agm['coordinates'][1], agm_elevations[i])
 

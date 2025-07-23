@@ -145,6 +145,15 @@ def get_elevations(coordinates, api_key):
         st.error(f"Error processing elevation data: {e}")
         return None
 
+def extract_numeric_from_agm_name(agm_name):
+    """Extracts the numeric part from an AGM name like '000', '010' for sorting."""
+    try:
+        # Assuming names are always numeric strings like "000", "010", etc.
+        return int(agm_name)
+    except ValueError:
+        # Fallback for non-numeric names, just return 0 or handle as needed
+        return 0 # Or float('inf') to put them at the end
+
 def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
     """
     Calculates terrain-aware (3D) distances between sorted AGMs along the path,
@@ -204,7 +213,6 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
             projected_alt = projected_elevation[0]
         else:
             # Fallback: interpolate altitude along the 3D centerline based on 2D projection
-            # This requires finding the segment and interpolating its altitude
             projected_measure_2d = centerline_2d_shapely.project(closest_point_on_centerline_2d)
             
             # Find the two closest vertices on the 2D line that bracket the projected_measure_2d
@@ -213,8 +221,6 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
                 p0_2d_len = centerline_2d_shapely.project(Point(path_2d_coords_for_shapely[idx]))
                 p1_2d_len = centerline_2d_shapely.project(Point(path_2d_coords_for_shapely[idx+1]))
 
-                # Check if projected_measure_2d is within the bounds of the segment's 2D measures
-                # Handle cases where segments might be defined in reverse order or have very small lengths
                 if (min(p0_2d_len, p1_2d_len) <= projected_measure_2d <= max(p0_2d_len, p1_2d_len)):
                     segment_index = idx
                     break
@@ -226,7 +232,6 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
                 segment_length_2d_actual = LineString([(p_start_3d_interp[1], p_start_3d_interp[0]), (p_end_3d_interp[1], p_end_3d_interp[0])]).length
                 
                 if segment_length_2d_actual > 0:
-                    # Calculate fraction of the 2D segment length that the projected point is along it
                     fraction_along_segment = geodesic((p_start_3d_interp[0], p_start_3d_interp[1]), (projected_lat, projected_lon)).m / segment_length_2d_actual
                 else:
                     fraction_along_segment = 0.0
@@ -244,20 +249,15 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
         shortest_distance_to_path_km = np.sqrt(dist_2d_m_to_proj**2 + delta_alt_m_to_proj**2) / 1000.0
 
         # Calculate the cumulative 3D distance along the path to the projected point of the AGM
-        # This is the most critical part for correct ordering and total distance.
-        
-        # Get the measure of the projected point along the 2D centerline
         projected_measure_2d_along_full_line = centerline_2d_shapely.project(closest_point_on_centerline_2d)
 
-        # Now, map this 2D measure to the 3D cumulative distances
-        # We need the cumulative 2D lengths of the centerline vertices for interpolation
+        # Map this 2D measure to the 3D cumulative distances using interpolation
         cumulative_2d_lengths_for_interp_shapely_units = [0.0]
         for i in range(1, len(path_2d_coords_for_shapely)):
             p0_2d = Point(path_2d_coords_for_shapely[i-1])
             p1_2d = Point(path_2d_coords_for_shapely[i])
             cumulative_2d_lengths_for_interp_shapely_units.append(cumulative_2d_lengths_for_interp_shapely_units[-1] + p0_2d.distance(p1_2d))
 
-        # Use numpy.interp to find the 3D cumulative distance corresponding to the 2D projected measure
         distance_along_path_km_for_agm = np.interp(
             projected_measure_2d_along_full_line,
             cumulative_2d_lengths_for_interp_shapely_units,
@@ -271,9 +271,8 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
             "shortest_distance_to_path_km": shortest_distance_to_path_km # Direct 3D distance to centerline
         })
 
-    # Sort AGMs by their calculated distance along the path
-    # This is the crucial step to ensure "000" comes first, then "010", etc.
-    agms_with_path_distances.sort(key=lambda x: x['distance_along_path_km'])
+    # Sort AGMs explicitly by their numerical name to ensure "000", "010", etc. order
+    agms_with_path_distances.sort(key=lambda x: extract_numeric_from_agm_name(x['name']))
 
     # Prepare results in the requested format
     final_results = []
@@ -283,7 +282,6 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
         return final_results
 
     # Calculate segments between consecutive sorted AGMs
-    # The running total will now correctly accumulate based on the sorted order
     running_total_distance_km = 0.0
     for i in range(len(agms_with_path_distances) - 1):
         from_agm = agms_with_path_distances[i]
@@ -292,20 +290,25 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
         # Segment distance is the difference in their cumulative distances along the centerline
         segment_dist_km = to_agm['distance_along_path_km'] - from_agm['distance_along_path_km']
         
-        # Accumulate total distance
-        running_total_distance_km += segment_dist_km
-        
-        # The "Total Distance" for a row is the cumulative distance along the centerline to the 'To AGM'
-        # This is equivalent to running_total_distance_km at this point
-        total_distance_km = running_total_distance_km
+        # Ensure segment distance is not negative (can happen due to floating point or slight deviations)
+        segment_dist_km = max(0, segment_dist_km)
 
+        # Accumulate total distance
+        # The total distance should be the cumulative distance to the 'To AGM'
+        # from the very first AGM (000) in the sorted list.
+        # So, we need to calculate the running total from the start of the sorted list.
+        if i == 0:
+            running_total_distance_km = segment_dist_km
+        else:
+            running_total_distance_km = agms_with_path_distances[i+1]['distance_along_path_km'] - agms_with_path_distances[0]['distance_along_path_km']
+        
         final_results.append({
             "From AGM": from_agm['name'],
             "To AGM": to_agm['name'],
             "Segment Distance (feet)": f"{segment_dist_km * KM_TO_FEET:.2f}",
             "Segment Distance (miles)": f"{segment_dist_km * KM_TO_MILES:.3f}",
-            "Total Distance (feet)": f"{total_distance_km * KM_TO_FEET:.2f}",
-            "Total Distance (miles)": f"{total_distance_km * KM_TO_MILES:.3f}"
+            "Total Distance (feet)": f"{running_total_distance_km * KM_TO_FEET:.2f}",
+            "Total Distance (miles)": f"{running_total_distance_km * KM_TO_MILES:.3f}"
         })
     
     return final_results

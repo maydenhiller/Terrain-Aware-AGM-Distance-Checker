@@ -282,6 +282,14 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
 
     # Calculate segments between consecutive sorted AGMs
     running_total_distance_km = 0.0
+    # The 'total distance' for the first segment (000 to 010) should be the distance
+    # from the projected point of 000 to the projected point of 010.
+    # And then subsequent totals are cumulative from the projected point of 000.
+
+    # Base distance for total calculation: this is the cumulative distance of the first AGM (000)
+    # from the start of the centerline.
+    base_distance_km = agms_with_path_distances[0]['distance_along_path_km']
+
     for i in range(len(agms_with_path_distances) - 1):
         from_agm = agms_with_path_distances[i]
         to_agm = agms_with_path_distances[i+1]
@@ -292,21 +300,18 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
         # Ensure segment distance is not negative (can happen due to floating point or slight deviations)
         segment_dist_km = max(0, segment_dist_km)
 
-        # Accumulate total distance based on the segment distances
-        if i == 0:
-            # For the very first segment, total distance is just the segment distance
-            running_total_distance_km = segment_dist_km
-        else:
-            # For subsequent segments, add the current segment distance to the running total
-            running_total_distance_km += segment_dist_km
-        
+        # Total distance for the current 'To AGM' is its cumulative distance from the centerline start
+        # minus the baseline (cumulative distance of the first AGM).
+        total_distance_km = to_agm['distance_along_path_km'] - base_distance_km
+        total_distance_km = max(0, total_distance_km) # Ensure non-negative
+
         final_results.append({
             "From AGM": from_agm['name'],
             "To AGM": to_agm['name'],
             "Segment Distance (feet)": f"{segment_dist_km * KM_TO_FEET:.2f}",
             "Segment Distance (miles)": f"{segment_dist_km * KM_TO_MILES:.3f}",
-            "Total Distance (feet)": f"{running_total_distance_km * KM_TO_FEET:.2f}",
-            "Total Distance (miles)": f"{running_total_distance_km * KM_TO_MILES:.3f}"
+            "Total Distance (feet)": f"{total_distance_km * KM_TO_FEET:.2f}",
+            "Total Distance (miles)": f"{total_distance_km * KM_TO_MILES:.3f}"
         })
     
     return final_results
@@ -421,4 +426,3 @@ The "Distance from Path Start" for each AGM is the cumulative 3D distance along 
 to the closest *perpendicular point* on that path to the AGM. The "Shortest Distance to Path" is the direct 3D distance
 from the AGM to its closest perpendicular point on the CENTERLINE.
 """)
-

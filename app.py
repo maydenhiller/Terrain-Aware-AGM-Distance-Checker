@@ -17,6 +17,10 @@ st.set_page_config(
 # --- KML Namespace ---
 KML_NAMESPACE = "{http://www.opengis.net/kml/2.2}"
 
+# --- Conversion Factors ---
+KM_TO_FEET = 3280.84 # 1 kilometer = 3280.84 feet
+KM_TO_MILES = 0.621371 # 1 kilometer = 0.621371 miles
+
 # --- Helper Functions ---
 
 def find_element_by_name(parent_element, name_to_find):
@@ -141,7 +145,8 @@ def get_elevations(coordinates, api_key):
 
 def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
     """
-    Calculates terrain-aware (3D) distances from the start of the path to each AGM.
+    Calculates terrain-aware (3D) distances from the start of the path to each AGM,
+    and then segment distances between sorted AGMs along the path.
     Assumes path_coords are ordered and represent the CENTERLINE.
     agm_coords_with_elevations should be a list of {'name': ..., 'coordinates': (lon, lat, alt)}
     """
@@ -177,17 +182,15 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
         segment_3d_m = np.sqrt(dist_2d_m**2 + delta_alt_m**2)
         cumulative_path_distances_km.append(cumulative_path_distances_km[-1] + (segment_3d_m / 1000.0))
 
-    # Now, find the closest point on the path for each AGM and its distance from path start
+    # Calculate distance along path for each AGM
+    agms_with_path_distances = []
     for agm in agm_coords_with_elevations:
         agm_lat, agm_lon = agm['coordinates'][1], agm['coordinates'][0]
-        agm_alt = agm['coordinates'][2] # Use the elevation fetched for AGM
+        agm_alt = agm['coordinates'][2]
 
         min_distance_to_path_point_km = float('inf')
-        distance_along_path_km = "N/A"
-        
-        # Find the closest point on the path to the AGM
-        # This is a simplified approach. For true projection, more complex geometry is needed.
-        # Here, we find the closest *vertex* on the path.
+        distance_along_path_km = 0.0 # Initialize to 0.0
+
         closest_path_point_index = -1
         for i, path_p in enumerate(path_3d_points):
             path_p_lat, path_p_lon, path_p_alt = path_p[0], path_p[1], path_p[2]
@@ -202,16 +205,56 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
         
         if closest_path_point_index != -1:
             distance_along_path_km = cumulative_path_distances_km[closest_path_point_index]
-
-        results.append({
-            "AGM Name": agm['name'],
-            "AGM Latitude": agm_lat,
-            "AGM Longitude": agm_lon,
-            "AGM Elevation (m)": f"{agm_alt:.2f}",
-            "Distance from Path Start (km)": f"{distance_along_path_km:.3f}",
-            "Shortest Distance to Path (km)": f"{min_distance_to_path_point_km:.3f}"
+        
+        agms_with_path_distances.append({
+            "name": agm['name'],
+            "coordinates": agm['coordinates'], # (lon, lat, alt)
+            "distance_along_path_km": distance_along_path_km,
+            "shortest_distance_to_path_km": min_distance_to_path_point_km
         })
-    return results
+
+    # Sort AGMs by their distance along the path
+    agms_with_path_distances.sort(key=lambda x: x['distance_along_path_km'])
+
+    # Prepare results in the requested format
+    final_results = []
+    total_cumulative_distance_km = 0.0
+
+    if not agms_with_path_distances:
+        return final_results
+
+    # Add a "start" point for the first segment
+    final_results.append({
+        "From AGM": "CENTERLINE Start",
+        "To AGM": agms_with_path_distances[0]['name'],
+        "Segment Distance (km)": f"{agms_with_path_distances[0]['distance_along_path_km']:.3f}",
+        "Segment Distance (feet)": f"{agms_with_path_distances[0]['distance_along_path_km'] * KM_TO_FEET:.2f}",
+        "Segment Distance (miles)": f"{agms_with_path_distances[0]['distance_along_path_km'] * KM_TO_MILES:.3f}",
+        "Total Distance (km)": f"{agms_with_path_distances[0]['distance_along_path_km']:.3f}",
+        "Total Distance (feet)": f"{agms_with_path_distances[0]['distance_along_path_km'] * KM_TO_FEET:.2f}",
+        "Total Distance (miles)": f"{agms_with_path_distances[0]['distance_along_path_km'] * KM_TO_MILES:.3f}"
+    })
+    total_cumulative_distance_km = agms_with_path_distances[0]['distance_along_path_km']
+
+    for i in range(1, len(agms_with_path_distances)):
+        prev_agm = agms_with_path_distances[i-1]
+        current_agm = agms_with_path_distances[i]
+
+        segment_dist_km = current_agm['distance_along_path_km'] - prev_agm['distance_along_path_km']
+        total_cumulative_distance_km += segment_dist_km
+
+        final_results.append({
+            "From AGM": prev_agm['name'],
+            "To AGM": current_agm['name'],
+            "Segment Distance (km)": f"{segment_dist_km:.3f}",
+            "Segment Distance (feet)": f"{segment_dist_km * KM_TO_FEET:.2f}",
+            "Segment Distance (miles)": f"{segment_dist_km * KM_TO_MILES:.3f}",
+            "Total Distance (km)": f"{total_cumulative_distance_km:.3f}",
+            "Total Distance (feet)": f"{total_cumulative_distance_km * KM_TO_FEET:.2f}",
+            "Total Distance (miles)": f"{total_cumulative_distance_km * KM_TO_MILES:.3f}"
+        })
+    
+    return final_results
 
 
 # --- Streamlit UI ---
@@ -294,7 +337,7 @@ if uploaded_file is not None:
 
                 if distance_results:
                     df = pd.DataFrame(distance_results)
-                    st.dataframe(df.set_index("AGM Name"))
+                    st.dataframe(df.set_index("From AGM"))
                 else:
                     st.warning("No distances calculated. Check if CENTERLINE has enough points or if AGMs have valid data.")
             else:
@@ -315,4 +358,3 @@ between the points on the Earth's surface, and $(alt_2 - alt_1)$ is the differen
 The "Distance from Path Start" for each AGM is the cumulative 3D distance along the CENTERLINE path
 to the closest vertex on the path to that AGM. The "Shortest Distance to Path" is the direct 3D distance
 from the AGM to its closest vertex on the CENTERLINE.
-""")

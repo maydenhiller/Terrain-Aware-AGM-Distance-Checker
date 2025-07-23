@@ -8,19 +8,18 @@ from shapely.geometry import LineString, Point
 from shapely.ops import nearest_points
 
 # --- Page Setup ---
-st.set_page_config(page_title="🛠️ Terrain Distance Debugger", layout="centered")
+st.set_page_config(page_title="🗺️ Terrain Distance Debugger", layout="centered")
 st.title("🚧 Terrain-Aware Distance Debugger")
-st.write("Upload a KML or KMZ file and see exactly how the app is working behind the scenes.")
+st.write("Upload a KMZ or KML file and trace exactly how distances are calculated.")
 
 # --- Constants ---
 KML_NAMESPACE = "{http://www.opengis.net/kml/2.2}"
 KM_TO_FEET = 3280.84
 KM_TO_MILES = 0.621371
-API_KEY = "YOUR_GOOGLE_ELEVATION_API_KEY"  # Replace with valid key
+API_KEY = "AIzaSyB9HxznAvlGb02e-K1rhld_CPeAm_wvPWU"
 
 # --- Coordinate Parser ---
 def parse_coordinates(text):
-    st.write("🔍 Parsing coordinates...")
     coords = []
     for pair in re.split(r'\s+', text.strip()):
         try:
@@ -28,16 +27,14 @@ def parse_coordinates(text):
             coords.append((lon, lat, alt))
         except Exception as e:
             st.warning(f"Skipping malformed coordinate: {pair} — {e}")
-    st.write(f"✅ Parsed {len(coords)} coordinates")
     return coords
 
-# --- KML Parser with Debug ---
+# --- KML Parser ---
 def parse_kml(kml_data):
     centerline, agms = [], []
     try:
         root = ET.fromstring(kml_data)
         placemarks = root.findall(f".//{KML_NAMESPACE}Placemark")
-        st.write(f"📍 Found {len(placemarks)} placemarks")
         for placemark in placemarks:
             name_tag = placemark.find(f"{KML_NAMESPACE}name")
             name = name_tag.text.strip() if name_tag is not None else "Unnamed"
@@ -54,12 +51,11 @@ def parse_kml(kml_data):
                 coords = parse_coordinates(line.find(f"{KML_NAMESPACE}coordinates").text)
                 centerline.extend(coords)
 
-        st.write(f"✅ AGMs: {len(agms)} — CENTERLINE points: {len(centerline)}")
     except ET.ParseError as e:
-        st.error(f"❌ KML Parse Error: {e}")
+        st.error(f"KML Parse Error: {e}")
     return centerline, agms
 
-# --- Elevation API Debugging ---
+# --- Elevation API Fetch ---
 @st.cache_data(ttl=3600)
 def get_elevations(coords):
     elevations = []
@@ -67,35 +63,33 @@ def get_elevations(coords):
         chunk = coords[i:i+100]
         loc_str = "|".join([f"{lat},{lon}" for lon, lat in chunk])
         url = f"https://maps.googleapis.com/maps/api/elevation/json?locations={loc_str}&key={API_KEY}"
-        st.write("🌐 Elevation API Request URL:", url)
+        st.write("🌐 Request URL:", url)
         try:
             time.sleep(0.2)
             resp = requests.get(url)
             data = resp.json()
             status = data.get("status", "UNKNOWN")
-            st.write(f"🔄 API Response Status: {status}")
+            st.write("🔄 API Response Status:", status)
             if status == "OK":
                 elevations += [r["elevation"] for r in data["results"]]
             else:
-                st.warning(f"🚫 Elevation API error: {status}")
+                st.warning(f"Elevation API error: {status}")
         except Exception as e:
-            st.error(f"⚠️ Failed elevation request: {e}")
-    st.write(f"📈 Retrieved {len(elevations)} elevations")
+            st.error(f"Elevation fetch failed: {e}")
     return elevations
 
-# --- Distance Calculation ---
+# --- Distance Calculator ---
 def calculate_distances(centerline, agms):
     if len(centerline) < 2 or len(agms) < 2:
-        st.error("🚫 Need at least 2 centerline points and 2 AGMs.")
+        st.error("Need at least 2 centerline points and 2 AGMs.")
         return []
 
     cl_2d = [(lon, lat) for lon, lat, _ in centerline]
     cl_elevs = get_elevations(cl_2d)
     if len(cl_elevs) != len(cl_2d):
-        st.error("❌ Elevation fetch failed for centerline.")
+        st.error("Elevation fetch failed for centerline.")
         return []
 
-    st.write("✅ Merging elevation with centerline")
     cl_3d = [(lon, lat, cl_elevs[i]) for i, (lon, lat) in enumerate(cl_2d)]
     cumulative = [0.0]
     for i in range(1, len(cl_3d)):
@@ -108,7 +102,7 @@ def calculate_distances(centerline, agms):
     agm_2d = [(a["coordinates"][0], a["coordinates"][1]) for a in agms]
     agm_elevs = get_elevations(agm_2d)
     if len(agm_elevs) != len(agm_2d):
-        st.error("❌ Elevation fetch failed for AGMs.")
+        st.error("Elevation fetch failed for AGMs.")
         return []
 
     for i, agm in enumerate(agms):
@@ -122,7 +116,7 @@ def calculate_distances(centerline, agms):
         proj = nearest_points(cl_geom, pt)[0]
         frac = cl_geom.project(proj) / cl_geom.length if cl_geom.length > 0 else 0
         dist_km = max(0, frac * cumulative[-1])
-        st.write(f"📍 {agm['name']} → projected at {frac:.4f} of path → {dist_km:.2f} km")
+        st.write(f"📍 AGM: {agm['name']} → projected fraction: {frac:.4f} → {dist_km:.2f} km")
         distances.append({"name": agm["name"], "dist_km": dist_km})
 
     distances.sort(key=lambda d: [int(t) if t.isdigit() else t for t in re.split(r'(\d+)', d["name"].lower())])
@@ -140,7 +134,7 @@ def calculate_distances(centerline, agms):
         })
     return output
 
-# --- File Upload Handler ---
+# --- File Upload ---
 file = st.file_uploader("📤 Upload KMZ or KML", type=["kmz", "kml"])
 if file:
     ext = file.name.split('.')[-1].lower()
@@ -155,17 +149,16 @@ if file:
                 kml = zf.read(kml_files[0]).decode("utf-8")
 
     if kml:
-        st.success("✅ KML content loaded")
         centerline, agms = parse_kml(kml)
         if centerline and agms:
             results = calculate_distances(centerline, agms)
             if results:
                 df = pd.DataFrame(results)
                 st.dataframe(df.set_index("From AGM"))
-                st.download_button("📥 Export to CSV", data=df.to_csv(index=False), file_name="agm_distances.csv")
+                st.download_button("📥 Export CSV", df.to_csv(index=False), "agm_distances.csv")
             else:
                 st.error("📉 No distances calculated.")
         else:
-            st.error("❌ Missing AGMs or centerline in file.")
+            st.error("❌ AGMs or CENTERLINE data missing.")
 else:
-    st.info("⏳ Waiting for file upload...")
+    st.info("⏳ Waiting for KMZ or KML upload...")

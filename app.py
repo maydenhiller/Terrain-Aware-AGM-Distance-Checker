@@ -48,35 +48,42 @@ def parse_kml_content(kml_data):
         else:
             target_scope = main_folder
 
-        # Find CENTERLINE linestring
-        centerline_feature = find_feature_by_name(target_scope, "CENTERLINE")
-        if centerline_feature and isinstance(centerline_feature, simplekml.features.Linestring):
-            centerline_linestrings.append({
-                "name": centerline_feature.name,
-                "coordinates": centerline_feature.coords
-            })
-        elif centerline_feature and isinstance(centerline_feature, simplekml.features.Folder):
-            # If CENTERLINE is a folder, look for linestrings inside it
-            for sub_feature in centerline_feature.features():
-                if isinstance(sub_feature, simplekml.features.Linestring):
-                    centerline_linestrings.append({
-                        "name": sub_feature.name,
-                        "coordinates": sub_feature.coords
-                    })
+        # Find CENTERLINE linestring (could be directly a linestring or inside a folder)
+        centerline_container = find_feature_by_name(target_scope, "CENTERLINE")
+        if centerline_container:
+            if isinstance(centerline_container, simplekml.features.Linestring):
+                centerline_linestrings.append({
+                    "name": centerline_container.name,
+                    "coordinates": centerline_container.coords
+                })
+            elif isinstance(centerline_container, simplekml.features.Folder):
+                # If CENTERLINE is a folder, look for linestrings inside it
+                for sub_feature in centerline_container.features():
+                    if isinstance(sub_feature, simplekml.features.Linestring):
+                        centerline_linestrings.append({
+                            "name": sub_feature.name,
+                            "coordinates": sub_feature.coords
+                        })
         else:
             st.warning("Could not find a 'CENTERLINE' linestring or folder containing one.")
 
-        # Find AGMs points (Placemarks)
-        agms_folder = find_feature_by_name(target_scope, "AGMs")
-        if agms_folder and isinstance(agms_folder, simplekml.features.Folder):
-            for feature in agms_folder.features():
+        # Find AGMs points (Placemarks, usually inside an 'AGMs' folder)
+        agms_container = find_feature_by_name(target_scope, "AGMs")
+        if agms_container and isinstance(agms_container, simplekml.features.Folder):
+            for feature in agms_container.features():
                 if isinstance(feature, simplekml.features.Placemark) and feature.geometry and feature.geometry.geom_type == 'Point':
                     agm_points.append({
                         "name": feature.name,
                         "coordinates": feature.coords[0] # Point has single coordinate (lon, lat, alt)
                     })
+        elif agms_container and isinstance(agms_container, simplekml.features.Placemark) and agms_container.geometry and agms_container.geometry.geom_type == 'Point':
+            # Handle case where 'AGMs' might directly be a placemark (less likely but for robustness)
+            agm_points.append({
+                "name": agms_container.name,
+                "coordinates": agms_container.coords[0]
+            })
         else:
-            st.warning("Could not find an 'AGMs' folder containing points.")
+            st.warning("Could not find an 'AGMs' folder containing points, or direct AGM points.")
 
     except Exception as e:
         st.error(f"Error parsing KML content: {e}")

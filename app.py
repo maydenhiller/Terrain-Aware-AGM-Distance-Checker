@@ -6,7 +6,8 @@ import io
 import pandas as pd
 import requests
 import numpy as np
-from shapely.geometry import LineString, Point # New import for Shapely
+from shapely.geometry import LineString, Point
+from shapely.ops import nearest_points
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -168,11 +169,7 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
     # Create a list of (lat, lon, alt) for the path vertices
     path_3d_points = [] # (lat, lon, alt)
     for i, c in enumerate(path_coords):
-        path_3d_points.append((c[1], c[0], path_elevations[i]))
-
-    # Create a 2D Shapely LineString from (lon, lat) for projection
-    path_2d_coords_for_shapely = [(c[0], c[1]) for c in path_coords] # (lon, lat) for Shapely
-    centerline_2d_shapely = LineString(path_2d_coords_for_shapely)
+        path_3d_points.append((c[1], c[0], path_elevations[i])) # (lat, lon, alt)
 
     # Calculate cumulative 3D distances along the centerline vertices
     cumulative_3d_distances_along_path_km = [0.0]
@@ -185,79 +182,67 @@ def calculate_terrain_aware_distances(path_coords, agm_coords_with_elevations):
         segment_3d_m = np.sqrt(dist_2d_m**2 + delta_alt_m**2)
         cumulative_3d_distances_along_path_km.append(cumulative_3d_distances_along_path_km[-1] + (segment_3d_m / 1000.0))
 
-    # Calculate 2D cumulative lengths along the shapely line for interpolation mapping
-    # This helps map the `shapely.project` output (linear measure) to the 3D path
-    cumulative_2d_lengths_shapely = [0.0]
-    for i in range(1, len(path_2d_coords_for_shapely)):
-        p0_2d_shapely = Point(path_2d_coords_for_shapely[i-1])
-        p1_2d_shapely = Point(path_2d_coords_for_shapely[i])
-        cumulative_2d_lengths_shapely.append(cumulative_2d_lengths_shapely[-1] + p0_2d_shapely.distance(p1_2d_shapely))
-
-
-    # Calculate distance along path for each AGM using Shapely's project
+    # Calculate distance along path for each AGM by projecting onto centerline segments
     agms_with_path_distances = []
     for agm in agm_coords_with_elevations:
         agm_name = agm['name']
-        agm_lon, agm_lat, agm_alt = agm['coordinates'] # (lon, lat, alt)
+        agm_lon, agm_lat, agm_alt = agm['coordinates'] # (lon, lat, alt) from input
 
-        agm_2d_point = Point(agm_lon, agm_lat)
+        agm_point_2d = Point(agm_lon, agm_lat)
 
-        # Project AGM onto 2D centerline to get linear referencing measure (in degrees/units of LineString)
-        projected_measure_2d = centerline_2d_shapely.project(agm_2d_point)
-
-        # Interpolate to get the projected point's (lon, lat) on the 2D centerline
-        projected_2d_point_shapely = centerline_2d_shapely.interpolate(projected_measure_2d)
-        projected_lon, projected_lat = projected_2d_point_shapely.x, projected_2d_point_shapely.y
-
-        # Fetch elevation for the projected point
-        projected_elevation = get_elevations([(projected_lon, projected_lat)], st.session_state.google_api_key)
-        if projected_elevation:
-            projected_alt = projected_elevation[0]
-        else:
-            st.warning(f"Could not fetch elevation for projected point of AGM {agm_name}. Using AGM's original elevation for 3D distance to projected point.")
-            projected_alt = agm_alt # Fallback to AGM's own altitude if projection elevation fails
-
-        # Calculate shortest 3D distance from AGM to its projected point on centerline
-        dist_2d_m_to_proj = geodesic((agm_lat, agm_lon), (projected_lat, projected_lon)).m
-        delta_alt_m_to_proj = agm_alt - projected_alt
-        shortest_distance_to_path_km = np.sqrt(dist_2d_m_to_proj**2 + delta_alt_m_to_proj**2) / 1000.0
-
-        # Map the 2D projected measure to the 3D cumulative distance along the path
-        distance_along_path_km = 0.0
+        min_distance_to_line_km = float('inf')
+        distance_along_path_km_for_agm = 0.0
         
-        # Find the segment where the projection falls and linearly interpolate 3D distance
-        for i in range(len(cumulative_2d_lengths_shapely) - 1):
-            # Check if projected_measure_2d falls within the current 2D segment's range
-            if cumulative_2d_lengths_shapely[i] <= projected_measure_2d <= cumulative_2d_lengths_shapely[i+1]:
-                segment_2d_length = cumulative_2d_lengths_shapely[i+1] - cumulative_2d_lengths_shapely[i]
+        # Iterate through each segment of the centerline
+        for i in range(len(path_3d_points) - 1):
+            p_start_3d = path_3d_points[i] # (lat, lon, alt)
+            p_end_3d = path_3d_points[i+1] # (lat, lon, alt)
 
-                if segment_2d_length > 0:
-                    # Fraction along the current 2D segment
-                    fraction_along_segment = (projected_measure_2d - cumulative_2d_lengths_shapely[i]) / segment_2d_length
+            # Create 2D Shapely LineString for the current segment
+            segment_2d_shapely = LineString([(p_start_3d[1], p_start_3d[0]), (p_end_3d[1], p_end_3d[0])]) # (lon, lat)
+
+            # Find the closest point on this 2D segment to the AGM
+            closest_point_on_segment_2d_shapely = nearest_points(segment_2d_shapely, agm_point_2d)[0]
+            projected_lon, projected_lat = closest_point_on_segment_2d_shapely.x, closest_point_on_segment_2d_shapely.y
+
+            # Fetch elevation for this projected point on the segment
+            projected_elevation = get_elevations([(projected_lon, projected_lat)], st.session_state.google_api_key)
+            if projected_elevation:
+                projected_alt = projected_elevation[0]
+            else:
+                # Fallback to linear interpolation of altitude if API fails for projected point
+                # Calculate fraction along the 2D segment
+                segment_length_2d = segment_2d_shapely.length
+                if segment_length_2d > 0:
+                    fraction_along_segment_2d = segment_2d_shapely.project(closest_point_on_segment_2d_shapely) / segment_length_2d
                 else:
-                    # Zero-length segment (duplicate points), treat as start of segment
-                    fraction_along_segment = 0.0
+                    fraction_along_segment_2d = 0.0 # Zero length segment
 
-                # Calculate the 3D length of the current segment
-                p_start_3d = path_3d_points[i]
-                p_end_3d = path_3d_points[i+1]
-                dist_2d_m_segment = geodesic((p_start_3d[0], p_start_3d[1]), (p_end_3d[0], p_end_3d[1])).m
-                delta_alt_m_segment = p_end_3d[2] - p_start_3d[2]
-                segment_3d_length_km = np.sqrt(dist_2d_m_segment**2 + delta_alt_m_segment**2) / 1000.0
+                projected_alt = p_start_3d[2] + fraction_along_segment_2d * (p_end_3d[2] - p_start_3d[2])
+                st.warning(f"Could not fetch elevation for projected point of AGM {agm_name} on segment {i}-{i+1}. Interpolating altitude.")
 
-                # Cumulative 3D distance up to the start of this segment + fractional 3D distance along this segment
-                distance_along_path_km = cumulative_3d_distances_along_path_km[i] + (fraction_along_segment * segment_3d_length_km)
-                break
+
+            # Calculate 3D distance from AGM to its projected point on this segment
+            dist_2d_m_to_proj = geodesic((agm_lat, agm_lon), (projected_lat, projected_lon)).m
+            delta_alt_m_to_proj = agm_alt - projected_alt
+            current_distance_to_line_km = np.sqrt(dist_2d_m_to_proj**2 + delta_alt_m_to_proj**2) / 1000.0
+
+            # If this is the shortest distance found so far, update the AGM's path distance
+            if current_distance_to_line_km < min_distance_to_line_km:
+                min_distance_to_line_km = current_distance_to_line_km
+                
+                # Calculate 3D distance from start of centerline to this projected point
+                dist_from_segment_start_2d_m = geodesic((p_start_3d[0], p_start_3d[1]), (projected_lat, projected_lon)).m
+                delta_alt_from_segment_start_m = projected_alt - p_start_3d[2]
+                dist_from_segment_start_3d_km = np.sqrt(dist_from_segment_start_2d_m**2 + delta_alt_from_segment_start_m**2) / 1000.0
+
+                distance_along_path_km_for_agm = cumulative_3d_distances_along_path_km[i] + dist_from_segment_start_3d_km
         
-        # Handle the edge case where the projected point is exactly at the end of the line
-        if projected_measure_2d == centerline_2d_shapely.length and len(cumulative_3d_distances_along_path_km) > 0:
-            distance_along_path_km = cumulative_3d_distances_along_path_km[-1]
-
         agms_with_path_distances.append({
             "name": agm_name,
             "coordinates": agm['coordinates'], # Original (lon, lat, alt)
-            "distance_along_path_km": distance_along_path_km,
-            "shortest_distance_to_path_km": shortest_distance_to_path_km
+            "distance_along_path_km": distance_along_path_km_for_agm, # Cumulative 3D distance along centerline
+            "shortest_distance_to_path_km": min_distance_to_line_km # Direct 3D distance to centerline
         })
 
     # Sort AGMs by their calculated distance along the path
@@ -351,17 +336,15 @@ if uploaded_file is not None:
 
             st.write(f"Number of points in CENTERLINE: {len(centerline_coords)}")
             st.write(f"Number of AGMs found: {len(agm_points)}")
-            st.write("Fetching elevation data for AGMs and projected points...")
+            st.write("Fetching elevation data for AGMs and centerline points...")
 
             # Fetch elevations for AGMs
-            # agm_points coords are (longitude, latitude, altitude), need (lon, lat) for elevation API
             agm_coords_for_elevation_api = [(p['coordinates'][0], p['coordinates'][1]) for p in agm_points]
             agm_elevations = get_elevations(agm_coords_for_elevation_api, st.session_state.google_api_key)
 
             if agm_elevations:
                 # Update AGM points with fetched elevations
                 for i, agm in enumerate(agm_points):
-                    # We store (longitude, latitude, fetched_altitude)
                     agm['coordinates'] = (agm['coordinates'][0], agm['coordinates'][1], agm_elevations[i])
 
                 st.success("Elevation data for AGMs fetched successfully!")

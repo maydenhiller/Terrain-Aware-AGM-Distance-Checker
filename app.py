@@ -34,7 +34,6 @@ def parse_kml(kml_data):
     centerline, agms = [], []
     try:
         root = ET.fromstring(kml_data)
-
         folders = root.findall(f".//{KML_NAMESPACE}Folder")
         st.write(f"🔎 Found {len(folders)} folders in KML.")
 
@@ -170,4 +169,12 @@ if file:
         kml = file.read().decode("utf-8")
     elif ext == "kmz":
         with zipfile.ZipFile(io.BytesIO(file.read()), 'r') as zf:
-            kml_files = [n for
+            kml_files = [n for n in zf.namelist() if n.endswith(".kml")]
+            st.write("📦 KMZ contents:", kml_files)
+            if kml_files:
+                kml = zf.read(kml_files[0]).decode("utf-8")
+            else:
+                st.warning("❌ No .kml file found inside KMZ archive.")
+
+    if kml:
+        centerline, agms

@@ -60,7 +60,7 @@ def parse_kml(kml_data):
         st.error(f"KML Parse Error: {e}")
     return centerline, agms
 
-# --- USGS Elevation Fetcher with Error Handling and Delay ---
+# --- USGS Elevation Fetcher with Error Handling and Throttle ---
 def get_usgs_elevations(coords):
     elevations = []
     for lon, lat in coords:

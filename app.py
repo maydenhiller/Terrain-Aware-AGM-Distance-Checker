@@ -10,7 +10,7 @@ from shapely.ops import nearest_points
 # --- Setup ---
 st.set_page_config(page_title="🗺️ Terrain Distance Debugger", layout="centered")
 st.title("🚧 Terrain-Aware Distance Debugger (USGS)")
-st.write("Upload a KMZ or KML file. Only placemarks in the AGMS folder will be measured. Folders MAP NOTES and ACCESS are ignored.")
+st.write("Only placemarks from the AGMS folder will be measured. MAP NOTES and ACCESS folders are ignored.")
 
 # --- Constants ---
 KML_NAMESPACE = "{http://www.opengis.net/kml/2.2}"
@@ -60,20 +60,24 @@ def parse_kml(kml_data):
         st.error(f"KML Parse Error: {e}")
     return centerline, agms
 
-# --- USGS Elevation Fetcher ---
+# --- USGS Elevation Fetcher with Error Handling and Delay ---
 def get_usgs_elevations(coords):
     elevations = []
     for lon, lat in coords:
         url = f"https://nationalmap.gov/epqs/pqs.php?x={lon}&y={lat}&units=Feet&output=json"
         try:
             resp = requests.get(url)
-            data = resp.json()
-            elev = data["USGS_Elevation_Point_Query_Service"]["Elevation_Query"]["Elevation"]
-            elevations.append(elev)
+            if resp.status_code == 200 and resp.text.strip():
+                data = resp.json()
+                elev = data["USGS_Elevation_Point_Query_Service"]["Elevation_Query"]["Elevation"]
+                elevations.append(elev)
+            else:
+                st.warning(f"USGS returned no data for ({lat}, {lon})")
+                elevations.append(0)
         except Exception as e:
             st.warning(f"USGS elevation failed for ({lat}, {lon}): {e}")
             elevations.append(0)
-        time.sleep(0.1)
+        time.sleep(0.25)
     return elevations
 
 # --- Distance Calculator ---
@@ -89,7 +93,6 @@ def calculate_distances(centerline, agms):
         return []
 
     cl_3d = [(lon, lat, cl_elevs[i]) for i, (lon, lat) in enumerate(cl_2d)]
-
     cumulative = [0.0]
     for i in range(1, len(cl_3d)):
         p1, p2 = cl_3d[i-1], cl_3d[i]

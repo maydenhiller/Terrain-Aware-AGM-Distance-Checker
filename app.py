@@ -9,12 +9,11 @@ from shapely.ops import nearest_points
 
 # --- Setup ---
 st.set_page_config(page_title="🗺️ Terrain Distance Debugger", layout="centered")
-st.title("🚧 Terrain-Aware Distance Debugger")
+st.title("🚧 Terrain-Aware Distance Debugger (USGS)")
 st.write("Upload a KMZ or KML file. Only placemarks in the AGMS folder will be measured. Folders MAP NOTES and ACCESS are ignored.")
 
 # --- Constants ---
 KML_NAMESPACE = "{http://www.opengis.net/kml/2.2}"
-API_KEY = "AIzaSyBV-YG0RDLIOg-60CVrDJ7-lOhG4gwq_4U"
 KM_TO_FEET = 3280.84
 KM_TO_MILES = 0.621371
 
@@ -61,24 +60,20 @@ def parse_kml(kml_data):
         st.error(f"KML Parse Error: {e}")
     return centerline, agms
 
-# --- Elevation Fetcher ---
-@st.cache_data(ttl=3600)
-def get_elevations(coords):
+# --- USGS Elevation Fetcher ---
+def get_usgs_elevations(coords):
     elevations = []
-    for i in range(0, len(coords), 100):
-        chunk = coords[i:i+100]
-        loc_str = "|".join([f"{lat},{lon}" for lon, lat in chunk])
-        url = f"https://maps.googleapis.com/maps/api/elevation/json?locations={loc_str}&key={API_KEY}"
-        time.sleep(0.2)
+    for lon, lat in coords:
+        url = f"https://nationalmap.gov/epqs/pqs.php?x={lon}&y={lat}&units=Feet&output=json"
         try:
             resp = requests.get(url)
             data = resp.json()
-            if data.get("status") == "OK":
-                elevations += [r["elevation"] for r in data["results"]]
-            else:
-                st.warning(f"Elevation API Error: {data.get('status')}")
+            elev = data["USGS_Elevation_Point_Query_Service"]["Elevation_Query"]["Elevation"]
+            elevations.append(elev)
         except Exception as e:
-            st.error(f"Elevation fetch failed: {e}")
+            st.warning(f"USGS elevation failed for ({lat}, {lon}): {e}")
+            elevations.append(0)
+        time.sleep(0.1)
     return elevations
 
 # --- Distance Calculator ---
@@ -88,7 +83,11 @@ def calculate_distances(centerline, agms):
         return []
 
     cl_2d = [(lon, lat) for lon, lat, _ in centerline]
-    cl_elevs = get_elevations(cl_2d)
+    cl_elevs = get_usgs_elevations(cl_2d)
+    if not cl_elevs or len(cl_elevs) != len(cl_2d):
+        st.error("USGS elevation lookup failed.")
+        return []
+
     cl_3d = [(lon, lat, cl_elevs[i]) for i, (lon, lat) in enumerate(cl_2d)]
 
     cumulative = [0.0]
@@ -100,7 +99,7 @@ def calculate_distances(centerline, agms):
         cumulative.append(cumulative[-1] + d3d / 1000.0)
 
     agm_2d = [(a["coordinates"][0], a["coordinates"][1]) for a in agms]
-    agm_elevs = get_elevations(agm_2d)
+    agm_elevs = get_usgs_elevations(agm_2d)
     for i, agm in enumerate(agms):
         agm["coordinates"] = (agm["coordinates"][0], agm["coordinates"][1], agm_elevs[i])
 
@@ -126,43 +125,4 @@ def calculate_distances(centerline, agms):
             "To AGM": distances[i+1]["name"],
             "Segment Distance (feet)": f"{seg_miles * 5280:.2f}",
             "Segment Distance (miles)": f"{seg_miles:.3f}",
-            "Total Distance (feet)": f"{tot_miles * 5280:.2f}",
-            "Total Distance (miles)": f"{tot_miles:.3f}"
-        })
-    return output
-
-# --- Streamlit UI ---
-file = st.file_uploader("📤 Upload KMZ or KML", type=["kmz", "kml"])
-if file:
-    ext = file.name.split('.')[-1].lower()
-    kml = None
-    if ext == "kml":
-        kml = file.read().decode("utf-8")
-    elif ext == "kmz":
-        with zipfile.ZipFile(io.BytesIO(file.read()), 'r') as zf:
-            kml_files = [n for n in zf.namelist() if n.endswith(".kml")]
-            st.write("📦 KMZ contents:", kml_files)
-            if kml_files:
-                kml = zf.read(kml_files[0]).decode("utf-8")
-            else:
-                st.warning("❌ No .kml file found inside KMZ archive.")
-
-    if kml:
-        centerline, agms = parse_kml(kml)
-        st.write(f"✅ Parsed CENTERLINE points: {len(centerline)}")
-        st.write(f"✅ Parsed AGMs from 'AGMS' folder: {len(agms)}")
-
-        if centerline and agms:
-            results = calculate_distances(centerline, agms)
-            if results:
-                df = pd.DataFrame(results)
-                st.dataframe(df)
-                st.download_button(
-                    "📥 Download AGM Distances (Feet & Miles)",
-                    df.to_csv(index=False),
-                    file_name="agm_distances_us_units.csv"
-                )
-        else:
-            st.warning("❌ Missing valid AGMs or CENTERLINE data.")
-else:
-    st.info("👀 Upload a KMZ or KML file to begin.")
+            "Total Distance (feet)": f"{tot

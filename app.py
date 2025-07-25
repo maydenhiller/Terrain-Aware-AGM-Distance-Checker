@@ -10,13 +10,12 @@ from shapely.ops import nearest_points
 # --- Setup ---
 st.set_page_config(page_title="🗺️ Terrain Distance Debugger", layout="centered")
 st.title("🚧 Terrain-Aware Distance Debugger")
-st.write("Upload a KMZ or KML file with AGMs and CENTERLINE. Folders 'MAP NOTES' and 'ACCESS' are ignored.")
+st.write("Upload a KMZ or KML file. Only placemarks in the AGMS folder will be measured. Folders MAP NOTES and ACCESS are ignored.")
 
 # --- Constants ---
 KML_NAMESPACE = "{http://www.opengis.net/kml/2.2}"
-API_KEY = "YOUR_API_KEY_HERE"
+API_KEY = "YOUR_API_KEY_HERE"  # Replace with your Google Elevation API key
 KM_TO_FEET, KM_TO_MILES = 3280.84, 0.621371
-EXCLUDE_TAGS = ["MAP NOTES", "ACCESS"]
 
 # --- Coordinate Parser ---
 def parse_coordinates(text):
@@ -29,40 +28,28 @@ def parse_coordinates(text):
             pass
     return coords
 
-# --- KML Parser with Folder Filtering ---
+# --- KML Parser ---
 def parse_kml(kml_data):
     centerline, agms = [], []
     try:
         root = ET.fromstring(kml_data)
         folders = root.findall(f".//{KML_NAMESPACE}Folder")
+
         for folder in folders:
             name_tag = folder.find(f"{KML_NAMESPACE}name")
             folder_name = name_tag.text.strip().upper() if name_tag is not None and name_tag.text else ""
-            if folder_name in EXCLUDE_TAGS:
+
+            if folder_name in ["MAP NOTES", "ACCESS"]:
                 continue
+
             placemarks = folder.findall(f"{KML_NAMESPACE}Placemark")
             for pm in placemarks:
                 name = pm.find(f"{KML_NAMESPACE}name")
                 label = name.text.strip() if name is not None else "Unnamed"
                 point = pm.find(f"{KML_NAMESPACE}Point")
                 line = pm.find(f"{KML_NAMESPACE}LineString")
-                if point is not None:
-                    coords = parse_coordinates(point.find(f"{KML_NAMESPACE}coordinates").text)
-                    if coords:
-                        agms.append({"name": label, "coordinates": coords[0]})
-                elif line is not None:
-                    coords = parse_coordinates(line.find(f"{KML_NAMESPACE}coordinates").text)
-                    centerline.extend(coords)
 
-        document = root.find(f"{KML_NAMESPACE}Document")
-        if document is not None:
-            placemarks = document.findall(f"{KML_NAMESPACE}Placemark")
-            for pm in placemarks:
-                name = pm.find(f"{KML_NAMESPACE}name")
-                label = name.text.strip() if name is not None else "Unnamed"
-                point = pm.find(f"{KML_NAMESPACE}Point")
-                line = pm.find(f"{KML_NAMESPACE}LineString")
-                if point is not None:
+                if folder_name == "AGMS" and point is not None:
                     coords = parse_coordinates(point.find(f"{KML_NAMESPACE}coordinates").text)
                     if coords:
                         agms.append({"name": label, "coordinates": coords[0]})
@@ -120,29 +107,26 @@ def calculate_distances(centerline, agms):
     distances = []
     for agm in agms:
         name = agm["name"]
-        if any(tag in name.upper() for tag in EXCLUDE_TAGS):
-            st.markdown(f"<span style='color:red;'>⛔ Skipped AGM: {name}</span>", unsafe_allow_html=True)
-            continue
         lon, lat, alt = agm["coordinates"]
         pt = Point(lon, lat)
         proj = nearest_points(cl_geom, pt)[0]
         frac = cl_geom.project(proj) / cl_geom.length if cl_geom.length > 0 else 0
         dist_km = max(0, frac * cumulative[-1])
-        st.markdown(f"<span style='color:green;'>✅ Included AGM: {name} → {dist_km:.2f} km</span>", unsafe_allow_html=True)
-        distances.append({"name": name, "dist_km": dist_km})
+        st.markdown(f"<span style='color:green;'>✅ AGM: {name} → {dist_km * KM_TO_MILES:.2f} miles</span>", unsafe_allow_html=True)
+        distances.append({"name": name, "dist_miles": dist_km * KM_TO_MILES})
 
     distances.sort(key=lambda d: [int(t) if t.isdigit() else t for t in re.split(r'(\d+)', d["name"].lower())])
     output = []
     for i in range(len(distances)-1):
-        seg_km = distances[i+1]["dist_km"] - distances[i]["dist_km"]
-        tot_km = distances[i+1]["dist_km"] - distances[0]["dist_km"]
+        seg_miles = distances[i+1]["dist_miles"] - distances[i]["dist_miles"]
+        tot_miles = distances[i+1]["dist_miles"] - distances[0]["dist_miles"]
         output.append({
             "From AGM": distances[i]["name"],
             "To AGM": distances[i+1]["name"],
-            "Segment Distance (feet)": f"{seg_km * KM_TO_FEET:.2f}",
-            "Segment Distance (miles)": f"{seg_km * KM_TO_MILES:.3f}",
-            "Total Distance (feet)": f"{tot_km * KM_TO_FEET:.2f}",
-            "Total Distance (miles)": f"{tot_km * KM_TO_MILES:.3f}"
+            "Segment Distance (feet)": f"{seg_miles * KM_TO_FEET / KM_TO_MILES:.2f}",
+            "Segment Distance (miles)": f"{seg_miles:.3f}",
+            "Total Distance (feet)": f"{tot_miles * KM_TO_FEET / KM_TO_MILES:.2f}",
+            "Total Distance (miles)": f"{tot_miles:.3f}"
         })
     return output
 
@@ -165,8 +149,18 @@ if file:
     if kml:
         centerline, agms = parse_kml(kml)
         st.write(f"✅ Parsed CENTERLINE points: {len(centerline)}")
-        st.write(f"✅ Parsed AGMs before filter: {len(agms)}")
+        st.write(f"✅ Parsed AGMs from AGMS folder: {len(agms)}")
         if centerline and agms:
             results = calculate_distances(centerline, agms)
             if results:
-                df
+                df = pd.DataFrame(results)
+                st.dataframe(df)
+                st.download_button(
+                    "📥 Download AGM Distances (Feet & Miles)",
+                    df.to_csv(index=False),
+                    file_name="agm_distances_us_units.csv"
+                )
+        else:
+            st.error("❌ Missing AGMs or centerline data.")
+else:
+    st.info("👀 Upload a KMZ or KML file to begin.")

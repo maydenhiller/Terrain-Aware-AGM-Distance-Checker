@@ -14,7 +14,7 @@ st.write("Upload a KMZ or KML file with AGMs and CENTERLINE. Folders 'MAP NOTES'
 
 # --- Constants ---
 KML_NAMESPACE = "{http://www.opengis.net/kml/2.2}"
-API_KEY = "AIzaSyB9HxznAvlGb02e-K1rhld_CPeAm_wvPWU"
+API_KEY = "YOUR_API_KEY_HERE"
 KM_TO_FEET, KM_TO_MILES = 3280.84, 0.621371
 EXCLUDE_TAGS = ["MAP NOTES", "ACCESS"]
 
@@ -35,20 +35,17 @@ def parse_kml(kml_data):
     try:
         root = ET.fromstring(kml_data)
         folders = root.findall(f".//{KML_NAMESPACE}Folder")
-
         for folder in folders:
             name_tag = folder.find(f"{KML_NAMESPACE}name")
             folder_name = name_tag.text.strip().upper() if name_tag is not None and name_tag.text else ""
             if folder_name in EXCLUDE_TAGS:
                 continue
-
             placemarks = folder.findall(f"{KML_NAMESPACE}Placemark")
             for pm in placemarks:
                 name = pm.find(f"{KML_NAMESPACE}name")
                 label = name.text.strip() if name is not None else "Unnamed"
                 point = pm.find(f"{KML_NAMESPACE}Point")
                 line = pm.find(f"{KML_NAMESPACE}LineString")
-
                 if point is not None:
                     coords = parse_coordinates(point.find(f"{KML_NAMESPACE}coordinates").text)
                     if coords:
@@ -65,7 +62,6 @@ def parse_kml(kml_data):
                 label = name.text.strip() if name is not None else "Unnamed"
                 point = pm.find(f"{KML_NAMESPACE}Point")
                 line = pm.find(f"{KML_NAMESPACE}LineString")
-
                 if point is not None:
                     coords = parse_coordinates(point.find(f"{KML_NAMESPACE}coordinates").text)
                     if coords:
@@ -150,7 +146,7 @@ def calculate_distances(centerline, agms):
         })
     return output
 
-# --- Upload and Process ---
+# --- Streamlit UI ---
 file = st.file_uploader("📤 Upload KMZ or KML", type=["kmz", "kml"])
 if file:
     ext = file.name.split('.')[-1].lower()
@@ -173,3 +169,4 @@ if file:
         if centerline and agms:
             results = calculate_distances(centerline, agms)
             if results:
+                df

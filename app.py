@@ -14,8 +14,9 @@ st.write("Upload a KMZ or KML file. Only placemarks in the AGMS folder will be m
 
 # --- Constants ---
 KML_NAMESPACE = "{http://www.opengis.net/kml/2.2}"
-API_KEY = "YOUR_API_KEY_HERE"  # Replace with your Google Elevation API key
-KM_TO_FEET, KM_TO_MILES = 3280.84, 0.621371
+API_KEY = "AIzaSyBV-YG0RDLIOg-60CVrDJ7-lOhG4gwq_4U"
+KM_TO_FEET = 3280.84
+KM_TO_MILES = 0.621371
 
 # --- Coordinate Parser ---
 def parse_coordinates(text):
@@ -37,7 +38,7 @@ def parse_kml(kml_data):
 
         for folder in folders:
             name_tag = folder.find(f"{KML_NAMESPACE}name")
-            folder_name = name_tag.text.strip().upper() if name_tag is not None and name_tag.text else ""
+            folder_name = name_tag.text.strip().upper() if name_tag is not None else ""
 
             if folder_name in ["MAP NOTES", "ACCESS"]:
                 continue
@@ -112,8 +113,8 @@ def calculate_distances(centerline, agms):
         proj = nearest_points(cl_geom, pt)[0]
         frac = cl_geom.project(proj) / cl_geom.length if cl_geom.length > 0 else 0
         dist_km = max(0, frac * cumulative[-1])
-        st.markdown(f"<span style='color:green;'>✅ AGM: {name} → {dist_km * KM_TO_MILES:.2f} miles</span>", unsafe_allow_html=True)
-        distances.append({"name": name, "dist_miles": dist_km * KM_TO_MILES})
+        dist_miles = dist_km * KM_TO_MILES
+        distances.append({"name": name, "dist_miles": dist_miles})
 
     distances.sort(key=lambda d: [int(t) if t.isdigit() else t for t in re.split(r'(\d+)', d["name"].lower())])
     output = []
@@ -123,9 +124,9 @@ def calculate_distances(centerline, agms):
         output.append({
             "From AGM": distances[i]["name"],
             "To AGM": distances[i+1]["name"],
-            "Segment Distance (feet)": f"{seg_miles * KM_TO_FEET / KM_TO_MILES:.2f}",
+            "Segment Distance (feet)": f"{seg_miles * 5280:.2f}",
             "Segment Distance (miles)": f"{seg_miles:.3f}",
-            "Total Distance (feet)": f"{tot_miles * KM_TO_FEET / KM_TO_MILES:.2f}",
+            "Total Distance (feet)": f"{tot_miles * 5280:.2f}",
             "Total Distance (miles)": f"{tot_miles:.3f}"
         })
     return output
@@ -149,7 +150,8 @@ if file:
     if kml:
         centerline, agms = parse_kml(kml)
         st.write(f"✅ Parsed CENTERLINE points: {len(centerline)}")
-        st.write(f"✅ Parsed AGMs from AGMS folder: {len(agms)}")
+        st.write(f"✅ Parsed AGMs from 'AGMS' folder: {len(agms)}")
+
         if centerline and agms:
             results = calculate_distances(centerline, agms)
             if results:
@@ -161,6 +163,6 @@ if file:
                     file_name="agm_distances_us_units.csv"
                 )
         else:
-            st.error("❌ Missing AGMs or centerline data.")
+            st.warning("❌ Missing valid AGMs or CENTERLINE data.")
 else:
     st.info("👀 Upload a KMZ or KML file to begin.")

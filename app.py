@@ -125,4 +125,43 @@ def calculate_distances(centerline, agms):
             "To AGM": distances[i+1]["name"],
             "Segment Distance (feet)": f"{seg_miles * 5280:.2f}",
             "Segment Distance (miles)": f"{seg_miles:.3f}",
-            "Total Distance (feet)": f"{tot
+            "Total Distance (feet)": f"{tot_miles * 5280:.2f}",
+            "Total Distance (miles)": f"{tot_miles:.3f}"
+        })
+    return output
+
+# --- Streamlit UI ---
+file = st.file_uploader("📤 Upload KMZ or KML", type=["kmz", "kml"])
+if file:
+    ext = file.name.split('.')[-1].lower()
+    kml = None
+    if ext == "kml":
+        kml = file.read().decode("utf-8")
+    elif ext == "kmz":
+        with zipfile.ZipFile(io.BytesIO(file.read()), 'r') as zf:
+            kml_files = [n for n in zf.namelist() if n.endswith(".kml")]
+            st.write("📦 KMZ contents:", kml_files)
+            if kml_files:
+                kml = zf.read(kml_files[0]).decode("utf-8")
+            else:
+                st.warning("❌ No .kml file found inside KMZ archive.")
+
+    if kml:
+        centerline, agms = parse_kml(kml)
+        st.write(f"✅ Parsed CENTERLINE points: {len(centerline)}")
+        st.write(f"✅ Parsed AGMs from 'AGMS' folder: {len(agms)}")
+
+        if centerline and agms:
+            results = calculate_distances(centerline, agms)
+            if results:
+                df = pd.DataFrame(results)
+                st.dataframe(df)
+                st.download_button(
+                    "📥 Download AGM Distances (Feet & Miles)",
+                    df.to_csv(index=False),
+                    file_name="agm_distances_usgs.csv"
+                )
+        else:
+            st.warning("❌ Missing valid AGMs or CENTERLINE data.")
+else:
+    st.info("👀 Upload a KMZ or KML file to begin.")

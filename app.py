@@ -1,25 +1,29 @@
 import streamlit as st
 import xml.etree.ElementTree as ET
-from geopy.distance import geodesic
-import zipfile, io, time, re, requests
+import zipfile, io, re, time, requests
 import pandas as pd
 import numpy as np
+from geopy.distance import geodesic
 from shapely.geometry import LineString, Point
 from shapely.ops import nearest_points
+from functools import lru_cache
 
 # --- Streamlit Setup ---
-st.set_page_config(page_title="🗺️ Terrain Distance Debugger", layout="centered")
-st.title("🚧 Terrain-Aware Distance Debugger (USGS v1 + Fallback)")
-st.write("Measuring only placemarks in the AGMS folder. MAP NOTES and ACCESS are ignored.")
+st.set_page_config(page_title="🗺️ AGM Distance Debugger", layout="centered")
+st.title("🚧 Terrain-Aware AGM Distance Debugger (OpenTopography)")
+st.write("Only placemarks in the AGMS folder will be measured. Folders MAP NOTES and ACCESS are ignored.")
 
 # --- Constants ---
-KML_NAMESPACE   = "{http://www.opengis.net/kml/2.2}"
-KM_TO_MILES     = 0.621371
-USGS_ENDPOINT   = "https://epqs.nationalmap.gov/v1/json"
-OPEN_ELEV_BASE  = "https://api.open-elevation.com/api/v1/lookup"
+KML_NS      = "{http://www.opengis.net/kml/2.2}"
+SRTM_TYPE   = "SRTMGL1"
+OPTO_API    = "https://portal.opentopography.org/API/globaldem"
+OPTO_KEY    = "49a90bbd39265a2efa15a52c00575150"
+KM_TO_FEET  = 3280.84
+KM_TO_MILES = 0.621371
 
-# --- Coordinate Parsing ---
-def parse_coordinates(text):
+# --- Coordinate Parser ---
+def parse_coordinates(text: str):
+    """Parse KML coordinate text into list of (lon, lat, alt)."""
     coords = []
     for trio in re.split(r"\s+", text.strip()):
         try:
@@ -29,154 +33,149 @@ def parse_coordinates(text):
             continue
     return coords
 
-# --- KML Parsing ---
-def parse_kml(kml_data):
+# --- KML Parser ---
+def parse_kml(kml: str):
+    """Extract centerline coordinates and AGM points from KML string."""
     centerline, agms = [], []
-    try:
-        root    = ET.fromstring(kml_data)
-        folders = root.findall(f".//{KML_NAMESPACE}Folder")
-        for folder in folders:
-            name_tag = folder.find(f"{KML_NAMESPACE}name")
-            fname    = name_tag.text.strip().upper() if name_tag is not None else ""
-            if fname in ("MAP NOTES", "ACCESS"):
-                continue
+    root = ET.fromstring(kml)
+    for folder in root.findall(f".//{KML_NS}Folder"):
+        name_el = folder.find(f"{KML_NS}name")
+        fname = name_el.text.strip().upper() if name_el is not None else ""
+        if fname in ("MAP NOTES", "ACCESS"):
+            continue
 
-            for pm in folder.findall(f"{KML_NAMESPACE}Placemark"):
-                label = pm.find(f"{KML_NAMESPACE}name")
-                label = label.text.strip() if label is not None else "Unnamed"
-                pt = pm.find(f"{KML_NAMESPACE}Point")
-                ln = pm.find(f"{KML_NAMESPACE}LineString")
+        for pm in folder.findall(f"{KML_NS}Placemark"):
+            label_el = pm.find(f"{KML_NS}name")
+            label = label_el.text.strip() if label_el is not None else "Unnamed"
+            pt = pm.find(f"{KML_NS}Point")
+            ln = pm.find(f"{KML_NS}LineString")
 
-                if fname == "AGMS" and pt is not None:
-                    c = parse_coordinates(pt.find(f"{KML_NAMESPACE}coordinates").text)
-                    if c:
-                        agms.append({"name": label, "coords": c[0]})
-                elif ln is not None:
-                    centerline.extend(parse_coordinates(ln.find(f"{KML_NAMESPACE}coordinates").text))
-    except Exception as e:
-        st.error(f"KML parse error: {e}")
+            if fname == "AGMS" and pt is not None:
+                txt = pt.find(f"{KML_NS}coordinates").text
+                pts = parse_coordinates(txt)
+                if pts:
+                    agms.append({"name": label, "coords": pts[0]})
+            elif ln is not None:
+                txt = ln.find(f"{KML_NS}coordinates").text
+                centerline.extend(parse_coordinates(txt))
+
     return centerline, agms
 
-# --- Elevation Fetchers ---
-def fetch_usgs_elev(sess, lon, lat, retries=3, backoff=0.5):
-    params = {"x": lon, "y": lat, "units": "Feet"}
-    for i in range(retries):
-        try:
-            resp = sess.get(USGS_ENDPOINT, params=params, timeout=5)
-            if resp.status_code == 200:
-                data = resp.json()
-                elev = (data
-                        .get("USGS_Elevation_Point_Query_Service", {})
-                        .get("Elevation_Query", {})
-                        .get("Elevation"))
-                if elev is not None:
-                    return elev
-                st.warning(f"USGS JSON missing Elevation at ({lat:.6f},{lon:.6f})")
-            else:
-                st.warning(f"USGS HTTP {resp.status_code} at ({lat:.6f},{lon:.6f})")
-        except Exception as e:
-            st.warning(f"USGS error at ({lat:.6f},{lon:.6f}): {e}")
-        time.sleep(backoff * (i + 1))
-    return None
+# --- OpenTopography Elevation Fetch ---
+@lru_cache(maxsize=None)
+def fetch_opentopo_elevation(lon: float, lat: float) -> float:
+    """
+    Query OpenTopography GlobalDEM API for elevation at a single point.
+    Returns elevation in meters.
+    """
+    params = {
+        "demtype": SRTM_TYPE,
+        "south": lat, "north": lat,
+        "west": lon, "east": lon,
+        "outputFormat": "JSON",
+        "API_Key": OPTO_KEY
+    }
+    resp = requests.get(OPTO_API, params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    # data["data"] → [[lon, lat, elev]]
+    elev = data.get("data", [[None, None, 0]])[0][2]
+    return float(elev)
 
-def fetch_open_elev(sess, lon, lat):
-    params = {"locations": f"{lat},{lon}"}
-    try:
-        resp = sess.get(OPEN_ELEV_BASE, params=params, timeout=5)
-        if resp.status_code == 200:
-            results = resp.json().get("results", [])
-            if results and "elevation" in results[0]:
-                return results[0]["elevation"]
-    except:
-        pass
-    return None
-
-def get_elevations(coords):
-    sess, elevs = requests.Session(), []
+def get_opentopo_elevations(coords):
+    """
+    Given a list of (lon, lat) tuples, return list of elevations (m).
+    Uses caching to avoid repeat calls.
+    """
+    elevs = []
     for lon, lat in coords:
-        elev = fetch_usgs_elev(sess, lon, lat)
-        if elev is None:
-            elev = fetch_open_elev(sess, lon, lat)
-            if elev is not None:
-                st.info(f"Fallback Open-Elev used at ({lat:.6f},{lon:.6f})")
-        if elev is None:
-            st.error(f"No elevation for ({lat:.6f},{lon:.6f}); defaulting to 0")
-            elev = 0
-        elevs.append(elev)
-        time.sleep(0.25)
+        try:
+            z = fetch_opentopo_elevation(lon, lat)
+        except Exception as e:
+            st.warning(f"OpenTopo error at ({lat:.6f}, {lon:.6f}): {e}")
+            z = 0.0
+        elevs.append(z)
+        time.sleep(0.2)  # throttle
     return elevs
 
-# --- Distance Calculation ---
+# --- Distance Calculator ---
 def calculate_distances(centerline, agms):
     if len(centerline) < 2 or len(agms) < 2:
         st.error("Need at least 2 centerline points and 2 AGMs.")
         return []
 
-    # Centerline elevations
-    cl2d    = [(lon, lat) for lon, lat, _ in centerline]
-    cl_elev = get_elevations(cl2d)
-    cl3d    = [(lon, lat, cl_elev[i]) for i, (lon, lat) in enumerate(cl2d)]
+    # Prepare 2D line coords
+    cl2d = [(lon, lat) for lon, lat, _ in centerline]
+    # Fetch elevations for each centerline vertex
+    cl_z = get_opentopo_elevations(cl2d)
+    cl3d = [(lon, lat, cl_z[i]) for i, (lon, lat) in enumerate(cl2d)]
 
-    # Cumulative 3D distance (km)
+    # Compute cumulative 3D distance (in kilometers) along centerline
     cum = [0.0]
     for i in range(1, len(cl3d)):
-        p1, p2 = cl3d[i-1], cl3d[i]
-        d2d     = geodesic((p1[1], p1[0]), (p2[1], p2[0])).meters
-        d_alt   = p2[2] - p1[2]
-        cum.append(cum[-1] + np.sqrt(d2d**2 + d_alt**2) / 1000.0)
+        x0, y0, z0 = cl3d[i - 1]
+        x1, y1, z1 = cl3d[i]
+        d2d = geodesic((y0, x0), (y1, x1)).meters
+        d3d = np.sqrt(d2d**2 + (z1 - z0)**2)
+        cum.append(cum[-1] + d3d / 1000.0)
 
-    # AGM elevations & projection
-    agm2d      = [(a["coords"][0], a["coords"][1]) for a in agms]
-    agm_elev   = get_elevations(agm2d)
+    # Elevations for each AGM
+    agm2d = [(a["coords"][0], a["coords"][1]) for a in agms]
+    agm_z = get_opentopo_elevations(agm2d)
     for i, a in enumerate(agms):
         lon, lat = a["coords"][:2]
-        a["coords"] = (lon, lat, agm_elev[i])
+        a["coords"] = (lon, lat, agm_z[i])
 
-    cl_geom = LineString(cl2d)
-    pts     = []
+    # Project AGMs onto centerline and record distances
+    line = LineString(cl2d)
+    pts = []
     for a in agms:
         lon, lat, _ = a["coords"]
-        proj       = nearest_points(cl_geom, Point(lon, lat))[0]
-        frac       = cl_geom.project(proj) / cl_geom.length if cl_geom.length else 0
-        dist_km    = max(0, frac * cum[-1])
+        proj_pt = nearest_points(line, Point(lon, lat))[0]
+        frac = line.project(proj_pt) / line.length if line.length else 0
+        dist_km = max(0, frac * cum[-1])
         pts.append({"name": a["name"], "miles": dist_km * KM_TO_MILES})
 
-    # Sort & build table
-    pts.sort(key=lambda x: [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", x["name"].lower())])
+    # Sort by name (handles numeric sorting)
+    pts.sort(key=lambda d: [int(t) if t.isdigit() else t
+                             for t in re.split(r"(\d+)", d["name"].lower())])
+
+    # Build segment & total distances
     rows = []
     start = pts[0]["miles"]
-    for i in range(len(pts)-1):
+    for i in range(len(pts) - 1):
         m0, m1 = pts[i]["miles"], pts[i+1]["miles"]
-        seg, tot = m1-m0, m1-start
+        seg = m1 - m0
+        tot = m1 - start
         rows.append({
             "From AGM": pts[i]["name"],
             "To AGM": pts[i+1]["name"],
             "Segment (mi)": f"{seg:.3f}",
-            "Segment (ft)": f"{seg*5280:.2f}",
+            "Segment (ft)": f"{seg * KM_TO_FEET:.2f}",
             "Total (mi)":   f"{tot:.3f}",
-            "Total (ft)":   f"{tot*5280:.2f}"
+            "Total (ft)":   f"{tot * KM_TO_FEET:.2f}"
         })
     return rows
 
-# --- UI Wiring ---
-uploaded = st.file_uploader("📤 Upload KMZ or KML", type=["kmz","kml"])
+# --- Streamlit UI ---
+uploaded = st.file_uploader("📤 Upload KMZ or KML", type=["kmz", "kml"])
 if uploaded:
-    raw_kml = None
-    ext     = uploaded.name.split(".")[-1].lower()
+    raw = None
+    ext = uploaded.name.split(".")[-1].lower()
 
     if ext == "kml":
-        raw_kml = uploaded.read().decode("utf-8")
+        raw = uploaded.read().decode("utf-8")
     else:
-        with zipfile.ZipFile(io.BytesIO(uploaded.read())) as zf:
-            kmls = [f for f in zf.namelist() if f.endswith(".kml")]
-            st.write("📦 KMZ contents:", kmls)
-            if kmls:
-                raw_kml = zf.read(kmls[0]).decode("utf-8")
-            else:
-                st.warning("No .kml inside KMZ.")
+        zf = zipfile.ZipFile(io.BytesIO(uploaded.read()))
+        kmls = [f for f in zf.namelist() if f.endswith(".kml")]
+        st.write("📦 KMZ contents:", kmls)
+        if kmls:
+            raw = zf.read(kmls[0]).decode("utf-8")
+        else:
+            st.warning("No .kml file found inside KMZ.")
 
-    if raw_kml:
-        cl, agms = parse_kml(raw_kml)
+    if raw:
+        cl, agms = parse_kml(raw)
         st.write(f"✅ Parsed CENTERLINE points: {len(cl)}")
         st.write(f"✅ Parsed AGMs: {len(agms)}")
 
@@ -186,12 +185,11 @@ if uploaded:
                 df = pd.DataFrame(table)
                 st.dataframe(df)
                 st.download_button(
-                    "📥 Download AGM Distances",
+                    "📥 Download Distances (Feet & Miles)",
                     df.to_csv(index=False),
-                    file_name="agm_distances.csv"
+                    file_name="agm_distances_opentopo.csv"
                 )
         else:
-            st.warning("Missing valid centerline or AGM data.")
+            st.warning("Missing valid CENTERLINE or AGM data.")
 else:
-    st.info("Upload a KMZ or KML file to start measuring.")
-
+    st.info("Upload a KMZ or KML file to begin.")

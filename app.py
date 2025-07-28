@@ -3,28 +3,28 @@ from fastkml import kml
 import requests
 from xml.etree import ElementTree as ET
 
-def get_features(obj):
-    feat = getattr(obj, "features", None)
-    if feat is None:
-        return []
-    return list(feat()) if callable(feat) else feat
+def extract_coords(features):
+    coords = []
+    for feat in features:
+        geom = getattr(feat, "geometry", None)
+        if geom and hasattr(geom, "coords"):
+            coords.extend(list(geom.coords))
+        sub_feats = getattr(feat, "features", None)
+        if sub_feats:
+            nested = list(sub_feats()) if callable(sub_feats) else sub_feats
+            coords.extend(extract_coords(nested))
+    return coords
 
 def parse_kml_coords(kml_file):
     try:
-        content = kml_file.read()  # keep bytes for XML declaration
-        ET.fromstring(content)     # fast sanity check
-
+        content = kml_file.read()  # keep raw bytes
+        ET.fromstring(content)     # validate XML
+        
         doc = kml.KML()
         doc.from_string(content)
-
-        coords = []
-        for feature in get_features(doc):
-            for placemark in get_features(feature):
-                geom = getattr(placemark, "geometry", None)
-                if geom and hasattr(geom, "coords"):
-                    coords.extend(geom.coords)
-
-        return coords
+        
+        root_feats = list(doc.features())
+        return extract_coords(root_feats)
 
     except Exception as e:
         st.error(f"⚠️ Failed to parse KML file: {e}")

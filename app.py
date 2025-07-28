@@ -1,18 +1,15 @@
-import streamlit as st
-import requests
+# ── API Key & Endpoint Diagnostics ──────────────────────────────────────────
 
-OPTO_KEY = "49a90bbd39265a2efa15a52c00575150"
-
-st.sidebar.markdown("## 🌐 API Key & Endpoint Checker")
-with st.sidebar.expander("Run Diagnostics", True):
-    lat = st.number_input("Latitude",   value=34.703428, format="%.6f")
-    lon = st.number_input("Longitude",  value=-95.101749, format="%.6f")
+st.sidebar.markdown("## 🔍 API Key Diagnostics")
+with st.sidebar.expander("Run Diagnostics", expanded=True):
+    lat = st.number_input("Latitude", value=34.703428, format="%.6f")
+    lon = st.number_input("Longitude", value=-95.101749, format="%.6f")
     demtype = st.selectbox("DEM Type", ["SRTMGL3", "AW3D30"])
     method = st.radio("Lookup Method", ["GlobalDEM (bbox)", "Fallback Open-Elevation"])
 
     if st.button("▶️ Test Now"):
         if method == "GlobalDEM (bbox)":
-            # build a tiny box ±1e-5 degrees (~1m)
+            # Build a tiny bbox ±1e-5°
             delta = 1e-5
             params = {
                 "demtype":      demtype,
@@ -25,14 +22,14 @@ with st.sidebar.expander("Run Diagnostics", True):
             }
             url = "https://portal.opentopography.org/API/globaldem"
         else:
-            # Open-Elevation fallback
+            url = "https://api.open-elevation.com/api/v1/lookup"
             params = {"locations": f"{lat},{lon}"}
-            url    = "https://api.open-elevation.com/api/v1/lookup"
 
         resp = requests.get(url, params=params, timeout=10)
 
+        # Show what was actually called
         st.write("**Request URL**")
-        st.code(resp.request.url, language="bash")
+        st.code(resp.request.url)
 
         st.write("**Status Code**")
         st.write(resp.status_code)
@@ -41,6 +38,23 @@ with st.sidebar.expander("Run Diagnostics", True):
         st.write(resp.text)
 
         st.markdown("---")
-        st.markdown("**Browser Test URLs**")
-        st.markdown(f"""
-1. GlobalDEM (tiny box):
+        st.write("**Browser-Ready URLs**")
+
+        # GlobalDEM browser URL
+        globaldem_url = (
+            f"https://portal.opentopography.org/API/globaldem"
+            f"?demtype={demtype}"
+            f"&south={lat:.6f}&north={lat:.6f}"
+            f"&west={lon:.6f}&east={lon:.6f}"
+            f"&outputFormat=JSON&API_Key={OPTO_KEY}"
+        )
+        st.code(globaldem_url, language="bash")
+
+        # Open-Elevation browser URL
+        open_elev_url = (
+            f"https://api.open-elevation.com/api/v1/lookup"
+            f"?locations={lat:.6f},{lon:.6f}"
+        )
+        st.code(open_elev_url, language="bash")
+
+# ───────────────────────────────────────────────────────────────────────────────

@@ -1,75 +1,117 @@
 import streamlit as st
-import numpy as np
+import requests
 import math
-import srtm
+import zipfile
+import xml.etree.ElementTree as ET
+from io import BytesIO
+import srtm  # pip-installed via requirements.txt
 
-# ── Setup ───────────────────────────────────────────────────────────────────────
-
-st.set_page_config("Fast AGM Distances", layout="wide")
-st.title("🗻 Fast Terrain-Aware Distances via Local SRTM")
-
-# Load local SRTM data (first run will download needed tiles)
+# ── Load local SRTM tiles ──────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def load_srtm():
     return srtm.get_data()
 
 elev_data = load_srtm()
 
-# Haversine vectorized
-def haversine_batch(lats, lons):
-    R = 6_371_000  # Earth radius in meters
-    φ = np.radians(lats)
-    λ = np.radians(lons)
-    dφ = φ[1:] - φ[:-1]
-    dλ = λ[1:] - λ[:-1]
-    a = np.sin(dφ/2)**2 + np.cos(φ[:-1])*np.cos(φ[1:])*np.sin(dλ/2)**2
-    return 2 * R * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+# ── Helpers ────────────────────────────────────────────────────────────────────
+def fetch_open_elev(lat, lon):
+    url = "https://api.open-elevation.com/api/v1/lookup"
+    resp = requests.get(url, params={"locations": f"{lat:.6f},{lon:.6f}"}, timeout=10)
+    resp.raise_for_status()
+    return float(resp.json()["results"][0]["elevation"])
 
-# ── UI & Logic ─────────────────────────────────────────────────────────────────
+def get_elevation(lat, lon):
+    """
+    Try local SRTM first; if missing tile, fall back to Open-Elevation.
+    """
+    elev = elev_data.get_elevation(lat, lon)
+    if elev is None:
+        elev = fetch_open_elev(lat, lon)
+        src = "Open-Elevation"
+    else:
+        src = "SRTM"
+    return elev, src
 
-uploaded = st.file_uploader("Upload centerline (KML/KMZ)", type=["kml","kmz"])
-if not uploaded:
-    st.info("Please upload a file to begin.")
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6_371_000
+    φ1, φ2 = math.radians(lat1), math.radians(lat2)
+    dφ = math.radians(lat2 - lat1)
+    dλ = math.radians(lon2 - lon1)
+    a = math.sin(dφ/2)**2 + math.cos(φ1)*math.cos(φ2)*math.sin(dλ/2)**2
+    return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+def parse_centerline(file):
+    data = file.read()
+    if file.name.lower().endswith(".kmz"):
+        z = zipfile.ZipFile(BytesIO(data))
+        for name in z.namelist():
+            if name.lower().endswith(".kml"):
+                data = z.read(name)
+                break
+    root = ET.fromstring(data)
+    ns = {"kml": root.tag.split("}")[0].strip("{")}
+    pts = []
+    for ls in root.findall(".//kml:LineString", ns):
+        text = ls.find("kml:coordinates", ns).text.strip()
+        for tok in text.split():
+            lon, lat, *_ = tok.split(",")
+            pts.append((float(lat), float(lon)))
+    return pts
+
+# ── Streamlit UI ──────────────────────────────────────────────────────────────
+st.set_page_config("Fast AGM Distances", layout="wide")
+st.title("🚀 Terrain-Aware AGM Distances (SRTM + Progress)")
+
+upload = st.file_uploader("Upload centerline (KML/KMZ)", type=["kml", "kmz"])
+if not upload:
+    st.info("Please upload a KML or KMZ to begin.")
     st.stop()
 
-# Parse coords (your existing parse_centerline function)
-pts = parse_centerline(uploaded)
-if len(pts) < 2:
-    st.error("Need at least 2 points.")
+try:
+    points = parse_centerline(upload)
+except Exception as e:
+    st.error(f"Failed to parse file: {e}")
     st.stop()
 
-lats = np.array([p[0] for p in pts])
-lons = np.array([p[1] for p in pts])
+if len(points) < 2:
+    st.error("Centerline must contain at least two points.")
+    st.stop()
 
-if st.button("▶️ Compute Fast Distances"):
-    with st.spinner("Crunching numbers…"):
-        # 2D distances vectorized
-        d2d = haversine_batch(lats, lons)
+st.success(f"Parsed {len(points)} points from centerline.")
 
-        # Elevations via local SRTM
-        elevs = np.array([elev_data.get_elevation(lat, lon) or 0 
-                          for lat, lon in pts])
+if st.button("▶️ Compute Distances"):
+    total_2d = 0.0
+    total_3d = 0.0
+    n = len(points) - 1
+    progress = st.progress(0)
 
-        # 3D distances
-        delta_e = elevs[1:] - elevs[:-1]
-        d3d = np.sqrt(d2d**2 + delta_e**2)
+    rows = []
+    for i in range(n):
+        lat1, lon1 = points[i]
+        lat2, lon2 = points[i+1]
 
-        # Totals
-        total_2d = d2d.sum()
-        total_3d = d3d.sum()
+        d2d = haversine(lat1, lon1, lat2, lon2)
+        e1, src1 = get_elevation(lat1, lon1)
+        e2, src2 = get_elevation(lat2, lon2)
 
-    # Display results
-    st.markdown(f"**Total 2D Distance:** {total_2d:,.2f} m")  
-    st.markdown(f"**Total 3D Distance:** {total_3d:,.2f} m")
+        d3d = math.sqrt(d2d**2 + (e2 - e1)**2)
 
-    # Optional: show a progress bar and table of first 100 segments
-    if st.checkbox("Show sample segments"):
-        rows = []
-        for i in range(min(100, len(d2d))):
-            rows.append({
-                "Segment": i+1,
-                "2D (m)": f"{d2d[i]:.2f}",
-                "ΔElev (m)": f"{delta_e[i]:.2f}",
-                "3D (m)": f"{d3d[i]:.2f}",
-            })
-        st.table(rows)
+        total_2d += d2d
+        total_3d += d3d
+
+        rows.append({
+            "Segment": i+1,
+            "2D (m)": f"{d2d:.2f}",
+            "ΔElev (m)": f"{(e2-e1):.2f}",
+            "3D (m)": f"{d3d:.2f}",
+            "Src1": src1,
+            "Src2": src2,
+        })
+
+        progress.progress((i+1)/n)
+
+    st.subheader("Segment Distances")
+    st.table(rows)
+
+    st.markdown(f"**Total 2D Distance:** {total_2d:.2f} m  ")
+    st.markdown(f"**Total 3D Distance:** {total_3d:.2f} m  ")

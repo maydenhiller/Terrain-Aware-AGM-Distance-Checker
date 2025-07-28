@@ -16,9 +16,15 @@ logger = logging.getLogger(__name__)
 # ── Hard-Coded API Key ─────────────────────────────────────────────────────────
 OPTO_KEY = "49a90bbd39265a2efa15a52c00575150"
 
-# ── Session State Initialization ─────────────────────────────────────────────────
+# ── Session State Initialization ───────────────────────────────────────────────
 if "globaldem_ok" not in st.session_state:
     st.session_state.globaldem_ok = True
+
+# ── Sidebar Controls ───────────────────────────────────────────────────────────
+st.sidebar.header("Service Controls")
+if st.sidebar.button("Reset GlobalDEM"):
+    st.session_state.globaldem_ok = True
+    st.sidebar.success("GlobalDEM re-enabled for this session")
 
 # ── Elevation-Fetch Functions ───────────────────────────────────────────────────
 
@@ -72,20 +78,17 @@ def fetch_open_elev(lat: float, lon: float) -> float:
 def get_elevation(lat: float, lon: float, demtype: str, method: str):
     """
     Returns (elevation_m, source_label).
-    Falls back automatically to Open-Elevation if GlobalDEM fails.
+    Falls back to Open-Elevation if GlobalDEM fails or is disabled.
     """
     if method == "GlobalDEM (point)" and st.session_state.globaldem_ok:
         try:
-            elev = fetch_globaldem(lat, lon, demtype)
-            return elev, "GlobalDEM"
+            return fetch_globaldem(lat, lon, demtype), "GlobalDEM"
         except Exception as e:
             logger.warning("GlobalDEM failed: %s", e)
             st.session_state.globaldem_ok = False
             st.error("GlobalDEM service unavailable. Now defaulting to Open-Elevation.")
-            # Fall through to Open-Elevation
 
-    elev = fetch_open_elev(lat, lon)
-    return elev, "Open-Elevation"
+    return fetch_open_elev(lat, lon), "Open-Elevation"
 
 # ── Distance Calculations ───────────────────────────────────────────────────────
 
@@ -128,16 +131,11 @@ with col2:
 
 demtype = st.selectbox("DEM Type", ["SRTMGL3", "AW3D30"])
 
-# Dynamic Elevation Source Selector
 if not st.session_state.globaldem_ok:
-    st.warning("GlobalDEM is disabled for this session. Using Open-Elevation only.")
+    st.warning("GlobalDEM disabled; using Open-Elevation")
     method = "Open-Elevation"
 else:
-    method = st.radio(
-        "Elevation Source",
-        ["GlobalDEM (point)", "Open-Elevation"],
-        index=0
-    )
+    method = st.radio("Elevation Source", ["GlobalDEM (point)", "Open-Elevation"])
 
 if st.button("🧮 Calculate Distance"):
     try:
@@ -152,3 +150,4 @@ if st.button("🧮 Calculate Distance"):
     except Exception as exc:
         logger.exception("Calculation error")
         st.error(f"Error calculating distance: {exc}")
+```

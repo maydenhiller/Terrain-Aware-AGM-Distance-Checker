@@ -1,77 +1,42 @@
-#!/usr/bin/env python3
-import sys
-import xml.etree.ElementTree as ET
+import streamlit as st
+from fastkml import kml
 import requests
-import json
+from xml.etree import ElementTree as ET
 
-def parse_kml(kml_file):
-    """
-    Parse a KML file and extract all (lat, lon) tuples from the first <coordinates> element.
-    """
-    ns = {'kml': 'http://www.opengis.net/kml/2.2'}
-    tree = ET.parse(kml_file)
-    root = tree.getroot()
-    coord_text = root.find('.//kml:coordinates', ns).text.strip()
-    points = []
-    for token in coord_text.split():
-        lon, lat, *_ = token.split(',')
-        points.append((float(lat), float(lon)))
-    return points
+def parse_kml_coords(kml_file):
+    coords = []
+    content = kml_file.read().decode("utf-8")
+    k = kml.KML()
+    k.from_string(content)
+    features = list(k.features())
+    placemarks = list(features[0].features())
+    for placemark in placemarks:
+        geom = placemark.geometry
+        if hasattr(geom, "coords"):
+            coords.extend(geom.coords)
+    return coords
 
-def fetch_opentopo(coords):
-    """
-    Query OpenTopography for a list of (lat, lon) points in one bulk request.
-    Raises on HTTP/errors or missing data.
-    """
-    url = 'https://portal.opentopography.org/API/point'
-    params = {
-        'demtype': 'SRTMGL1',
-        'outputFormat': 'JSON',
-    }
-    # build repeated latitude/longitude params
-    params['latitude']  = [lat for lat, lon in coords]
-    params['longitude'] = [lon for lat, lon in coords]
-    resp = requests.get(url, params=params, timeout=30)
-    resp.raise_for_status()
-    payload = resp.json()
-    if 'data' not in payload:
-        raise ValueError("OpenTopography returned no 'data' field")
-    return [pt['elevation'] for pt in payload['data']]
-
-def fetch_open_elevation(coords):
-    """
-    Fallback to Open-Elevation bulk lookup via POST JSON.
-    Raises on HTTP/errors or missing data.
-    """
-    url = 'https://api.open-elevation.com/api/v1/lookup'
-    body = {'locations': [{'latitude': lat, 'longitude': lon} for lat, lon in coords]}
-    resp = requests.post(url, json=body, timeout=30)
-    resp.raise_for_status()
-    payload = resp.json()
-    if 'results' not in payload:
-        raise ValueError("Open-Elevation returned no 'results' field")
-    return [pt['elevation'] for pt in payload['results']]
-
-def main():
-    if len(sys.argv) != 2:
-        print("Usage: diagnose_opentopo_api.py path/to/your.kml", file=sys.stderr)
-        sys.exit(1)
-
-    kml_path = sys.argv[1]
-    coords   = parse_kml(kml_path)
-
+def query_opentopo(lat, lon):
+    url = f"https://portal.opentopography.org/API/globaldem?demtype=AW3D30&lat={lat}&lon={lon}&outputFormat=json"
     try:
-        elevations = fetch_opentopo(coords)
-        source     = "OpenTopography"
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("elevation", "No elevation data found")
+        else:
+            return f"HTTP {response.status_code} error"
     except Exception as e:
-        print(f"⚠ OpenTopography failed ({e}); falling back to Open-Elevation", file=sys.stderr)
-        elevations = fetch_open_elevation(coords)
-        source     = "Open-Elevation"
+        return f"Request failed: {e}"
 
-    # output CSV to stdout
-    print("index,latitude,longitude,elevation_m,source")
-    for idx, ((lat, lon), elev) in enumerate(zip(coords, elevations)):
-        print(f"{idx},{lat},{lon},{elev},{source}")
+st.title("OpenTopography Diagnostic Tool")
+uploaded_file = st.file_uploader("Upload KML file", type=["kml"])
 
-if __name__ == '__main__':
-    main()
+if uploaded_file:
+    st.success("KML file uploaded successfully.")
+    coordinates = parse_kml_coords(uploaded_file)
+    st.write(f"📌 Found {len(coordinates)} coordinate points.")
+
+    st.subheader("Elevation Diagnostics:")
+    for idx, (lon, lat) in enumerate(coordinates[:10]):  # Sample first 10
+        elevation = query_opentopo(lat, lon)
+        st.write(f"{idx+1}. ({lat:.6f}, {lon:.6f}) → Elevation: `{elevation}`")

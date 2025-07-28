@@ -1,38 +1,37 @@
 import streamlit as st
 import requests
 
-# Hard-coded key
 OPTO_KEY = "49a90bbd39265a2efa15a52c00575150"
 
-# … your other imports & functions …
-
-st.sidebar.markdown("## 🔍 Key & Endpoint Test")
-with st.sidebar.expander("Run Diagnostics", expanded=True):
+st.sidebar.markdown("## 🌐 API Key & Endpoint Checker")
+with st.sidebar.expander("Run Diagnostics", True):
     lat = st.number_input("Latitude",   value=34.703428, format="%.6f")
     lon = st.number_input("Longitude",  value=-95.101749, format="%.6f")
-    endpoint = st.selectbox(
-        "Endpoint",
-        options=["/API/globaldem", "/API/point"],
-        format_func=lambda e: e.replace("/API/", "")
-    )
-    demtype = st.selectbox("DEM Type", ["AW3D30", "SRTMGL3"]);
+    demtype = st.selectbox("DEM Type", ["SRTMGL3", "AW3D30"])
+    method = st.radio("Lookup Method", ["GlobalDEM (bbox)", "Fallback Open-Elevation"])
+
     if st.button("▶️ Test Now"):
-        base = "https://portal.opentopography.org"
-        params = {
-            "demtype":      demtype,
-            "outputFormat": "JSON",
-            "API_Key":      OPTO_KEY,
-        }
+        if method == "GlobalDEM (bbox)":
+            # build a tiny box ±1e-5 degrees (~1m)
+            delta = 1e-5
+            params = {
+                "demtype":      demtype,
+                "south":        lat - delta,
+                "north":        lat + delta,
+                "west":         lon - delta,
+                "east":         lon + delta,
+                "outputFormat": "JSON",
+                "API_Key":      OPTO_KEY,
+            }
+            url = "https://portal.opentopography.org/API/globaldem"
+        else:
+            # Open-Elevation fallback
+            params = {"locations": f"{lat},{lon}"}
+            url    = "https://api.open-elevation.com/api/v1/lookup"
 
-        # Choose params key names by endpoint
-        if endpoint.endswith("globaldem"):
-            params.update({"lat": lat, "lon": lon})
-        else:  # /API/point
-            params.update({"latitude": lat, "longitude": lon})
+        resp = requests.get(url, params=params, timeout=10)
 
-        resp = requests.get(f"{base}{endpoint}", params=params, timeout=10)
-
-        st.write("**Full Request URL**")
+        st.write("**Request URL**")
         st.code(resp.request.url, language="bash")
 
         st.write("**Status Code**")
@@ -41,4 +40,7 @@ with st.sidebar.expander("Run Diagnostics", expanded=True):
         st.write("**Response Body**")
         st.write(resp.text)
 
-# … rest of your app follows …
+        st.markdown("---")
+        st.markdown("**Browser Test URLs**")
+        st.markdown(f"""
+1. GlobalDEM (tiny box):

@@ -16,16 +16,16 @@ logger = logging.getLogger(__name__)
 # ── Hard-Coded API Key ─────────────────────────────────────────────────────────
 OPTO_KEY = "49a90bbd39265a2efa15a52c00575150"
 
-# ── Session State Keys ─────────────────────────────────────────────────────────
+# ── Session State Initialization ─────────────────────────────────────────────────
 if "globaldem_ok" not in st.session_state:
-    st.session_state.globaldem_ok = True  # assume OK until proven otherwise
+    st.session_state.globaldem_ok = True
 
 # ── Elevation-Fetch Functions ───────────────────────────────────────────────────
 
 def fetch_globaldem(lat: float, lon: float, demtype: str = "SRTMGL3") -> float:
     """
-    Query OpenTopography’s GlobalDEM point endpoint using location=lat,lon.
-    Raises on any non-200 or bad payload.
+    Query OpenTopography’s GlobalDEM point endpoint.
+    Raises on HTTP errors or unexpected payloads.
     """
     url = "https://portal.opentopography.org/API/globaldem"
     params = {
@@ -36,7 +36,6 @@ def fetch_globaldem(lat: float, lon: float, demtype: str = "SRTMGL3") -> float:
     }
 
     resp = requests.get(url, params=params, timeout=10)
-
     logger.info("GlobalDEM URL      → %s", resp.request.url)
     logger.info("GlobalDEM Status   → %s", resp.status_code)
     logger.info("GlobalDEM Response → %s", resp.text)
@@ -47,8 +46,7 @@ def fetch_globaldem(lat: float, lon: float, demtype: str = "SRTMGL3") -> float:
     if not data or ("elevation" not in data[0] and "z" not in data[0]):
         raise RuntimeError("GlobalDEM returned unexpected payload")
 
-    elev = data[0].get("elevation", data[0].get("z"))
-    return float(elev)
+    return float(data[0].get("elevation", data[0].get("z")))
 
 
 def fetch_open_elev(lat: float, lon: float) -> float:
@@ -74,24 +72,20 @@ def fetch_open_elev(lat: float, lon: float) -> float:
 def get_elevation(lat: float, lon: float, demtype: str, method: str):
     """
     Returns (elevation_m, source_label).
-    Falls back automatically to Open-Elevation if GlobalDEM fails or is disabled.
+    Falls back automatically to Open-Elevation if GlobalDEM fails.
     """
-    # If user selects GlobalDEM but it's disabled, force Open-Elev
-    use_global = method == "GlobalDEM (point)" and st.session_state.globaldem_ok
-
-    if use_global:
+    if method == "GlobalDEM (point)" and st.session_state.globaldem_ok:
         try:
             elev = fetch_globaldem(lat, lon, demtype)
             return elev, "GlobalDEM"
         except Exception as e:
             logger.warning("GlobalDEM failed: %s", e)
-            st.session_state.globaldem_ok = False  # disable for session
-            st.error("GlobalDEM service unavailable, using Open-Elevation.")
-            # fall through to Open-Elev
+            st.session_state.globaldem_ok = False
+            st.error("GlobalDEM service unavailable. Now defaulting to Open-Elevation.")
+            # Fall through to Open-Elevation
 
     elev = fetch_open_elev(lat, lon)
     return elev, "Open-Elevation"
-
 
 # ── Distance Calculations ───────────────────────────────────────────────────────
 
@@ -133,24 +127,28 @@ with col2:
     lon2 = st.number_input("End Longitude", value=-95.100000, format="%.6f")
 
 demtype = st.selectbox("DEM Type", ["SRTMGL3", "AW3D30"])
-method = st.radio(
-    "Elevation Source",
-    ["GlobalDEM (point)", "Open-Elevation"],
-    help="GlobalDEM may be auto-disabled if it fails."
-)
+
+# Dynamic Elevation Source Selector
+if not st.session_state.globaldem_ok:
+    st.warning("GlobalDEM is disabled for this session. Using Open-Elevation only.")
+    method = "Open-Elevation"
+else:
+    method = st.radio(
+        "Elevation Source",
+        ["GlobalDEM (point)", "Open-Elevation"],
+        index=0
+    )
 
 if st.button("🧮 Calculate Distance"):
     try:
         planar, e1, s1, e2, s2, d3d = compute_terrain_distance(
             lat1, lon1, lat2, lon2, demtype, method
         )
-
         st.subheader("Results")
         st.write(f"Planar (2D): {planar:.2f} m")
         st.write(f"Start Elevation ({s1}): {e1:.2f} m")
         st.write(f"End Elevation   ({s2}): {e2:.2f} m")
         st.write(f"3D Distance:    {d3d:.2f} m")
-
     except Exception as exc:
         logger.exception("Calculation error")
         st.error(f"Error calculating distance: {exc}")

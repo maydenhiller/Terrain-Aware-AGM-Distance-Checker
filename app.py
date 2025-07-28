@@ -1,3 +1,5 @@
+# app.py
+
 import streamlit as st
 import requests
 import math
@@ -15,44 +17,44 @@ logger = logging.getLogger(__name__)
 OPTO_KEY = "49a90bbd39265a2efa15a52c00575150"
 
 # ── Elevation-Fetch Functions ──────────────────────────────────────────────────
+
 def fetch_globaldem(lat: float, lon: float, demtype: str = "SRTMGL3") -> float:
     """
-    Query OpenTopography GlobalDEM for a tiny bbox around (lat, lon).
-    Raises on any failure.
+    Query OpenTopography point-based endpoint for a single (lat, lon).
+    Returns elevation in meters or raises on failure.
     """
-    url = "https://portal.opentopography.org/API/globaldem"
-    delta = 1e-5
+    url = "https://portal.opentopography.org/API/getdem"
     params = {
         "demtype":      demtype,
-        "south":        lat - delta,
-        "north":        lat + delta,
-        "west":         lon - delta,
-        "east":         lon + delta,
+        "latitude":     f"{lat:.6f}",
+        "longitude":    f"{lon:.6f}",
         "outputFormat": "JSON",
         "API_Key":      OPTO_KEY,
     }
 
     resp = requests.get(url, params=params, timeout=10)
 
-    # Log full request & response
-    logger.info("GlobalDEM URL      → %s", resp.request.url)
-    logger.info("GlobalDEM Status   → %s", resp.status_code)
-    logger.info("GlobalDEM Response → %s", resp.text)
+    # Log full request & response for diagnostics
+    logger.info("GlobalDEM Point URL      → %s", resp.request.url)
+    logger.info("GlobalDEM Point Status   → %s", resp.status_code)
+    logger.info("GlobalDEM Point Response → %s", resp.text)
 
-    resp.raise_for_status()  # HTTP errors
-    data = resp.json().get("data")
-    if not data or "elevation" not in data[0]:
+    resp.raise_for_status()
+
+    payload = resp.json()
+    data = payload.get("data")
+    if not data or "z" not in data[0]:
         msg = f"Unexpected payload: {resp.text}"
         logger.error(msg)
-        raise RuntimeError(msg)
+        raise RuntimeError("GlobalDEM point lookup returned no elevation")
 
-    return data[0]["elevation"]
+    return float(data[0]["z"])
 
 
 def fetch_open_elev(lat: float, lon: float) -> float:
     """
-    Query open-elevation.com for a single (lat, lon).
-    Raises on any failure.
+    Query Open-Elevation for a single (lat, lon).
+    Returns elevation in meters or raises on failure.
     """
     url = "https://api.open-elevation.com/api/v1/lookup"
     params = {"locations": f"{lat:.6f},{lon:.6f}"}
@@ -67,51 +69,60 @@ def fetch_open_elev(lat: float, lon: float) -> float:
     if not results or "elevation" not in results[0]:
         msg = f"Unexpected payload: {resp.text}"
         logger.error(msg)
-        raise RuntimeError(msg)
+        raise RuntimeError("Open-Elevation lookup returned no elevation")
 
-    return results[0]["elevation"]
+    return float(results[0]["elevation"])
 
 
 def get_elevation(
     lat: float, lon: float, demtype: str, method: str
 ) -> tuple[float, str]:
     """
-    Returns (elevation_m, source_label), auto-falling back if needed.
+    Returns (elevation_m, source_label), auto-falls back if GlobalDEM fails.
     """
-    if method == "GlobalDEM (bbox)":
+    if method == "GlobalDEM (point)":
         try:
-            return fetch_globaldem(lat, lon, demtype), "GlobalDEM"
+            elev = fetch_globaldem(lat, lon, demtype)
+            return elev, "GlobalDEM"
         except Exception as e:
             logger.warning("GlobalDEM failed, falling back: %s", e)
-            return fetch_open_elev(lat, lon), "Open-Elevation (fallback)"
+            elev = fetch_open_elev(lat, lon)
+            return elev, "Open-Elevation (fallback)"
     else:
-        return fetch_open_elev(lat, lon), "Open-Elevation"
+        elev = fetch_open_elev(lat, lon)
+        return elev, "Open-Elevation"
 
+# ── Geodesic & Terrain Distance Calculations ──────────────────────────────────
 
-# ── Distance Calculators ───────────────────────────────────────────────────────
-def haversine(lat1, lon1, lat2, lon2):
+def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """
+    Compute great-circle (planar) distance between two points in meters.
+    """
     R = 6_371_000  # Earth radius in meters
-    φ1, φ2 = map(math.radians, (lat1, lat2))
+    φ1, φ2 = math.radians(lat1), math.radians(lat2)
     Δφ = math.radians(lat2 - lat1)
     Δλ = math.radians(lon2 - lon1)
-    a = math.sin(Δφ/2)**2 + math.cos(φ1)*math.cos(φ2)*math.sin(Δλ/2)**2
+    a = math.sin(Δφ / 2) ** 2 + math.cos(φ1) * math.cos(φ2) * math.sin(Δλ / 2) ** 2
     return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
 def compute_terrain_distance(
-    lat1, lon1, lat2, lon2, demtype, method
+    lat1: float, lon1: float, lat2: float, lon2: float, demtype: str, method: str
 ):
+    """
+    Returns (planar_m, elev1_m, src1, elev2_m, src2, d3d_m).
+    """
     planar = haversine(lat1, lon1, lat2, lon2)
     elev1, src1 = get_elevation(lat1, lon1, demtype, method)
     elev2, src2 = get_elevation(lat2, lon2, demtype, method)
-    d3d = math.sqrt(planar**2 + (elev2 - elev1)**2)
+    d3d = math.sqrt(planar ** 2 + (elev2 - elev1) ** 2)
     return planar, elev1, src1, elev2, src2, d3d
 
+# ── Streamlit App Layout ───────────────────────────────────────────────────────
 
-# ── Streamlit UI ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Terrain-Aware AGM Distance Checker", layout="wide")
 st.title("Terrain-Aware AGM Distance Checker")
-st.write("Planar + 3D distances with terrain elevation.")
+st.write("Compute planar + 3D distances using terrain elevation.")
 
 # Sidebar: Raw API Diagnostics
 st.sidebar.markdown("## 🔍 Elevation API Diagnostics")
@@ -119,7 +130,7 @@ with st.sidebar.expander("Run Raw Diagnostic", expanded=False):
     dlat = st.number_input("Latitude", value=34.703428, format="%.6f")
     dlon = st.number_input("Longitude", value=-95.101749, format="%.6f")
     dDEM = st.selectbox("DEM Type", ["SRTMGL3", "AW3D30"])
-    dMethod = st.radio("Lookup Method", ["GlobalDEM (bbox)", "Fallback Open-Elevation"])
+    dMethod = st.radio("Lookup Method", ["GlobalDEM (point)", "Open-Elevation"])
 
     if st.button("▶️ Test Now"):
         try:
@@ -128,7 +139,7 @@ with st.sidebar.expander("Run Raw Diagnostic", expanded=False):
         except Exception as err:
             st.error(f"API call failed: {err}")
 
-# Main pane: distance inputs
+# Main pane: Distance inputs
 st.header("Distance Calculation")
 col1, col2 = st.columns(2)
 with col1:
@@ -139,7 +150,7 @@ with col2:
     lon2 = st.number_input("End Longitude", value=-95.100000, format="%.6f")
 
 demtype = st.selectbox("DEM Type", ["SRTMGL3", "AW3D30"])
-method = st.radio("Elevation Source", ["GlobalDEM (bbox)", "Fallback Open-Elevation"])
+method = st.radio("Elevation Source", ["GlobalDEM (point)", "Open-Elevation"])
 
 if st.button("🧮 Calculate Distance"):
     try:
@@ -151,8 +162,10 @@ if st.button("🧮 Calculate Distance"):
         st.write(f"Start Elevation ({s1}): {e1:.2f} m")
         st.write(f"End Elevation   ({s2}): {e2:.2f} m")
         st.write(f"3D Distance:    {d3d:.2f} m")
+
         if "fallback" in (s1 + s2).lower():
             st.warning("One or more elevations used the Open-Elevation fallback.")
+
     except Exception:
         logger.exception("Calculation error")
         st.error("An unexpected error occurred. Check logs for details.")

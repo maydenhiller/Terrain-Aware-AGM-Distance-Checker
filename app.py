@@ -150,4 +150,3 @@ if st.button("🧮 Calculate Distance"):
     except Exception as exc:
         logger.exception("Calculation error")
         st.error(f"Error calculating distance: {exc}")
-```

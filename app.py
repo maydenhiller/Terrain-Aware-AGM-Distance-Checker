@@ -1,13 +1,11 @@
 import streamlit as st
 import requests
-import zipfile
-import io
+import zipfile, io, time
 import xml.etree.ElementTree as ET
 import pandas as pd
-import json
-import re
+import json, re
 
-# Hard-coded OpenTopography API key
+# hard-coded OpenTopography key:
 OPTO_KEY = "49a90bbd39265a2efa15a52c00575150"
 
 def extract_coords_from_kml_text(xml_text):
@@ -18,20 +16,17 @@ def extract_coords_from_kml_text(xml_text):
         return []
     pts = []
     for elem in root.findall('.//{*}coordinates'):
-        text = elem.text or ""
-        for group in text.strip().split():
-            parts = group.split(',')
-            if len(parts) >= 2:
-                try:
-                    lon, lat = map(float, parts[:2])
-                    pts.append((lon, lat))
-                except ValueError:
-                    continue
+        for pair in (elem.text or "").strip().split():
+            lon, lat = pair.split(',')[:2]
+            try:
+                pts.append((float(lon), float(lat)))
+            except:
+                continue
     return pts
 
-def parse_kml_coords(uploaded_file):
-    raw = uploaded_file.getvalue()
-    name = uploaded_file.name.lower()
+def parse_kml_coords(uploaded):
+    raw = uploaded.getvalue()
+    name = uploaded.name.lower()
 
     if name.endswith(".kmz"):
         try:
@@ -41,77 +36,83 @@ def parse_kml_coords(uploaded_file):
                         raw = z.read(info)
                         break
         except zipfile.BadZipFile:
-            st.error("Uploaded KMZ is not a valid archive.")
+            st.error("Invalid KMZ archive.")
             return []
 
-    text = raw.decode("utf-8", errors="ignore")
+    text = raw.decode("utf-8", "ignore")
     text = re.sub(r"^<\?xml[^>]+\?>", "", text, count=1)
     return extract_coords_from_kml_text(text)
 
 @st.cache_data(show_spinner=False)
 def query_opentopo(lat, lon):
+    url = "https://portal.opentopography.org/API/globaldem"
     params = {
-        "demtype": "AW3D30",
-        "lat": lat,
-        "lon": lon,
+        "demtype":      "AW3D30",
+        "lat":          lat,
+        "lon":          lon,
         "outputFormat": "JSON",
-        "API_Key": OPTO_KEY
+        "api_key":      OPTO_KEY,     # <— lowercase
     }
-    resp = requests.get(
-        "https://portal.opentopography.org/API/globaldem",
-        params=params,
-        timeout=5
-    )
-    if resp.status_code == 200:
-        return resp.json().get("elevation", "No elevation")
-    return f"HTTP {resp.status_code}"
 
-st.set_page_config(page_title="AGM Distance Debugger", layout="centered")
+    # retry up to 3 times on 5xx
+    for attempt in range(3):
+        resp = requests.get(url, params=params, timeout=10)
+        if resp.status_code == 200:
+            try:
+                return resp.json().get("elevation", "no elevation")
+            except ValueError:
+                return f"Invalid JSON response"
+        if resp.status_code >= 500:
+            time.sleep(2 ** attempt)
+            continue
+        return f"HTTP {resp.status_code}: {resp.text}"
+
+    # fallback to Open-Elevation
+    try:
+        fb = requests.get(
+            "https://api.open-elevation.com/api/v1/lookup",
+            params={"locations": f"{lat},{lon}"},
+            timeout=5
+        )
+        if fb.status_code == 200:
+            return fb.json()["results"][0]["elevation"] \
+                   + " (open-elevation)"
+        return f"Fallback HTTP {fb.status_code}"
+    except Exception as e:
+        return f"Fallback error: {e}"
+
+st.set_page_config(page_title="AGM Distance Debugger")
 st.title("🚧 Terrain-Aware AGM Distance Debugger")
 
-uploaded = st.file_uploader("Drag & drop KML/KMZ (≤200 MB)", type=["kml", "kmz"])
+uploaded = st.file_uploader("Drag & drop KML/KMZ", type=["kml","kmz"])
 if not uploaded:
-    st.info("Upload a KML or KMZ to begin.")
+    st.info("Upload a KML or KMZ file to begin.")
     st.stop()
 
 coords = parse_kml_coords(uploaded)
-total = len(coords)
-st.success(f"Found {total:,} coordinate points in {uploaded.name}")
-
-if total == 0:
-    st.warning("No valid coordinates—check your file.")
+if not coords:
+    st.warning("No coordinates found.")
     st.stop()
 
-sample_size = st.slider(
-    "Sample how many points for elevation?",
-    min_value=1,
-    max_value=min(1000, total),
-    value=min(10, total)
-)
+st.success(f"Found {len(coords)} points in {uploaded.name}")
 
-if st.button("▶️ Run Elevation Diagnostics"):
-    diagnostics = []
-    progress = st.progress(0)
-    for i, (lon, lat) in enumerate(coords[:sample_size], start=1):
+sample = st.slider("How many points to sample?", 1, min(1000, len(coords)), 10)
+if st.button("Run Elevation Diagnostics"):
+    results, prog = [], st.progress(0)
+    for i, (lon, lat) in enumerate(coords[:sample], 1):
         elev = query_opentopo(lat, lon)
-        diagnostics.append({
-            "index": i,
+        results.append({
+            "index":    i,
             "latitude": lat,
-            "longitude": lon,
-            "elevation": elev
+            "longitude":lon,
+            "elevation":elev
         })
-        progress.progress(i / sample_size)
+        prog.progress(i/ sample)
 
-    st.subheader(f"Results (first {sample_size} points)")
-    for row in diagnostics:
-        st.write(f"{row['index']}. ({row['latitude']:.6f}, {row['longitude']:.6f}) → {row['elevation']}")
+    st.subheader("Results")
+    for r in results:
+        st.write(f"{r['index']}. ({r['latitude']:.6f}, {r['longitude']:.6f}) → {r['elevation']}")
 
-    df = pd.DataFrame(diagnostics)
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
-    st.download_button("📥 Download CSV", csv_bytes, "diagnostics.csv", "text/csv")
-    st.download_button(
-        "📥 Download JSON",
-        json.dumps(diagnostics, indent=2),
-        "diagnostics.json",
-        "application/json"
-    )
+    df = pd.DataFrame(results)
+    st.download_button("Download CSV", df.to_csv(index=False).encode(), "diag.csv")
+    st.download_button("Download JSON", json.dumps(results, indent=2), "diag.json")

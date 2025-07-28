@@ -1,3 +1,6 @@
+import streamlit as st
+import requests
+OPTO_KEY = st.secrets["49a90bbd39265a2efa15a52c00575150"]
 # ── API Key & Endpoint Diagnostics ──────────────────────────────────────────
 
 st.sidebar.markdown("## 🔍 API Key Diagnostics")
@@ -58,3 +61,5 @@ with st.sidebar.expander("Run Diagnostics", expanded=True):
         st.code(open_elev_url, language="bash")
 
 # ───────────────────────────────────────────────────────────────────────────────
+# Sanity check – you should see “OK” in the sidebar
+st.sidebar.write("Sanity check: OK")

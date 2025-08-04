@@ -1,124 +1,190 @@
-import os
 import streamlit as st
 import pandas as pd
 import requests
 import xml.etree.ElementTree as ET
-from math import radians, cos, sin, asin, sqrt
+import math
+from io import BytesIO
+import zipfile
+import srtm  # local SRTM lookup
 
-st.set_page_config(page_title="Terrain-Aware Distance Calculator")
+# ── CONSTANTS ──────────────────────────────────────────────────────────────────
+FT_PER_M = 3.28084
+MI_PER_FT = 1 / 5280
 
-# ---------------------------------------------
-#  Config: Your OpenTopography API Key (opt.)
-# ---------------------------------------------
-OT_KEY = os.getenv("OPENTOPO_KEY")  # set in Streamlit Cloud Secrets
+# ── LOAD & CACHE LOCAL SRTM ────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def load_srtm():
+    return srtm.get_data()
 
-# ---------------------------------------------
-#  Elevation Fetcher with Fallback & Caching
-# ---------------------------------------------
-@st.cache_data(show_spinner=False, max_entries=5000, ttl=24*3600)
+elev_data = load_srtm()
+
+# ── ELEVATION LOOKUP WITH FALLBACKS ─────────────────────────────────────────────
+@st.cache_data(show_spinner=False, max_entries=10000, ttl=24*3600)
 def get_elevation(lat: float, lon: float) -> float:
-    # 1) USGS EPQS (LiDAR / best DEM)
+    # 1) LOCAL SRTM  
+    elev = elev_data.get_elevation(lat, lon)
+    if elev is not None:
+        return elev
+
+    # 2) USGS EPQS (LiDAR / best‐available DEM)
     try:
         r = requests.get(
             "https://nationalmap.gov/epqs/pqs.php",
-            params={
-                "x": lon, "y": lat,
-                "units": "Meters", "output": "json"
-            },
-            timeout=8
+            params={"x": lon, "y": lat, "units": "Meters", "output": "json"},
+            timeout=5
         )
         r.raise_for_status()
-        elev = r.json()["USGS_Elevation_Point_Query_Service"] \
-                     ["Elevation_Query"]["Elevation"]
-        if elev is not None:
-            return elev
-    except Exception:
+        e = r.json()["USGS_Elevation_Point_Query_Service"]["Elevation_Query"]["Elevation"]
+        if e is not None:
+            return float(e)
+    except:
         pass
 
-    # 2) OpenTopography Point Query (if key provided)
-    if OT_KEY:
-        try:
-            ot = requests.get(
-                "https://portal.opentopography.org/API/point",
-                params={
-                    "demtype": "SRTMGL1",  # or your preferred DEM
-                    "x": lon, "y": lat,
-                    "outputFormat": "JSON",
-                    "key": OT_KEY
-                },
-                timeout=8
-            )
-            ot.raise_for_status()
-            jo = ot.json()
-            return jo["data"]["elevation"]
-        except Exception:
-            pass
-
-    # 3) Open-Elevation batch fallback
+    # 3) OPEN‐ELEVATION fallback
     try:
-        payload = {"locations": [{"latitude": lat, "longitude": lon}]}
-        r2 = requests.post(
+        r = requests.get(
             "https://api.open-elevation.com/api/v1/lookup",
-            json=payload,
-            timeout=8
+            params={"locations": f"{lat:.6f},{lon:.6f}"},
+            timeout=5
         )
-        r2.raise_for_status()
-        return r2.json()["results"][0]["elevation"]
-    except Exception:
-        pass
+        r.raise_for_status()
+        return float(r.json()["results"][0]["elevation"])
+    except:
+        return 0.0
 
-    # 4) Last‐resort fallback
-    return 0.0
+# ── HAVERSINE IN METERS ─────────────────────────────────────────────────────────
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371000  # radius in meters
+    φ1, φ2 = math.radians(lat1), math.radians(lat2)
+    dφ = math.radians(lat2 - lat1)
+    dλ = math.radians(lon2 - lon1)
+    a = math.sin(dφ/2)**2 + math.cos(φ1)*math.cos(φ2)*math.sin(dλ/2)**2
+    return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
-# ---------------------------------------------
-#  3D Haversine for Segment Length
-# ---------------------------------------------
-def haversine(lon1, lat1, lon2, lat2):
-    lon1, lat1, lon2, lat2 = map(radians, (lon1, lat1, lon2, lat2))
-    dlon = lon2 - lon1
-    dlat = lat2 - lat1
-    a = sin(dlat/2)**2 + cos(lat1)*cos(lat2)*sin(dlon/2)**2
-    return 2 * 6371000 * asin(sqrt(a))
+# ── PARSE KMZ / KML ─────────────────────────────────────────────────────────────
+def parse_kml_kmz(file) -> tuple[list[tuple[str,int,float,float]], list[tuple[float,float]]]:
+    raw = file.read()
+    # unzip if KMZ
+    if file.name.lower().endswith(".kmz"):
+        with zipfile.ZipFile(BytesIO(raw)) as z:
+            for nm in z.namelist():
+                if nm.lower().endswith(".kml"):
+                    raw = z.read(nm)
+                    break
 
-def segment_length(p1, p2):
-    e1, e2 = get_elevation(*p1), get_elevation(*p2)
-    plan = haversine(p1[1], p1[0], p2[1], p2[0])
-    vert = abs(e2 - e1)
-    return sqrt(plan**2 + vert**2)
+    root = ET.fromstring(raw)
+    ns = {"kml": "http://www.opengis.net/kml/2.2"}
 
-# ---------------------------------------------
-#  UI: Upload + Compute
-# ---------------------------------------------
-st.title("Terrain-Aware Centerline Distance")
+    # extract AGM points
+    agms = []
+    for fld in root.findall(".//kml:Folder", ns):
+        nm = fld.find("kml:name", ns)
+        if nm is not None and nm.text.strip().lower() == "agms":
+            for pm in fld.findall(".//kml:Placemark", ns):
+                label = pm.find("kml:name", ns).text.strip()
+                coord = pm.find(".//kml:coordinates", ns).text.strip()
+                lon, lat, *_ = coord.split(",")
+                agms.append((label, float(lat), float(lon)))
 
-f = st.file_uploader("Upload your KML/KMZ", type=["kml","kmz"])
-if not f:
-    st.warning("Upload a KML or KMZ to begin.")
+    # extract centerline polyline
+    center = []
+    for fld in root.findall(".//kml:Folder", ns):
+        nm = fld.find("kml:name", ns)
+        if nm is not None and nm.text.strip().lower() == "centerline":
+            for ls in fld.findall(".//kml:LineString", ns):
+                coords = ls.find("kml:coordinates", ns).text.strip()
+                for pair in coords.split():
+                    lon, lat, *_ = pair.split(",")
+                    center.append((float(lat), float(lon)))
+
+    return agms, center
+
+# ── SNAP AGM TO CENTERLINE INDEX ───────────────────────────────────────────────
+def closest_index(path: list[tuple[float,float]], pt: tuple[float,float]) -> int:
+    best_i, best_d = 0, float("inf")
+    lat0, lon0 = pt
+    for i, (lat, lon) in enumerate(path):
+        d = haversine(lat0, lon0, lat, lon)
+        if d < best_d:
+            best_i, best_d = i, d
+    return best_i
+
+# ── CALCULATE PATH‐WALK DISTANCE BETWEEN TWO CENTERLINE INDICES ───────────────
+def path_distance(path: list[tuple[float,float]], i1: int, i2: int) -> float:
+    a, b = sorted((i1, i2))
+    total = 0.0
+    for i in range(a, b):
+        lat1, lon1 = path[i]
+        lat2, lon2 = path[i+1]
+        h = haversine(lat1, lon1, lat2, lon2)
+        e1 = get_elevation(lat1, lon1)
+        e2 = get_elevation(lat2, lon2)
+        total += math.sqrt(h*h + (e2 - e1)**2)
+    return total
+
+# ── STREAMLIT UI ───────────────────────────────────────────────────────────────
+st.set_page_config("AGM Terrain Distances", layout="wide")
+st.title("📏 Terrain-Aware AGM Distances Along Centerline")
+
+up = st.file_uploader("Upload KML or KMZ (must include ‘AGMs’ & ‘Centerline’ folders)",
+                     type=["kml","kmz"])
+if not up:
+    st.info("Please upload your KML or KMZ file.")
     st.stop()
 
-# Parse coords
-root = ET.fromstring(f.read())
-coords = []
-for node in root.findall(".//{*}coordinates"):
-    for text in node.text.strip().split():
-        lon, lat, *_ = map(float, text.split(","))
-        coords.append((lat, lon))
+# parse
+agms, centerline = parse_kml_kmz(up)
+if not agms or not centerline:
+    st.error("Could not find an ‘AGMs’ folder or ‘Centerline’ in your file.")
+    st.stop()
 
-segments = list(zip(coords, coords[1:]))
-st.info(f"Calculating {len(segments)} segments…")
+# order AGMs by station number (last three digits)
+agms_sorted = sorted(
+    agms,
+    key=lambda x: int("".join(filter(str.isdigit, x[0])) or 0)
+)
 
-lengths_m = [segment_length(a, b) for a, b in segments]
-total_m = sum(lengths_m)
+# precompute snap-indices
+indices = [
+    closest_index(centerline, (lat, lon))
+    for _, lat, lon in agms_sorted
+]
 
-df = pd.DataFrame({
-    "Segment #": range(1, len(lengths_m)+1),
-    "Length (ft)": [m * 3.28084 for m in lengths_m],
-    "Length (mi)": [m * 0.000621371 for m in lengths_m]
-})
+# compute segment distances
+rows = []
+total_ft = 0.0
+n = len(indices) - 1
+prog = st.progress(0)
 
+for i in range(n):
+    label1, lat1, lon1 = agms_sorted[i]
+    label2, lat2, lon2 = agms_sorted[i+1]
+
+    d_m = path_distance(centerline, indices[i], indices[i+1])
+    d_ft = d_m * FT_PER_M
+    d_mi = d_ft * MI_PER_FT
+    total_ft += d_ft
+
+    # zero-pad numeric part to 3 digits
+    st1 = int("".join(filter(str.isdigit, label1)) or 0)
+    st2 = int("".join(filter(str.isdigit, label2)) or 0)
+    seg_lbl = f"Distance from {st1:03d} to {st2:03d}:"
+
+    rows.append({
+        "Segment": seg_lbl,
+        "Distance (ft)": f"{d_ft:,.2f}",
+        "Distance (mi)": f"{d_mi:.4f}"
+    })
+    prog.progress((i+1)/n)
+
+# render results & CSV download
+df = pd.DataFrame(rows)
+st.subheader("AGM Segment Distances")
 st.dataframe(df, use_container_width=True)
-st.markdown(f"**Total:** {total_m*0.000621371:.4f} mi | {total_m*3.28084:.1f} ft")
+
+tot_mi = total_ft * MI_PER_FT
+st.markdown(f"**Total:** {total_ft:,.2f} ft  |  **{tot_mi:.4f} mi**")
 
 csv = df.to_csv(index=False).encode("utf-8")
-st.download_button("Download CSV", data=csv, file_name="distances.csv")
+st.download_button("📥 Download CSV", data=csv, file_name="agm_distances.csv")
 

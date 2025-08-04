@@ -1,136 +1,90 @@
 import streamlit as st
-import requests
-import math
 import zipfile
-import xml.etree.ElementTree as ET
-from io import BytesIO
-import srtm
+import simplekml
+import io
+import polyline
+import requests
 import pandas as pd
+import math
+from pykml import parser
+from lxml import etree
+from geopy.distance import geodesic
 
-# ── Constants ──────────────────────────────────────────────────────────────────
-FT_PER_M = 3.28084
-MI_PER_FT = 1 / 5280
+# 📍 Elevation API config (Open-Elevation)
+def fetch_elevation(lat, lon):
+    url = f"https://api.open-elevation.com/api/v1/lookup?locations={lat},{lon}"
+    try:
+        response = requests.get(url)
+        data = response.json()
+        return data['results'][0]['elevation']
+    except Exception:
+        return 0  # fallback if API fails
 
-# ── Load SRTM ──────────────────────────────────────────────────────────────────
-@st.cache_data
-def load_srtm_data():
-    return srtm.get_data()
+# 📍 3D distance calculator using terrain
+def terrain_distance(path):
+    total = 0
+    for i in range(len(path) - 1):
+        lat1, lon1 = path[i]
+        lat2, lon2 = path[i+1]
+        elev1 = fetch_elevation(lat1, lon1)
+        elev2 = fetch_elevation(lat2, lon2)
+        horizontal = geodesic((lat1, lon1), (lat2, lon2)).feet
+        vertical = elev2 - elev1
+        total += math.sqrt(horizontal**2 + vertical**2)
+    return total
 
-elev_data = load_srtm_data()
+# 📍 KMZ/KML parser
+def extract_kml_from_kmz(kmz_file):
+    with zipfile.ZipFile(kmz_file, 'r') as zf:
+        for name in zf.namelist():
+            if name.endswith('.kml'):
+                return zf.read(name)
+    return None
 
-# ── Elevation Helpers ──────────────────────────────────────────────────────────
-def fetch_open_elev(lat, lon):
-    url = "https://api.open-elevation.com/api/v1/lookup"
-    r = requests.get(url, params={"locations": f"{lat:.6f},{lon:.6f}"})
-    r.raise_for_status()
-    return float(r.json()["results"][0]["elevation"])
+def extract_agms_and_centerline(kml_data):
+    agms = {}
+    centerline_coords = []
 
-def get_elevation(lat, lon):
-    elev = elev_data.get_elevation(lat, lon)
-    if elev is None:
-        elev = fetch_open_elev(lat, lon)
-    return elev
+    kml_root = parser.fromstring(kml_data)
+    ns = {'kml': 'http://www.opengis.net/kml/2.2'}
 
-# ── Planar Distance (Haversine) ────────────────────────────────────────────────
-def haversine(lat1, lon1, lat2, lon2):
-    R = 6371000  # earth radius in meters
-    φ1, φ2 = math.radians(lat1), math.radians(lat2)
-    Δφ = math.radians(lat2 - lat1)
-    Δλ = math.radians(lon2 - lon1)
-    a = math.sin(Δφ/2)**2 + math.cos(φ1)*math.cos(φ2)*math.sin(Δλ/2)**2
-    return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    for folder in kml_root.Document.Folder:
+        if hasattr(folder, 'name') and folder.name == 'AGMs':
+            for pm in folder.Placemark:
+                name = str(pm.name)
+                coord_text = str(pm.Point.coordinates).strip()
+                lon, lat, _ = map(float, coord_text.split(','))
+                agms[name] = (lat, lon)
 
-# ── KML/KMZ Parser ─────────────────────────────────────────────────────────────
-def parse_centerline(file_uploader):
-    raw = file_uploader.read()
-    if file_uploader.name.lower().endswith(".kmz"):
-        z = zipfile.ZipFile(BytesIO(raw))
-        for f in z.namelist():
-            if f.lower().endswith(".kml"):
-                raw = z.read(f)
-                break
-    root = ET.fromstring(raw)
-    ns = {"kml": root.tag.split("}")[0].strip("{")}
-    pts = []
-    for ls in root.findall(".//kml:LineString", ns):
-        coords = ls.find("kml:coordinates", ns).text.strip()
-        for pair in coords.split():
-            lon, lat, *_ = pair.split(",")
-            pts.append((float(lat), float(lon)))
-    return pts
+        if hasattr(folder, 'name') and folder.name == 'Centerline':
+            for pm in folder.Placemark:
+                if hasattr(pm, 'LineString'):
+                    coords_text = str(pm.LineString.coordinates).strip()
+                    for line in coords_text.split():
+                        lon, lat, _ = map(float, line.split(','))
+                        centerline_coords.append((lat, lon))
 
-# ── Streamlit Interface ───────────────────────────────────────────────────────
-st.set_page_config("AGM Segment Distances", layout="wide")
-st.title("📏 Terrain-Aware AGM Segment Distances")
+    return agms, centerline_coords
 
-upload = st.file_uploader("Upload KML or KMZ centerline", type=["kml", "kmz"])
-if not upload:
-    st.info("Please upload your KML/KMZ file.")
-    st.stop()
+# 📍 AGM path segment extractor
+def get_path_segment(centerline, pt1, pt2):
+    def closest_index(point):
+        return min(range(len(centerline)), key=lambda i: geodesic(centerline[i], point).feet)
+    i1 = closest_index(pt1)
+    i2 = closest_index(pt2)
+    return centerline[min(i1, i2):max(i1, i2)+1]
 
-try:
-    points = parse_centerline(upload)
-except Exception as e:
-    st.error(f"Failed to parse file: {e}")
-    st.stop()
+# 🖥️ Streamlit App
+st.title("AGM Terrain-Aware Distance Calculator")
+uploaded_file = st.file_uploader("Upload KMZ file with 'AGMs' and 'Centerline' folders", type="kmz")
 
-if len(points) < 2:
-    st.error("Centerline needs at least 2 points.")
-    st.stop()
+if uploaded_file:
+    kml_raw = extract_kml_from_kmz(uploaded_file)
+    agms, centerline = extract_agms_and_centerline(kml_raw)
 
-st.success(f"Loaded {len(points)} centerline points.")
+    ordered_agms = sorted(agms.items(), key=lambda x: int(x[0].split()[-1]))
+    distances = []
 
-if st.button("Compute Segment Distances"):
-    n = len(points) - 1
-
-    # cumulative planar (2D) distances in meters
-    cumul2d = [0.0]
-    for i in range(n):
-        lat1, lon1 = points[i]
-        lat2, lon2 = points[i+1]
-        cumul2d.append(cumul2d[-1] + haversine(lat1, lon1, lat2, lon2))
-
-    rows = []
-    total_ft = 0.0
-
-    prog = st.progress(0)
-    for i in range(n):
-        lat1, lon1 = points[i]
-        lat2, lon2 = points[i+1]
-
-        d2d = haversine(lat1, lon1, lat2, lon2)
-        e1, e2 = get_elevation(lat1, lon1), get_elevation(lat2, lon2)
-        d3d = math.sqrt(d2d**2 + (e2 - e1)**2)
-
-        # convert to feet & miles
-        seg_ft = d3d * FT_PER_M
-        seg_mi = seg_ft * MI_PER_FT
-        total_ft += seg_ft
-
-        # station labels (zero-padded to 3 digits)
-        start_ft = round(cumul2d[i] * FT_PER_M)
-        end_ft   = round(cumul2d[i+1] * FT_PER_M)
-        label = f"Distance from {start_ft:03d} to {end_ft:03d}:"
-
-        rows.append({
-            "Segment": label,
-            "Distance (ft)": f"{seg_ft:.2f}",
-            "Distance (mi)": f"{seg_mi:.4f}"
-        })
-        prog.progress((i+1)/n)
-
-    df = pd.DataFrame(rows)
-    st.dataframe(df, use_container_width=True)
-
-    # show totals
-    total_mi = total_ft * MI_PER_FT
-    st.markdown(f"**Total Terrain-Aware Distance:** {total_ft:.2f} ft ({total_mi:.2f} mi)")
-
-    # CSV download
-    csv = df.to_csv(index=False)
-    st.download_button(
-        label="📥 Download CSV",
-        data=csv,
-        file_name="segment_distances.csv",
-        mime="text/csv"
-    )
+    st.write(f"Processing {len(ordered_agms)} AGMs…")
+    for i in range(len(ordered_agms) - 1):
+        name1, pt1 = ordered

@@ -9,8 +9,7 @@ lxml
 requests
 shapely
 streamlit-folium
-pyproj
-requests
 folium
 geopy
 srtm.py
+tqdm

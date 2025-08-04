@@ -2,7 +2,6 @@ import streamlit as st
 import zipfile
 import simplekml
 import io
-import polyline
 import requests
 import pandas as pd
 import math

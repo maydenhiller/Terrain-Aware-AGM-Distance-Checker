@@ -173,4 +173,7 @@ total_ft = 0.0
 for i in range(len(agm_chain) - 1):
     lab1, _, _, s0 = agm_chain[i]
     lab2, _, _, s1 = agm_chain[i + 1]
-    pts_xy = densified_points(line_utm, s0 + offset, s1 + offset
+    pts_xy = densified_points(line_utm, s0 + offset, s1 + offset, step_m)
+    dist_m = terrain_distance_m(pts_xy, to_wgs84)
+    dist_ft = dist_m * METERS_TO_FEET
+    dist_mi = dist

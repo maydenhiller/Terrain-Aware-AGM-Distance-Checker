@@ -1,81 +1,62 @@
-import streamlit as st
-from fastkml import kml
-from shapely.geometry import LineString, Point
-import zipfile, io, requests
-import xml.etree.ElementTree as ET
+import os
+import io
 import math
-import pyproj
+import zipfile
+import xml.etree.ElementTree as ET
 
-# Elevation API (replace with preferred multi-source logic)
-def get_elevation(lat, lon):
-    # Stub: Replace with real elevation retrieval
-    return 0.0
+import requests
+import streamlit as st
+from shapely.geometry import LineString, Point, MultiLineString
+from shapely.ops import linemerge
+from pyproj import CRS, Transformer
+import srtm  # pip install srtm.py
 
-def terrain_distance(p1, p2):
-    # p1, p2 = (lon, lat)
-    elev1 = get_elevation(p1[1], p1[0])
-    elev2 = get_elevation(p2[1], p2[0])
-    geod = pyproj.Geod(ellps="WGS84")
-    horiz_dist = geod.inv(p1[0], p1[1], p2[0], p2[1])[2]
-    vert_diff = elev2 - elev1
-    return math.sqrt(horiz_dist**2 + vert_diff**2)
+# ---------------------------- Config ----------------------------
+METERS_TO_FEET = 3.28084
+FEET_PER_MILE = 5280
+DEFAULT_STEP_M = 5.0  # densification step along centerline in meters
 
-def extract_kml(file):
-    if file.name.lower().endswith(".kmz"):
-        with zipfile.ZipFile(file) as kmz:
-            with kmz.open([n for n in kmz.namelist() if n.endswith(".kml")][0]) as kml_file:
-                return kml_file.read()
+# Elevation sources (priority order)
+EPQS_URL = "https://nationalmap.gov/epqs/pqs.php"  # USGS Elevation Point Query Service
+OPENTOPO_URL = "https://portal.opentopography.org/API/point"  # requires key
+OPENTOPO_KEY = os.getenv("OPENTOPO_KEY") or st.secrets.get("OPENTOPO_KEY", None)
+OPENTOPO_DEMTYPES = ["USGS3DEP1m", "USGSNED10m", "SRTMGL1"]  # high->lower res fallbacks
+OPEN_ELEVATION_URL = "https://api.open-elevation.com/api/v1/lookup"
+
+# ---------------------------- Streamlit UI ----------------------------
+st.set_page_config(page_title="Terrain-aware AGM distances", layout="wide")
+st.title("Terrain-aware AGM distances (KML/KMZ)")
+
+with st.expander("Options", expanded=False):
+    step_m = st.number_input(
+        "Densification step (meters)",
+        min_value=1.0,
+        max_value=50.0,
+        value=DEFAULT_STEP_M,
+        step=1.0,
+        help="Smaller steps increase accuracy but require more elevation queries."
+    )
+    show_debug = st.checkbox("Show debug info", value=False)
+
+uploaded = st.file_uploader("Upload KML or KMZ containing AGMs and CENTERLINE", type=["kml", "kmz"])
+if not uploaded:
+    st.stop()
+
+# ---------------------------- Helpers ----------------------------
+def read_uploaded_bytes(file) -> bytes:
+    file.seek(0)
     return file.read()
 
-st.title("AGM Terrain‑Aware Distance Calculator")
+def extract_kml_from_kmz(data: bytes) -> bytes | None:
+    with zipfile.ZipFile(io.BytesIO(data), 'r') as zf:
+        # Pick the first KML found (most KMZs contain one doc.kml)
+        for name in zf.namelist():
+            if name.lower().endswith(".kml"):
+                return zf.read(name)
+    return None
 
-uploaded = st.file_uploader("Upload KML or KMZ", type=["kml", "kmz"])
-if uploaded:
-    kml_bytes = extract_kml(uploaded)
-    root = ET.fromstring(kml_bytes)
-    ns = {"kml": "http://www.opengis.net/kml/2.2"}
-
-    # Find the red centerline coordinates
-    centerline_coords = []
-    for placemark in root.findall(".//kml:Folder[kml:name='CENTERLINE']/kml:Placemark", ns):
-        style_url = placemark.find("kml:styleUrl", ns)
-        if style_url is not None and "2_0" in style_url.text:
-            coords_text = placemark.find(".//kml:coordinates", ns).text.strip()
-            for coord in coords_text.split():
-                lon, lat, *_ = map(float, coord.split(","))
-                centerline_coords.append((lon, lat))
-
-    # Extract AGMs
-    agms = []
-    for pm in root.findall(".//kml:Folder[kml:name='AGMs']/kml:Placemark", ns):
-        coord_text = pm.find(".//kml:coordinates", ns).text.strip()
-        lon, lat, *_ = map(float, coord_text.split(","))
-        name = pm.find("kml:name", ns).text
-        agms.append((name, (lon, lat)))
-
-    # Sort AGMs by order along centerline
-    def proj_on_line(pt, line):
-        return line.project(Point(pt), normalized=False)
-    line_geom = LineString(centerline_coords)
-    agms.sort(key=lambda x: proj_on_line(x[1], line_geom))
-
-    # Distance calculations
-    results = []
-    total = 0
-    for i in range(len(agms) - 1):
-        seg_len = 0
-        seg_line = []
-        # Walk centerline between AGM[i] and AGM[i+1]
-        start_m = proj_on_line(agms[i][1], line_geom)
-        end_m = proj_on_line(agms[i+1][1], line_geom)
-        segment = LineString(line_geom.interpolate(d) for d in [start_m, end_m])
-        seg_coords = list(segment.coords)
-        for a, b in zip(seg_coords[:-1], seg_coords[1:]):
-            seg_len += terrain_distance(a, b)
-        total += seg_len
-        results.append((agms[i][0], agms[i+1][0], seg_len))
-
-    st.subheader("AGM‑to‑AGM Distances")
-    for a, b, d in results:
-        st.write(f"{a} → {b}: {d:.2f} m")
-    st.write(f"**Total Distance:** {total:.2f} m")
+def utm_crs_for(lats, lons) -> CRS:
+    lat_mean = sum(lats) / len(lats)
+    lon_mean = sum(lons) / len(lons)
+    zone = int((lon_mean + 180) // 6) + 1
+    epsg = 32600 + zone if lat_mean

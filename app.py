@@ -15,7 +15,7 @@ import srtm  # pip install srtm.py
 # ---------------------------- Config ----------------------------
 METERS_TO_FEET = 3.28084
 FEET_PER_MILE = 5280
-DEFAULT_STEP_M = 5.0  # densification step along centerline in meters
+DEFAULT_STEP_M = 5.0
 
 EPQS_URL = "https://nationalmap.gov/epqs/pqs.php"
 OPENTOPO_URL = "https://portal.opentopography.org/API/point"
@@ -33,8 +33,7 @@ with st.expander("Options", expanded=False):
         min_value=1.0,
         max_value=50.0,
         value=DEFAULT_STEP_M,
-        step=1.0,
-        help="Smaller steps increase accuracy but require more elevation queries."
+        step=1.0
     )
     show_debug = st.checkbox("Show debug info", value=False)
 
@@ -113,43 +112,34 @@ def get_srtm():
 
 srtm_data = get_srtm()
 
-@st.cache_data(show_spinner=False, ttl=24 * 3600, max_entries=200000)
+@st.cache_data(show_spinner=False, ttl=86400, max_entries=200000)
 def get_elevation(lat: float, lon: float) -> float:
     try:
-        r = requests.get(
-            EPQS_URL,
-            params={"x": lon, "y": lat, "units": "Meters", "output": "json"},
-            timeout=6,
-        )
+        r = requests.get(EPQS_URL, params={"x": lon, "y": lat, "units": "Meters", "output": "json"}, timeout=6)
         r.raise_for_status()
         e = r.json()["USGS_Elevation_Point_Query_Service"]["Elevation_Query"]["Elevation"]
         if e is not None:
             return float(e)
     except Exception:
         pass
-
     if OPENTOPO_KEY:
         for dem in OPENTOPO_DEMTYPES:
             try:
-                r = requests.get(
-                    OPENTOPO_URL,
-                    params={"x": lon, "y": lat, "demtype": dem, "outputFormat": "JSON", "key": OPENTOPO_KEY},
-                    timeout=6,
-                )
+                r = requests.get(OPENTOPO_URL,
+                                 params={"x": lon, "y": lat, "demtype": dem, "outputFormat": "JSON", "key": OPENTOPO_KEY},
+                                 timeout=6)
                 r.raise_for_status()
                 j = r.json()
                 if "data" in j and "elevation" in j["data"]:
                     return float(j["data"]["elevation"])
             except Exception:
                 continue
-
     try:
         e = srtm_data.get_elevation(lat, lon)
         if e is not None:
             return float(e)
     except Exception:
         pass
-
     try:
         r = requests.get(OPEN_ELEVATION_URL, params={"locations": f"{lat:.6f},{lon:.6f}"}, timeout=6)
         r.raise_for_status()
@@ -161,25 +151,16 @@ def get_elevation(lat: float, lon: float) -> float:
 def build_centerline_utm(segments_ll, to_utm: Transformer) -> LineString:
     utm_lines = []
     for seg in segments_ll:
-        if not seg or len(seg) < 2:
+        if len(seg) < 2:
             continue
         xs, ys = to_utm.transform(*zip(*seg))
-        if len(xs) >= 2:
-            utm_lines.append(LineString(list(zip(xs, ys))))
-    if not utm_lines:
-        raise ValueError("No valid Centerline geometry.")
-    try:
-        merged = linemerge(MultiLineString(utm_lines)) if len(utm_lines) > 1 else utm_lines[0]
-        if isinstance(merged, LineString):
-            return merged
-        parts = list(merged.geoms)
-        parts.sort(key=lambda g: g.length, reverse=True)
-        return parts[0]
-    except Exception:
-        coords = []
-        for ln in utm_lines:
-            coords.extend(list(ln.coords))
-        return LineString(coords)
+        utm_lines.append(LineString(list(zip(xs, ys))))
+    merged = linemerge(MultiLineString(utm_lines)) if len(utm_lines) > 1 else utm_lines[0]
+    if isinstance(merged, LineString):
+        return merged
+    parts = list(merged.geoms)
+    parts.sort(key=lambda g: g.length, reverse=True)
+    return parts[0]
 
 def densified_points(line_utm, s0: float, s1: float, step: float):
     a, b = (s0, s1) if s0 <= s1 else (s1, s0)
@@ -202,4 +183,20 @@ def terrain_distance_m(pts_xy, to_wgs84: Transformer) -> float:
     elevs = [get_elevation(lat, lon) for lat, lon in zip(lats, lons)]
     for i in range(len(pts_xy) - 1):
         x1, y1 = pts_xy[i]
-        x2, y
+        x2, y2 = pts_xy[i + 1]
+        h = math.hypot(x2 - x1, y2 - y1)
+        v = elevs[i + 1] - elevs[i]
+        total += math.hypot(h, v)
+    return total
+
+# ---------------------------- Main flow ----------------------------
+data = read_uploaded_bytes(uploaded)
+if uploaded.name.lower().endswith(".kmz"):
+    kml_bytes = extract_kml_from_kmz(data)
+    if not kml_bytes:
+        st.error("Could not extract KML from KMZ.")
+        st.stop()
+else:
+    kml_bytes = data
+
+ag

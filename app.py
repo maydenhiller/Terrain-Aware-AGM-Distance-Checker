@@ -30,14 +30,14 @@ st.title("Terrain-aware AGM distances (KML/KMZ)")
 with st.expander("Options", expanded=False):
     step_m = st.number_input(
         "Densification step (meters)",
-        min_value=1.0,
-        max_value=50.0,
-        value=DEFAULT_STEP_M,
-        step=1.0
+        min_value=1.0, max_value=50.0,
+        value=DEFAULT_STEP_M, step=1.0
     )
     show_debug = st.checkbox("Show debug info", value=False)
 
-uploaded = st.file_uploader("Upload KML or KMZ containing AGMs and CENTERLINE", type=["kml", "kmz"])
+uploaded = st.file_uploader(
+    "Upload KML or KMZ containing AGMs and CENTERLINE", type=["kml", "kmz"]
+)
 if not uploaded:
     st.stop()
 
@@ -65,7 +65,6 @@ def parse_station(label: str) -> tuple[int, str]:
     m = re.match(r"^\s*(\d+)\s*([A-Za-z]*)\s*$", label or "")
     return (int(m.group(1)), m.group(2)) if m else (0, "")
 
-# ---------------------------- KML parsing ----------------------------
 def parse_kml_for_agms_and_centerline(kml_bytes: bytes):
     ns = {"kml": "http://www.opengis.net/kml/2.2"}
     root = ET.fromstring(kml_bytes)
@@ -78,7 +77,7 @@ def parse_kml_for_agms_and_centerline(kml_bytes: bytes):
         for pm in fld.findall("kml:Placemark", ns):
             name_el = pm.find("kml:name", ns)
             coord_el = pm.find(".//kml:Point/kml:coordinates", ns)
-            if name_el is None or coord_el is None or not (coord_el.text or "").strip():
+            if name_el is None or coord_el is None or not coord_el.text.strip():
                 continue
             label = (name_el.text or "").strip()
             lon, lat, *_ = coord_el.text.strip().split(",")
@@ -94,7 +93,7 @@ def parse_kml_for_agms_and_centerline(kml_bytes: bytes):
             if style_url is None or "#2_0" not in (style_url.text or ""):
                 continue
             coords_el = pm.find(".//kml:LineString/kml:coordinates", ns)
-            if coords_el is None or not (coords_el.text or "").strip():
+            if coords_el is None or not coords_el.text.strip():
                 continue
             seg = []
             for token in coords_el.text.strip().split():
@@ -105,11 +104,9 @@ def parse_kml_for_agms_and_centerline(kml_bytes: bytes):
 
     return agms, centerline_segments
 
-# ---------------------------- Elevation stack ----------------------------
 @st.cache_resource(show_spinner=False)
 def get_srtm():
     return srtm.get_data()
-
 srtm_data = get_srtm()
 
 @st.cache_data(show_spinner=False, ttl=86400, max_entries=200000)
@@ -118,15 +115,15 @@ def get_elevation(lat: float, lon: float) -> float:
         r = requests.get(EPQS_URL, params={"x": lon, "y": lat, "units": "Meters", "output": "json"}, timeout=6)
         r.raise_for_status()
         e = r.json()["USGS_Elevation_Point_Query_Service"]["Elevation_Query"]["Elevation"]
-        if e is not None:
-            return float(e)
+        if e is not None: return float(e)
     except Exception:
         pass
     if OPENTOPO_KEY:
         for dem in OPENTOPO_DEMTYPES:
             try:
                 r = requests.get(OPENTOPO_URL,
-                                 params={"x": lon, "y": lat, "demtype": dem, "outputFormat": "JSON", "key": OPENTOPO_KEY},
+                                 params={"x": lon, "y": lat, "demtype": dem,
+                                         "outputFormat": "JSON", "key": OPENTOPO_KEY},
                                  timeout=6)
                 r.raise_for_status()
                 j = r.json()
@@ -136,8 +133,7 @@ def get_elevation(lat: float, lon: float) -> float:
                 continue
     try:
         e = srtm_data.get_elevation(lat, lon)
-        if e is not None:
-            return float(e)
+        if e is not None: return float(e)
     except Exception:
         pass
     try:
@@ -147,14 +143,12 @@ def get_elevation(lat: float, lon: float) -> float:
     except Exception:
         return 0.0
 
-# ---------------------------- Geometry helpers ----------------------------
 def build_centerline_utm(segments_ll, to_utm: Transformer) -> LineString:
     utm_lines = []
     for seg in segments_ll:
-        if len(seg) < 2:
-            continue
+        if len(seg) < 2: continue
         xs, ys = to_utm.transform(*zip(*seg))
-        utm_lines.append(LineString(list(zip(xs, ys))))
+        utm_lines.append(LineString(zip(xs, ys)))
     merged = linemerge(MultiLineString(utm_lines)) if len(utm_lines) > 1 else utm_lines[0]
     if isinstance(merged, LineString):
         return merged
@@ -164,16 +158,13 @@ def build_centerline_utm(segments_ll, to_utm: Transformer) -> LineString:
 
 def densified_points(line_utm, s0: float, s1: float, step: float):
     a, b = (s0, s1) if s0 <= s1 else (s1, s0)
-    if abs(b - a) < 1e-6:
-        b = a + step
+    if abs(b - a) < 1e-6: b = a + step
     n_steps = max(1, int(math.floor((b - a) / step)))
     dists = [a + i * step for i in range(n_steps)]
-    if not dists or dists[-1] < b:
-        dists.append(b)
+    if not dists or dists[-1] < b: dists.append(b)
     pts = [line_utm.interpolate(d) for d in dists]
     pts_xy = [(p.x, p.y) for p in pts]
-    if s0 > s1:
-        pts_xy.reverse()
+    if s0 > s1: pts_xy.reverse()
     return pts_xy
 
 def terrain_distance_m(pts_xy, to_wgs84: Transformer) -> float:
@@ -191,90 +182,123 @@ def terrain_distance_m(pts_xy, to_wgs84: Transformer) -> float:
 
 # ---------------------------- Main flow ----------------------------
 data = read_uploaded_bytes(uploaded)
-if uploaded.name.lower().endswith(".kmz"):
-    kml_bytes = extract_kml_from_kmz(data)
-    if not kml_bytes:
-        st.error("Could not extract KML from KMZ.")
-        st.stop()
-else:
-    kml_bytes = data
+kml_bytes = extract_kml_from_kmz(data) if uploaded.name.lower().endswith(".kmz") else data
 
-agms, centerline_ll = parse_kml_for_agms_and_centerline(kml_bytes)
+agms, centerline_segments = parse_kml_for_agms_and_centerline(kml_bytes)
 
 if not agms:
-    st.error("No AGMs found under Folder named 'AGMs'.")
+    st.error("No AGMs found in the 'AGMs' folder.")
     st.stop()
-if not centerline_ll:
-    st.error("No CENTERLINE placemarks with styleUrl '#2_0' found.")
+if not centerline_segments:
+    st.error("No red CENTERLINE segments found (style '#2_0').")
     st.stop()
 
-# Prepare CRS
-all_lons = [lon for seg in centerline_ll for lon, _ in seg]
-all_lats = [lat for seg in centerline_ll for _, lat in seg]
+# Build UTM CRS and transformers from centerline extents
+all_lons = [lon for seg in centerline_segments for (lon, lat) in seg]
+all_lats = [lat for seg in centerline_segments for (lon, lat) in seg]
 crs_utm = utm_crs_for(all_lats, all_lons)
 to_utm = Transformer.from_crs("EPSG:4326", crs_utm, always_xy=True)
 to_wgs84 = Transformer.from_crs(crs_utm, "EPSG:4326", always_xy=True)
 
-# Build centerline
-line_utm = build_centerline_utm(centerline_ll, to_utm)
+# Centerline in UTM
+line_utm = build_centerline_utm(centerline_segments, to_utm)
+line_len_m = float(line_utm.length)
 
-# Sort AGMs and project to chainage
-agms_sorted = sorted(agms, key=lambda x: parse_station(x[0]))
-agm_chain = []
-for label, lon, lat in agms_sorted:
+# Project AGMs to line and order along the centerline
+records = []
+for label, lon, lat in agms:
+    s_num, suf = parse_station(label)
     x, y = to_utm.transform(lon, lat)
-    s = line_utm.project(Point(x, y))
-    agm_chain.append((label, lon, lat, s))
+    s_on = float(line_utm.project(Point(x, y)))
+    records.append(
+        {
+            "label": label,
+            "num": s_num,
+            "suffix": suf,
+            "lon": lon,
+            "lat": lat,
+            "x": x,
+            "y": y,
+            "s_on": s_on,
+        }
+    )
 
-# Rebase to AGM 000
-offset = None
-for lab, lo, la, s in agm_chain:
-    if parse_station(lab)[0] == 0:  # AGM 000
-        offset = s
-        break
-if offset is None:
-    st.error("No AGM 000 found to use as starting point.")
-    st.stop()
-agm_chain = [(lab, lo, la, s - offset) for lab, lo, la, s in agm_chain]
+# Sort AGMs by their curvilinear position on the centerline
+recs_sorted = sorted(records, key=lambda r: r["s_on"])
 
-if show_debug:
-    st.write("AGM projection (chainage in feet):")
-    st.dataframe([
-        {"AGM": lab, "lon": lo, "lat": la, "chainage_ft": round(s * METERS_TO_FEET, 2)}
-        for lab, lo, la, s in agm_chain
-    ])
+# Start from AGM 000 at 0 feet if present; otherwise start from first AGM along line
+start_idx = next((i for i, r in enumerate(recs_sorted) if r["num"] == 0), None)
+if start_idx is None:
+    st.warning("AGM '000' not found. Starting from the first AGM along the centerline.")
+    start_idx = 0
 
-# Compute AGM → AGM segment distances
+# Build segment distances between consecutive AGMs (000→010, 010→020, ...)
 rows = []
-total_ft = 0.0
-for i in range(len(agm_chain) - 1):
-    lab1, lo1, la1, s0 = agm_chain[i]
-    lab2, lo2, la2, s1 = agm_chain[i + 1]
-    pts_xy = densified_points(line_utm, s0 + offset, s1 + offset, step_m)
-    d_m = terrain_distance_m(pts_xy, to_wgs84)
-    d_ft = d_m * METERS_TO_FEET
-    d_mi = d_ft / FEET_PER_MILE
-    total_ft += d_ft
-    rows.append({
-        "Segment": f"{lab1} → {lab2}",
-        "Distance (ft)": round(d_ft, 2),
-        "Distance (mi)": round(d_mi, 4)
-    })
+cum_ft = 0.0
+for i in range(start_idx, len(recs_sorted) - 1):
+    r0 = recs_sorted[i]
+    r1 = recs_sorted[i + 1]
+
+    s0 = max(0.0, min(r0["s_on"], line_len_m))
+    s1 = max(0.0, min(r1["s_on"], line_len_m))
+
+    # Densify the path between AGMs along the centerline and compute terrain-aware 3D distance
+    pts_xy = densified_points(line_utm, s0, s1, float(step_m))
+    seg_m = terrain_distance_m(pts_xy, to_wgs84)
+
+    seg_ft = seg_m * METERS_TO_FEET
+    seg_mi = seg_ft / FEET_PER_MILE
+    cum_ft += seg_ft
+
+    lab0 = f"{r0['num']:03d}"
+    lab1 = f"{r1['num']:03d}"
+
+    rows.append(
+        {
+            "Segment": f"{lab0} to {lab1}",
+            "Distance (ft)": seg_ft,
+            "Distance (mi)": seg_mi,
+            "Total Distance So Far (ft)": cum_ft,
+        }
+    )
 
 df = pd.DataFrame(rows)
 
-# Display results
-st.subheader("AGM Segment Distances (Terrain-aware)")
-st.dataframe(df, use_container_width=True)
+if df.empty:
+    st.error("No AGM segments to measure. Need at least two AGMs aligned to the centerline.")
+    st.stop()
 
-tot_mi = total_ft / FEET_PER_MILE
-st.markdown(f"**Total Distance:** {total_ft:,.2f} ft  |  {tot_mi:.4f} mi")
+# Display table
+st.subheader("Segment distances")
+st.dataframe(
+    df.style.format(
+        {
+            "Distance (ft)": "{:,.2f}",
+            "Distance (mi)": "{:,.4f}",
+            "Total Distance So Far (ft)": "{:,.2f}",
+        }
+    ),
+    use_container_width=True,
+)
 
 # CSV download
-csv = df.to_csv(index=False).encode("utf-8")
+csv_data = df.to_csv(index=False)
 st.download_button(
     label="Download CSV",
-    data=csv,
+    data=csv_data,
     file_name="agm_segment_distances.csv",
-    mime="text/csv"
+    mime="text/csv",
 )
+
+# Optional debug info
+if show_debug:
+    st.write(
+        {
+            "utm_crs": str(crs_utm),
+            "line_length_m": round(line_len_m, 3),
+            "num_agms_found": len(agms),
+            "num_centerline_segments": len(centerline_segments),
+            "densify_step_m": float(step_m),
+            "start_index": start_idx,
+        }
+    )

@@ -17,7 +17,6 @@ METERS_TO_FEET = 3.28084
 FEET_PER_MILE = 5280
 DEFAULT_STEP_M = 5.0  # densification step along centerline in meters
 
-# Elevation sources
 EPQS_URL = "https://nationalmap.gov/epqs/pqs.php"
 OPENTOPO_URL = "https://portal.opentopography.org/API/point"
 OPENTOPO_KEY = os.getenv("OPENTOPO_KEY") or st.secrets.get("OPENTOPO_KEY", None)
@@ -202,4 +201,5 @@ def terrain_distance_m(pts_xy, to_wgs84: Transformer) -> float:
     lons, lats = to_wgs84.transform(xs, ys)
     elevs = [get_elevation(lat, lon) for lat, lon in zip(lats, lons)]
     for i in range(len(pts_xy) - 1):
-        h = math.hypot(pts_xy[i+1
+        x1, y1 = pts_xy[i]
+        x2, y

@@ -1,95 +1,81 @@
 import streamlit as st
-import pandas as pd
+from fastkml import kml
+from shapely.geometry import LineString, Point
+import zipfile, io, requests
+import xml.etree.ElementTree as ET
+import math
+import pyproj
 
-# --- Terrain-aware 3D distance logic ---
-# This version includes the elevation-aware calculation inline
-# so you don't have to swap imports or modules.
-
-from math import sqrt
-import requests
-
+# Elevation API (replace with preferred multi-source logic)
 def get_elevation(lat, lon):
-    """
-    Replace this with your actual multi-source elevation lookup.
-    Below is a placeholder using Open-Elevation API for demonstration.
-    """
-    url = "https://api.open-elevation.com/api/v1/lookup"
-    params = {"locations": f"{lat},{lon}"}
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        data = r.json()
-        return data['results'][0]['elevation']
-    except Exception:
-        return 0.0
+    # Stub: Replace with real elevation retrieval
+    return 0.0
 
-def compute_3d_distance(coords):
-    """
-    Computes total 3D distance along the given coordinate list,
-    integrating elevation at each point.
-    """
-    total = 0.0
-    if len(coords) < 2:
-        return total
+def terrain_distance(p1, p2):
+    # p1, p2 = (lon, lat)
+    elev1 = get_elevation(p1[1], p1[0])
+    elev2 = get_elevation(p2[1], p2[0])
+    geod = pyproj.Geod(ellps="WGS84")
+    horiz_dist = geod.inv(p1[0], p1[1], p2[0], p2[1])[2]
+    vert_diff = elev2 - elev1
+    return math.sqrt(horiz_dist**2 + vert_diff**2)
 
-    elev_cache = {}
-    for i in range(len(coords) - 1):
-        lat1, lon1 = coords[i]
-        lat2, lon2 = coords[i + 1]
+def extract_kml(file):
+    if file.name.lower().endswith(".kmz"):
+        with zipfile.ZipFile(file) as kmz:
+            with kmz.open([n for n in kmz.namelist() if n.endswith(".kml")][0]) as kml_file:
+                return kml_file.read()
+    return file.read()
 
-        # Elevations with caching
-        if (lat1, lon1) not in elev_cache:
-            elev_cache[(lat1, lon1)] = get_elevation(lat1, lon1)
-        if (lat2, lon2) not in elev_cache:
-            elev_cache[(lat2, lon2)] = get_elevation(lat2, lon2)
+st.title("AGM Terrain‑Aware Distance Calculator")
 
-        z1 = elev_cache[(lat1, lon1)]
-        z2 = elev_cache[(lat2, lon2)]
+uploaded = st.file_uploader("Upload KML or KMZ", type=["kml", "kmz"])
+if uploaded:
+    kml_bytes = extract_kml(uploaded)
+    root = ET.fromstring(kml_bytes)
+    ns = {"kml": "http://www.opengis.net/kml/2.2"}
 
-        # Haversine for horizontal distance in meters
-        from math import radians, sin, cos, atan2
-        R = 6371000  # Earth radius in meters
-        phi1, phi2 = radians(lat1), radians(lat2)
-        dphi = radians(lat2 - lat1)
-        dlambda = radians(lon2 - lon1)
-        a = sin(dphi/2)**2 + cos(phi1) * cos(phi2) * sin(dlambda/2)**2
-        horiz_dist = 2 * R * atan2(sqrt(a), sqrt(1-a))
+    # Find the red centerline coordinates
+    centerline_coords = []
+    for placemark in root.findall(".//kml:Folder[kml:name='CENTERLINE']/kml:Placemark", ns):
+        style_url = placemark.find("kml:styleUrl", ns)
+        if style_url is not None and "2_0" in style_url.text:
+            coords_text = placemark.find(".//kml:coordinates", ns).text.strip()
+            for coord in coords_text.split():
+                lon, lat, *_ = map(float, coord.split(","))
+                centerline_coords.append((lon, lat))
 
-        # Vertical difference
-        vert_diff = z2 - z1
+    # Extract AGMs
+    agms = []
+    for pm in root.findall(".//kml:Folder[kml:name='AGMs']/kml:Placemark", ns):
+        coord_text = pm.find(".//kml:coordinates", ns).text.strip()
+        lon, lat, *_ = map(float, coord_text.split(","))
+        name = pm.find("kml:name", ns).text
+        agms.append((name, (lon, lat)))
 
-        # 3D segment length
-        seg_len = sqrt(horiz_dist**2 + vert_diff**2)
+    # Sort AGMs by order along centerline
+    def proj_on_line(pt, line):
+        return line.project(Point(pt), normalized=False)
+    line_geom = LineString(centerline_coords)
+    agms.sort(key=lambda x: proj_on_line(x[1], line_geom))
+
+    # Distance calculations
+    results = []
+    total = 0
+    for i in range(len(agms) - 1):
+        seg_len = 0
+        seg_line = []
+        # Walk centerline between AGM[i] and AGM[i+1]
+        start_m = proj_on_line(agms[i][1], line_geom)
+        end_m = proj_on_line(agms[i+1][1], line_geom)
+        segment = LineString(line_geom.interpolate(d) for d in [start_m, end_m])
+        seg_coords = list(segment.coords)
+        for a, b in zip(seg_coords[:-1], seg_coords[1:]):
+            seg_len += terrain_distance(a, b)
         total += seg_len
+        results.append((agms[i][0], agms[i+1][0], seg_len))
 
-    return total
-
-# --- Streamlit UI ---
-st.title("Terrain‑Aware Centerline Distance Calculator")
-
-uploaded_centerline = st.file_uploader(
-    "Upload Centerline TXT",
-    type=["txt", "csv"],
-    help="Extracted table with latitude, longitude, color, kml_folder"
-)
-
-if uploaded_centerline:
-    # Load tab‑ or comma‑separated file
-    df = pd.read_csv(uploaded_centerline, sep=None, engine="python")
-
-    # Filter for red CENTERLINE entries
-    mask = (
-        df['kml_folder'].astype(str).str.strip().eq('CENTERLINE')
-    ) | (
-        df['color'].astype(str).str.strip().eq('#ff0000')
-    )
-    centerline_df = df[mask].copy()
-
-    centerline_coords = list(
-        zip(centerline_df['latitude'], centerline_df['longitude'])
-    )
-
-    st.write(f"Loaded {len(centerline_coords)} centerline points.")
-
-    if st.button("Compute Terrain‑Aware Distance"):
-        total_distance_m = compute_3d_distance(centerline_coords)
-        st.success(f"Total terrain‑aware centerline length: {total_distance_m:,.2f} m")
+    st.subheader("AGM‑to‑AGM Distances")
+    for a, b, d in results:
+        st.write(f"{a} → {b}: {d:.2f} m")
+    st.write(f"**Total Distance:** {total:.2f} m")

@@ -1,304 +1,286 @@
-import os
-import io
-import math
-import zipfile
-import xml.etree.ElementTree as ET
-
-import requests
+# --- AGM Terrain-Aware Chainage Calculator Streamlit App ---
 import streamlit as st
 import pandas as pd
-from shapely.geometry import LineString, Point, MultiLineString
+import numpy as np
+from io import BytesIO
+import zipfile
+from fastkml import kml
+from shapely.geometry import Point, LineString, MultiLineString
 from shapely.ops import linemerge
-from pyproj import CRS, Transformer
-import srtm  # pip install srtm.py
+import requests
+import re
 
-# ---------------------------- Config ----------------------------
-METERS_TO_FEET = 3.28084
-FEET_PER_MILE = 5280
-DEFAULT_STEP_M = 5.0
-
-EPQS_URL = "https://nationalmap.gov/epqs/pqs.php"
-OPENTOPO_URL = "https://portal.opentopography.org/API/point"
-OPENTOPO_KEY = os.getenv("OPENTOPO_KEY") or st.secrets.get("OPENTOPO_KEY", None)
-OPENTOPO_DEMTYPES = ["USGS3DEP1m", "USGSNED10m", "SRTMGL1"]
-OPEN_ELEVATION_URL = "https://api.open-elevation.com/api/v1/lookup"
-
-# ---------------------------- UI ----------------------------
-st.set_page_config(page_title="Terrain-aware AGM distances", layout="wide")
-st.title("Terrain-aware AGM distances (KML/KMZ)")
-
-with st.expander("Options", expanded=False):
-    step_m = st.number_input(
-        "Densification step (meters)",
-        min_value=1.0, max_value=50.0,
-        value=DEFAULT_STEP_M, step=1.0
-    )
-    show_debug = st.checkbox("Show debug info", value=False)
-
-uploaded = st.file_uploader(
-    "Upload KML or KMZ containing AGMs and CENTERLINE", type=["kml", "kmz"]
+# ---- SECTION 1: Streamlit UI Setup ----
+st.set_page_config(page_title="AGM Terrain-Aware Chainage Calculator", layout="wide")
+st.title("AGM Terrain-Aware Chainage Calculator")
+st.markdown(
+    """
+    Upload a KML or KMZ file containing AGMs (Points) with names (e.g., 'AGM 000', 'AGM 010', etc.) and a centerline as a LineString.
+    The app will calculate terrain-aware (3D) distances between AGMs, output a rebased chainage table, and allow you to download results as CSV.
+    """
 )
-if not uploaded:
+
+# ---- SECTION 2: File Upload ----
+uploaded_file = st.file_uploader(
+    "Upload your KML or KMZ file",
+    type=["kml", "kmz"]
+)
+
+if not uploaded_file:
+    st.info("Please upload a .kml or .kmz file to begin.")
     st.stop()
 
-# ---------------------------- Helpers ----------------------------
-def read_uploaded_bytes(file) -> bytes:
-    file.seek(0)
-    return file.read()
+# ---- SECTION 3: Extract KML Data from (KML/KMZ) ----
+def extract_kml_text(filelike, ext):
+    if ext.lower() == ".kmz":
+        try:
+            with zipfile.ZipFile(filelike) as zf:
+                # Find the first .kml file in the archive
+                kml_fname = next((f for f in zf.namelist() if f.endswith(".kml")), None)
+                if not kml_fname:
+                    raise ValueError("No .kml file found inside KMZ.")
+                return zf.read(kml_fname).decode("utf-8")
+        except Exception as e:
+            st.error(f"Failed to extract .kml from .kmz: {e}")
+            st.stop()
+    else:
+        # Assume KML is text
+        return filelike.read().decode("utf-8")
 
-def extract_kml_from_kmz(data: bytes) -> bytes | None:
-    with zipfile.ZipFile(io.BytesIO(data), 'r') as zf:
-        for name in zf.namelist():
-            if name.lower().endswith(".kml"):
-                return zf.read(name)
+file_ext = "." + uploaded_file.name.rsplit(".", 1)[-1].lower()
+kml_text = extract_kml_text(uploaded_file, file_ext)
+
+# ---- SECTION 4: KML Parsing Utilities ----
+
+def parse_kml_features(kml_text):
+    """Parse KML, return lists of (AGM Placemark) and the centerline coordinates."""
+    k = kml.KML()
+    try:
+        k.from_string(kml_text)
+    except Exception as e:
+        st.error(f"KML parse error: {e}")
+        st.stop()
+
+    agm_points = []
+    centerlines = []
+
+    # Recursive function to visit Placemarks at all levels
+    def visit_feature(feat):
+        for f in getattr(feat, 'features', lambda: [])():
+            if isinstance(f, kml.Placemark):
+                geom = f.geometry
+                if hasattr(geom, 'geom_type'):
+                    if geom.geom_type == 'Point':
+                        name = getattr(f, 'name', None)
+                        point = (name, (geom.y, geom.x))  # (lat, lon)
+                        agm_points.append(point)
+                    elif geom.geom_type in ('LineString', 'MultiLineString'):
+                        centerlines.append(geom)
+            else:
+                visit_feature(f)
+    for feat in k.features():
+        visit_feature(feat)
+    return agm_points, centerlines
+
+agm_list, centerlines = parse_kml_features(kml_text)
+
+# ---- Validate AGMs and Centerlines ----
+if len(agm_list) < 2:
+    st.error("Less than two AGMs were detected in the file. At least two AGMs are required.")
+    st.stop()
+if len(centerlines) == 0:
+    st.error("No centerline (LineString or MultiLineString) found in KML.")
+    st.stop()
+
+# ---- SECTION 5: AGM Processing: Sort, Clean, Prepare ----
+
+def parse_agm_number(name):
+    """Return integer AGM number from AGM name like 'AGM 000', 'AGM010', etc."""
+    if not name:
+        return None
+    m = re.search(r"AGM\s*0*(\d+)", name.upper())
+    if m: return int(m.group(1))
+    # Fallback: look for integer in name
+    m = re.search(r"0*(\d+)", name)
+    if m: return int(m.group(1))
     return None
 
-def utm_crs_for(lats, lons) -> CRS:
-    lat_mean = sum(lats) / len(lats)
-    lon_mean = sum(lons) / len(lons)
-    zone = int((lon_mean + 180) // 6) + 1
-    epsg = 32600 + zone if lat_mean >= 0 else 32700 + zone
-    return CRS.from_epsg(epsg)
-
-def parse_station(label: str) -> tuple[int, str]:
-    import re
-    m = re.match(r"^\s*(\d+)\s*([A-Za-z]*)\s*$", label or "")
-    return (int(m.group(1)), m.group(2)) if m else (0, "")
-
-def parse_kml_for_agms_and_centerline(kml_bytes: bytes):
-    ns = {"kml": "http://www.opengis.net/kml/2.2"}
-    root = ET.fromstring(kml_bytes)
-
-    agms = []
-    for fld in root.findall(".//kml:Folder", ns):
-        nm = fld.find("kml:name", ns)
-        if nm is None or (nm.text or "").strip().lower() != "agms":
-            continue
-        for pm in fld.findall("kml:Placemark", ns):
-            name_el = pm.find("kml:name", ns)
-            coord_el = pm.find(".//kml:Point/kml:coordinates", ns)
-            if name_el is None or coord_el is None or not coord_el.text.strip():
-                continue
-            label = (name_el.text or "").strip()
-            lon, lat, *_ = coord_el.text.strip().split(",")
-            agms.append((label, float(lon), float(lat)))
-
-    centerline_segments = []
-    for fld in root.findall(".//kml:Folder", ns):
-        nm = fld.find("kml:name", ns)
-        if nm is None or (nm.text or "").strip().lower() != "centerline":
-            continue
-        for pm in fld.findall("kml:Placemark", ns):
-            style_url = pm.find("kml:styleUrl", ns)
-            if style_url is None or "#2_0" not in (style_url.text or ""):
-                continue
-            coords_el = pm.find(".//kml:LineString/kml:coordinates", ns)
-            if coords_el is None or not coords_el.text.strip():
-                continue
-            seg = []
-            for token in coords_el.text.strip().split():
-                lon, lat, *_ = token.split(",")
-                seg.append((float(lon), float(lat)))
-            if len(seg) >= 2:
-                centerline_segments.append(seg)
-
-    return agms, centerline_segments
-
-@st.cache_resource(show_spinner=False)
-def get_srtm():
-    return srtm.get_data()
-srtm_data = get_srtm()
-
-@st.cache_data(show_spinner=False, ttl=86400, max_entries=200000)
-def get_elevation(lat: float, lon: float) -> float:
-    try:
-        r = requests.get(EPQS_URL, params={"x": lon, "y": lat, "units": "Meters", "output": "json"}, timeout=6)
-        r.raise_for_status()
-        e = r.json()["USGS_Elevation_Point_Query_Service"]["Elevation_Query"]["Elevation"]
-        if e is not None: return float(e)
-    except Exception:
-        pass
-    if OPENTOPO_KEY:
-        for dem in OPENTOPO_DEMTYPES:
-            try:
-                r = requests.get(OPENTOPO_URL,
-                                 params={"x": lon, "y": lat, "demtype": dem,
-                                         "outputFormat": "JSON", "key": OPENTOPO_KEY},
-                                 timeout=6)
-                r.raise_for_status()
-                j = r.json()
-                if "data" in j and "elevation" in j["data"]:
-                    return float(j["data"]["elevation"])
-            except Exception:
-                continue
-    try:
-        e = srtm_data.get_elevation(lat, lon)
-        if e is not None: return float(e)
-    except Exception:
-        pass
-    try:
-        r = requests.get(OPEN_ELEVATION_URL, params={"locations": f"{lat:.6f},{lon:.6f}"}, timeout=6)
-        r.raise_for_status()
-        return float(r.json()["results"][0]["elevation"])
-    except Exception:
-        return 0.0
-
-def build_centerline_utm(segments_ll, to_utm: Transformer) -> LineString:
-    utm_lines = []
-    for seg in segments_ll:
-        if len(seg) < 2: continue
-        xs, ys = to_utm.transform(*zip(*seg))
-        utm_lines.append(LineString(zip(xs, ys)))
-    merged = linemerge(MultiLineString(utm_lines)) if len(utm_lines) > 1 else utm_lines[0]
-    if isinstance(merged, LineString):
-        return merged
-    parts = list(merged.geoms)
-    parts.sort(key=lambda g: g.length, reverse=True)
-    return parts[0]
-
-def densified_points(line_utm, s0: float, s1: float, step: float):
-    a, b = (s0, s1) if s0 <= s1 else (s1, s0)
-    if abs(b - a) < 1e-6: b = a + step
-    n_steps = max(1, int(math.floor((b - a) / step)))
-    dists = [a + i * step for i in range(n_steps)]
-    if not dists or dists[-1] < b: dists.append(b)
-    pts = [line_utm.interpolate(d) for d in dists]
-    pts_xy = [(p.x, p.y) for p in pts]
-    if s0 > s1: pts_xy.reverse()
-    return pts_xy
-
-def terrain_distance_m(pts_xy, to_wgs84: Transformer) -> float:
-    total = 0.0
-    xs, ys = zip(*pts_xy)
-    lons, lats = to_wgs84.transform(xs, ys)
-    elevs = [get_elevation(lat, lon) for lat, lon in zip(lats, lons)]
-    for i in range(len(pts_xy) - 1):
-        x1, y1 = pts_xy[i]
-        x2, y2 = pts_xy[i + 1]
-        h = math.hypot(x2 - x1, y2 - y1)
-        v = elevs[i + 1] - elevs[i]
-        total += math.hypot(h, v)
-    return total
-
-# ---------------------------- Main flow ----------------------------
-data = read_uploaded_bytes(uploaded)
-kml_bytes = extract_kml_from_kmz(data) if uploaded.name.lower().endswith(".kmz") else data
-
-agms, centerline_segments = parse_kml_for_agms_and_centerline(kml_bytes)
-
-if not agms:
-    st.error("No AGMs found in the 'AGMs' folder.")
+agm_processed = []
+for name, (lat, lon) in agm_list:
+    num = parse_agm_number(name)
+    if num is not None:
+        agm_processed.append({"name": name, "num": num, "lat": lat, "lon": lon})
+if len(agm_processed) < 2:
+    st.error("Could not reliably extract AGM numbers from AGM Points. Check naming (AGM labels required).")
     st.stop()
-if not centerline_segments:
-    st.error("No red CENTERLINE segments found (style '#2_0').")
+# Sort AGMs by number (e.g., 0, 10, 20, ...)
+agm_processed = sorted(agm_processed, key=lambda x: x["num"])
+
+# Convert to DataFrame for later
+agm_df = pd.DataFrame(agm_processed)
+
+# ---- SECTION 6: Centerline Geometry Preparation ----
+
+# Merge (possibly multiple) centerline geometries into a single LineString
+centerline_geoms = []
+for geom in centerlines:
+    if hasattr(geom, "coords"):
+        centerline_geoms.append(LineString(list(geom.coords)))
+    elif isinstance(geom, MultiLineString):
+        for l in geom.geoms:
+            centerline_geoms.append(LineString(list(l.coords)))
+if not centerline_geoms:
+    st.error("No valid centerline geometry found.")
     st.stop()
 
-# Build UTM CRS and transformers from centerline extents
-all_lons = [lon for seg in centerline_segments for (lon, lat) in seg]
-all_lats = [lat for seg in centerline_segments for (lon, lat) in seg]
-crs_utm = utm_crs_for(all_lats, all_lons)
-to_utm = Transformer.from_crs("EPSG:4326", crs_utm, always_xy=True)
-to_wgs84 = Transformer.from_crs(crs_utm, "EPSG:4326", always_xy=True)
+centerline_merged = linemerge(centerline_geoms)
+if isinstance(centerline_merged, LineString):
+    centerline_line = centerline_merged
+else:
+    # Multiple disconnected lines, take the longest one
+    lines = list(centerline_merged.geoms)
+    centerline_line = max(lines, key=lambda l: l.length)
 
-# Centerline in UTM
-line_utm = build_centerline_utm(centerline_segments, to_utm)
-line_len_m = float(line_utm.length)
+cl_coords = list(centerline_line.coords)  # (lon,lat [,z]); KML order
 
-# Project AGMs to line and order along the centerline
-records = []
-for label, lon, lat in agms:
-    s_num, suf = parse_station(label)
-    x, y = to_utm.transform(lon, lat)
-    s_on = float(line_utm.project(Point(x, y)))
-    records.append(
-        {
-            "label": label,
-            "num": s_num,
-            "suffix": suf,
-            "lon": lon,
-            "lat": lat,
-            "x": x,
-            "y": y,
-            "s_on": s_on,
-        }
-    )
+# For 3D, if z (altitude) is present, it will be used; otherwise, elevation must be looked up.
 
-# Sort AGMs by their curvilinear position on the centerline
-recs_sorted = sorted(records, key=lambda r: r["s_on"])
+# ---- SECTION 7: Snap AGMs to Centerline ----
 
-# Start from AGM 000 at 0 feet if present; otherwise start from first AGM along line
-start_idx = next((i for i, r in enumerate(recs_sorted) if r["num"] == 0), None)
-if start_idx is None:
-    st.warning("AGM '000' not found. Starting from the first AGM along the centerline.")
-    start_idx = 0
+from shapely.geometry import Point as ShapelyPoint
 
-# Build segment distances between consecutive AGMs (000→010, 010→020, ...)
-rows = []
-cum_ft = 0.0
-for i in range(start_idx, len(recs_sorted) - 1):
-    r0 = recs_sorted[i]
-    r1 = recs_sorted[i + 1]
+def project_point_onto_line(lat, lon, line):
+    """Project AGM (lat, lon) onto centerline; returns distance along (fraction) and projected point."""
+    pt = ShapelyPoint(lon, lat)
+    proj_dist = line.project(pt)
+    snapped = line.interpolate(proj_dist)
+    return proj_dist, snapped
 
-    s0 = max(0.0, min(r0["s_on"], line_len_m))
-    s1 = max(0.0, min(r1["s_on"], line_len_m))
+agm_chain = []
+for idx, row in agm_df.iterrows():
+    dist, snapped = project_point_onto_line(row["lat"], row["lon"], centerline_line)
+    agm_chain.append({
+        "name": row["name"],
+        "num": row["num"],
+        "lat": row["lat"],
+        "lon": row["lon"],
+        "centerline_dist": dist,
+        "cl_snap_lat": snapped.y,
+        "cl_snap_lon": snapped.x
+    })
+agm_chain_sorted = sorted(agm_chain, key=lambda x: x["centerline_dist"])
+agm_snap_df = pd.DataFrame(agm_chain_sorted).reset_index(drop=True)
 
-    # Densify the path between AGMs along the centerline and compute terrain-aware 3D distance
-    pts_xy = densified_points(line_utm, s0, s1, float(step_m))
-    seg_m = terrain_distance_m(pts_xy, to_wgs84)
+# ---- SECTION 8: Elevation Data Function ----
 
-    seg_ft = seg_m * METERS_TO_FEET
-    seg_mi = seg_ft / FEET_PER_MILE
-    cum_ft += seg_ft
+# Caching decorator for API efficiency
+@st.cache_data(show_spinner=False)
+def get_elevations(latlons):
+    """Batch query Open-Elevation for elevations (meters) given list of (lat, lon)."""
+    if len(latlons) == 0:
+        return []
+    url = "https://api.open-elevation.com/api/v1/lookup"
+    # Limit batch size due to service restrictions (use batch of 100)
+    elevations = []
+    batch_size = 100
+    for i in range(0, len(latlons), batch_size):
+        coords = latlons[i:i+batch_size]
+        locations = [{"latitude": lat, "longitude": lon} for (lat, lon) in coords]
+        try:
+            resp = requests.post(
+                url, json={"locations": locations},
+                timeout=10
+            )
+            resp.raise_for_status()
+            rets = resp.json().get("results", [])
+            elevations.extend([r.get("elevation", None) for r in rets])
+        except Exception as e:
+            st.warning(f"Elevation API batch failed: {e}")
+            elevations.extend([None]*len(coords))
+    return elevations
 
-    lab0 = f"{r0['num']:03d}"
-    lab1 = f"{r1['num']:03d}"
+# ---- SECTION 9: AGM-to-AGM Segmental Chainage Calculation ----
 
-    rows.append(
-        {
-            "Segment": f"{lab0} to {lab1}",
-            "Distance (ft)": seg_ft,
-            "Distance (mi)": seg_mi,
-            "Total Distance So Far (ft)": cum_ft,
-        }
-    )
+st.header("Calculating Terrain-Aware Chainages")
+st.write("This may take a minute for a long centerline.")
 
-df = pd.DataFrame(rows)
+def sample_points_along_line(line, s_start, s_end, interval_feet=30):
+    """Return list of points (lat, lon) along `line` between start/end, evenly spaced by interval_feet."""
+    distance = abs(s_end - s_start)
+    interval_m = interval_feet * 0.3048  # convert feet to meters
+    n_samples = max(2, int(np.ceil(distance / interval_m)))  # at least 2 points
+    fractions = np.linspace(s_start, s_end, n_samples)
+    coords = [line.interpolate(f).coords[0] for f in fractions]
+    # coords: list of (lon, lat, [z])
+    return [(c[1], c[0]) for c in coords]  # (lat, lon)
 
-if df.empty:
-    st.error("No AGM segments to measure. Need at least two AGMs aligned to the centerline.")
+segment_data = []
+total_distance_ft = 0.0
+progressbar = st.progress(0, text="Processing segments...")
+
+for i in range(agm_snap_df.shape[0] - 1):
+    r1 = agm_snap_df.iloc[i]
+    r2 = agm_snap_df.iloc[i+1]
+    # Projected centerline positions (distance units in centerline's CRS, likely degrees or meters, but treat as arc length)
+    s1, s2 = r1["centerline_dist"], r2["centerline_dist"]
+    pts = sample_points_along_line(centerline_line, s1, s2, interval_feet=30)
+    elevs = get_elevations(pts)
+    # For any response gaps default to 0
+    elevs = [e if e is not None else 0 for e in elevs]
+    # Compute 3D segment distances
+    dist_sum = 0.0
+    for j in range(1, len(pts)):
+        lat1, lon1, z1 = pts[j-1][0], pts[j-1][1], elevs[j-1]
+        lat2, lon2, z2 = pts[j][0], pts[j][1], elevs[j]
+        # Geodesic (surface) distance
+        r = 6371000  # meters, earth radius
+        phi1, phi2 = np.radians(lat1), np.radians(lat2)
+        dphi = np.radians(lat2 - lat1)
+        dlambda = np.radians(lon2 - lon1)
+        a = np.sin(dphi/2)**2 + np.cos(phi1)*np.cos(phi2)*np.sin(dlambda/2)**2
+        c = 2*np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+        planar = r * c   # meters
+        dz = (z2 - z1)
+        dist = np.sqrt(planar**2 + dz**2)  # meters
+        dist_sum += dist
+    dist_ft = dist_sum * 3.28084  # meters to feet
+    total_distance_ft += dist_ft
+    segment_str = f"{str(r1['num']).zfill(3)} to {str(r2['num']).zfill(3)}"
+    segment_data.append({
+        'Segment': segment_str,
+        'Distance (ft)': int(round(dist_ft)),
+        'Distance (mi)': round(dist_ft/5280.0, 4),
+        'Total Distance So Far (ft)': int(round(total_distance_ft))
+    })
+    progressbar.progress((i+1)/(agm_snap_df.shape[0] - 1))
+
+progressbar.empty()
+
+if len(segment_data) == 0:
+    st.warning("No AGM-to-AGM segments found (are there at least two AGMs?)")
     st.stop()
 
-# Display table
-st.subheader("Segment distances")
+results_df = pd.DataFrame(segment_data)
+st.success("Chainage calculation complete!")
+
+# ---- SECTION 10: Present Results Table ----
+
+st.header("AGM-to-AGM Terrain-Aware Chainage Table")
 st.dataframe(
-    df.style.format(
-        {
-            "Distance (ft)": "{:,.2f}",
-            "Distance (mi)": "{:,.4f}",
-            "Total Distance So Far (ft)": "{:,.2f}",
-        }
-    ),
-    use_container_width=True,
+    results_df,
+    hide_index=True,
+    use_container_width=True
 )
 
-# CSV download
-csv_data = df.to_csv(index=False)
+# ---- SECTION 11: Download as CSV ----
+@st.cache_data(show_spinner=False)
+def make_csv(df):
+    return df.to_csv(index=False).encode("utf-8")
+
 st.download_button(
-    label="Download CSV",
-    data=csv_data,
-    file_name="agm_segment_distances.csv",
+    label="Download Chainage Table as CSV",
+    data=make_csv(results_df),
+    file_name="terrain_aware_chainage.csv",
     mime="text/csv",
+    help="Download the table as a CSV file."
 )
-
-# Optional debug info
-if show_debug:
-    st.write(
-        {
-            "utm_crs": str(crs_utm),
-            "line_length_m": round(line_len_m, 3),
-            "num_agms_found": len(agms),
-            "num_centerline_segments": len(centerline_segments),
-            "densify_step_m": float(step_m),
-            "start_index": start_idx,
-        }
-    )

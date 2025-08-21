@@ -30,22 +30,12 @@ if uploaded_file:
         # Parse KML
         tree = ET.parse(kml_path)
         root = tree.getroot()
-
-        # Namespace
         ns = {"kml": "http://www.opengis.net/kml/2.2"}
 
-        fmap = folium.Map(location=[39, -98], zoom_start=4)
+        placemarks = []
+        lines = []
 
-        # Draw all LineStrings in red
-        for linestring in root.findall(".//kml:LineString", ns):
-            coords_text = linestring.find("kml:coordinates", ns).text.strip()
-            coords = []
-            for c in coords_text.split():
-                lon, lat, *_ = c.split(",")
-                coords.append((float(lat), float(lon)))
-            folium.PolyLine(coords, color="red", weight=3).add_to(fmap)
-
-        # Plot numerical placemarks
+        # Collect placemarks
         for placemark in root.findall(".//kml:Placemark", ns):
             name_elem = placemark.find("kml:name", ns)
             point = placemark.find(".//kml:Point/kml:coordinates", ns)
@@ -53,11 +43,39 @@ if uploaded_file:
                 name = name_elem.text.strip()
                 if name.isnumeric():
                     lon, lat, *_ = point.text.strip().split(",")
-                    folium.Marker(
-                        location=(float(lat), float(lon)),
-                        popup=name,
-                        icon=folium.Icon(color="blue", icon="info-sign"),
-                    ).add_to(fmap)
+                    placemarks.append((name, float(lat), float(lon)))
+
+        # Collect line coords
+        for linestring in root.findall(".//kml:LineString", ns):
+            coords_text = linestring.find("kml:coordinates", ns).text.strip()
+            coords = []
+            for c in coords_text.split():
+                lon, lat, *_ = c.split(",")
+                coords.append((float(lat), float(lon)))
+            lines.append(coords)
+
+        # Debug info
+        st.write(f"✅ Found {len(placemarks)} placemarks and {len(lines)} line(s).")
+        if lines:
+            st.write(f"First line has {len(lines[0])} points.")
+
+        # Build map
+        fmap = folium.Map(location=[39, -98], zoom_start=4)
+
+        # Cap huge line draw for stability
+        for coords in lines:
+            if len(coords) > 5000:
+                st.warning(f"Line has {len(coords)} points. Showing only first 5000 for preview.")
+                coords = coords[:5000]
+            folium.PolyLine(coords, color="red", weight=3).add_to(fmap)
+
+        # Add markers
+        for name, lat, lon in placemarks:
+            folium.Marker(
+                location=(lat, lon),
+                popup=name,
+                icon=folium.Icon(color="blue", icon="info-sign"),
+            ).add_to(fmap)
 
         st.subheader("🗺️ Map Preview")
         st_folium(fmap, width=800, height=600)

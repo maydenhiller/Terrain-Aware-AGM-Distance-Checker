@@ -190,7 +190,6 @@ def terrain_distance_m(pts_xy, to_wgs84: Transformer) -> float:
     return total
 
 # ---------------------------- Main flow ----------------------------
-# ---------------------------- Main flow ----------------------------
 data = read_uploaded_bytes(uploaded)
 if uploaded.name.lower().endswith(".kmz"):
     kml_bytes = extract_kml_from_kmz(data)
@@ -258,8 +257,10 @@ for i in range(len(agm_chain) - 1):
     total_ft += d_ft
     rows.append({
         "Segment": f"{lab1} → {lab2}",
-        "Distance (ft)": round(d_ft, 2),
-        "Distance (mi)": round(d_mi, 4)
+        "Segment Distance (ft)": round(d_ft, 2),
+        "Segment Distance (mi)": round(d_mi, 4),
+        "Cumulative Distance (ft)": round(total_ft, 2),
+        "Cumulative Distance (mi)": round(total_ft / FEET_PER_MILE, 4)
     })
 
 df = pd.DataFrame(rows)
@@ -271,11 +272,21 @@ st.dataframe(df, use_container_width=True)
 tot_mi = total_ft / FEET_PER_MILE
 st.markdown(f"**Total Distance:** {total_ft:,.2f} ft  |  {tot_mi:.4f} mi")
 
-# CSV download
+# ---------------------------- Download buttons ----------------------------
 csv = df.to_csv(index=False).encode("utf-8")
 st.download_button(
     label="Download CSV",
     data=csv,
     file_name="agm_segment_distances.csv",
     mime="text/csv"
+)
+
+excel_buf = io.BytesIO()
+with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+    df.to_excel(writer, sheet_name="AGM Distances", index=False)
+st.download_button(
+    label="Download Excel (.xlsx)",
+    data=excel_buf.getvalue(),
+    file_name="agm_segment_distances.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )

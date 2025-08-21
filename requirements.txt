@@ -13,3 +13,10 @@ folium
 geopy
 srtm.py
 tqdm
+os
+io
+math
+zipfile
+xml.etree.ElementTree
+shapely.geometry
+shapely.ops

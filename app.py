@@ -48,4 +48,40 @@ if uploaded_file:
         # Look specifically for the CENTERLINE folder
         for folder in root.findall(".//kml:Folder", ns):
             fname = folder.find("kml:name", ns)
-            if fname is not None and fname.text.strip().upper().startswith("CENTERLI
+            if fname is not None and fname.text.strip().upper().startswith("CENTERLINE"):
+                for linestring in folder.findall(".//kml:LineString", ns):
+                    coords_text = linestring.find("kml:coordinates", ns).text.strip()
+                    coords = []
+                    for c in coords_text.split():
+                        lon, lat, *_ = c.split(",")
+                        coords.append((float(lat), float(lon)))
+                    centerline.extend(coords)
+
+        # Debug info
+        st.write(f"✅ Found {len(placemarks)} numeric placemarks.")
+        st.write(f"✅ Found CENTERLINE with {len(centerline)} points.")
+
+        # Build map
+        fmap = folium.Map(location=[39, -98], zoom_start=4)
+
+        # Draw only CENTERLINE (cap at 5000 points for preview stability)
+        if centerline:
+            draw_coords = centerline
+            if len(draw_coords) > 5000:
+                st.warning(f"CENTERLINE has {len(draw_coords)} points. Showing only first 5000.")
+                draw_coords = draw_coords[:5000]
+            folium.PolyLine(draw_coords, color="red", weight=3).add_to(fmap)
+
+        # Add placemarks
+        for name, lat, lon in placemarks:
+            folium.Marker(
+                location=(lat, lon),
+                popup=name,
+                icon=folium.Icon(color="blue", icon="info-sign"),
+            ).add_to(fmap)
+
+        st.subheader("🗺️ Map Preview")
+        st_folium(fmap, width=800, height=600)
+
+    except Exception as e:
+        st.error(f"⚠️ Error while processing file: {e}")

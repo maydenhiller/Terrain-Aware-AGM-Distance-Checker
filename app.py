@@ -2,86 +2,237 @@ import streamlit as st
 import zipfile
 import tempfile
 import xml.etree.ElementTree as ET
-import folium
-from streamlit_folium import st_folium
+import math
+import requests
+from shapely.geometry import LineString, Point, MultiLineString
+from shapely.ops import linemerge
+from pyproj import CRS, Transformer
+import srtm
+import pandas as pd
 import os
 
-st.set_page_config(page_title="Terrain Distance Checker", layout="wide")
-st.title("📍 Terrain Distance Checker")
+# ---------------- Config ----------------
+METERS_TO_FEET = 3.28084
+FEET_PER_MILE = 5280
+DEFAULT_STEP_M = 5.0
+EPQS_URL = "https://nationalmap.gov/epqs/pqs.php"
+OPEN_ELEVATION_URL = "https://api.open-elevation.com/api/v1/lookup"
 
-uploaded_file = st.file_uploader("Upload a KML or KMZ file", type=["kml", "kmz"])
-show_preview = st.checkbox("Show map preview", value=True)
-simplify_factor = st.slider("Simplify line by keeping every Nth point", 1, 50, 10)
+# ---------------- UI ----------------
+st.set_page_config(page_title="Terrain-aware AGM distances", layout="wide")
+st.title("Terrain-aware AGM distances (KML/KMZ)")
 
-if uploaded_file:
+with st.expander("Options", expanded=False):
+    step_m = st.number_input(
+        "Densification step (meters)",
+        min_value=1.0, max_value=50.0,
+        value=DEFAULT_STEP_M, step=1.0
+    )
+    show_debug = st.checkbox("Show debug info", value=True)
+
+uploaded = st.file_uploader("Upload KML or KMZ containing AGMs and CENTERLINE", type=["kml","kmz"])
+if not uploaded:
+    st.stop()
+
+# ---------------- Helpers ----------------
+def read_uploaded_bytes(file) -> bytes:
+    file.seek(0)
+    return file.read()
+
+def extract_kml_from_kmz(data: bytes) -> bytes | None:
+    with zipfile.ZipFile(tempfile.SpooledTemporaryFile(buffer=data), 'r') as zf:
+        for name in zf.namelist():
+            if name.lower().endswith(".kml"):
+                return zf.read(name)
+    return None
+
+def utm_crs_for(lats, lons) -> CRS:
+    lat_mean = sum(lats)/len(lats)
+    lon_mean = sum(lons)/len(lons)
+    zone = int((lon_mean + 180)//6)+1
+    epsg = 32600 + zone if lat_mean >= 0 else 32700 + zone
+    return CRS.from_epsg(epsg)
+
+def parse_station(label: str) -> tuple[int, str]:
+    import re
+    m = re.match(r"^\s*(\d+)\s*([A-Za-z]*)\s*$", label or "")
+    return (int(m.group(1)), m.group(2)) if m else (0, "")
+
+# ---------------- KML parsing ----------------
+def parse_kml_for_agms_and_centerline(kml_bytes: bytes):
+    ns = {"kml": "http://www.opengis.net/kml/2.2"}
+    root = ET.fromstring(kml_bytes)
+
+    agms = []
+    for fld in root.findall(".//kml:Folder", ns):
+        nm = fld.find("kml:name", ns)
+        if nm is None or (nm.text or "").strip().upper() != "AGMS":
+            continue
+        for pm in fld.findall("kml:Placemark", ns):
+            name_el = pm.find("kml:name", ns)
+            coord_el = pm.find(".//kml:Point/kml:coordinates", ns)
+            if name_el is None or coord_el is None or not (coord_el.text or "").strip():
+                continue
+            label = (name_el.text or "").strip()
+            lon, lat, *_ = coord_el.text.strip().split(",")
+            if label.isnumeric():  # only numeric
+                agms.append((label, float(lon), float(lat)))
+
+    centerline_segments = []
+    for fld in root.findall(".//kml:Folder", ns):
+        nm = fld.find("kml:name", ns)
+        if nm is None or not (nm.text or "").strip().upper().startswith("CENTERLINE"):
+            continue
+        for pm in fld.findall(".//kml:LineString", ns):
+            coords_el = pm.find("kml:coordinates", ns)
+            if coords_el is None or not (coords_el.text or "").strip():
+                continue
+            seg = []
+            for token in coords_el.text.strip().split():
+                lon, lat, *_ = token.split(",")
+                seg.append((float(lon), float(lat)))
+            if len(seg) >= 2:
+                centerline_segments.append(seg)
+
+    return agms, centerline_segments
+
+# ---------------- Elevation ----------------
+@st.cache_resource(show_spinner=False)
+def get_srtm():
+    return srtm.get_data()
+
+srtm_data = get_srtm()
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def get_elevation(lat: float, lon: float) -> float:
+    # EPQS
     try:
-        # Handle KML vs KMZ
-        if uploaded_file.name.endswith(".kml"):
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".kml") as tmp:
-                tmp.write(uploaded_file.read())
-                kml_path = tmp.name
-        else:  # KMZ
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".kmz") as tmp:
-                tmp.write(uploaded_file.read())
-                kmz_path = tmp.name
-            with zipfile.ZipFile(kmz_path, "r") as z:
-                kml_filename = [f for f in z.namelist() if f.endswith(".kml")][0]
-                z.extract(kml_filename, tempfile.gettempdir())
-                kml_path = os.path.join(tempfile.gettempdir(), kml_filename)
+        r = requests.get(EPQS_URL, params={"x":lon,"y":lat,"units":"Meters","output":"json"}, timeout=6)
+        r.raise_for_status()
+        e = r.json()["USGS_Elevation_Point_Query_Service"]["Elevation_Query"]["Elevation"]
+        if e is not None: return float(e)
+    except: pass
+    # SRTM fallback
+    try:
+        e = srtm_data.get_elevation(lat, lon)
+        if e is not None: return float(e)
+    except: pass
+    # OpenElevation
+    try:
+        r = requests.get(OPEN_ELEVATION_URL, params={"locations":f"{lat:.6f},{lon:.6f}"}, timeout=6)
+        r.raise_for_status()
+        return float(r.json()["results"][0]["elevation"])
+    except: return 0.0
 
-        # Parse KML
-        tree = ET.parse(kml_path)
-        root = tree.getroot()
-        ns = {"kml": "http://www.opengis.net/kml/2.2"}
+# ---------------- Geometry ----------------
+def build_centerline_utm(segments_ll, to_utm: Transformer) -> LineString:
+    utm_lines = []
+    for seg in segments_ll:
+        xs, ys = to_utm.transform(*zip(*seg))
+        utm_lines.append(LineString(list(zip(xs, ys))))
+    merged = linemerge(MultiLineString(utm_lines)) if len(utm_lines)>1 else utm_lines[0]
+    if isinstance(merged, LineString): return merged
+    parts = list(merged.geoms)
+    parts.sort(key=lambda g: g.length, reverse=True)
+    return parts[0]
 
-        placemarks = []
-        centerline = []
+def densified_points(line_utm, s0: float, s1: float, step: float):
+    a,b = (s0,s1) if s0<=s1 else (s1,s0)
+    if abs(b-a)<1e-6: b=a+step
+    n_steps = max(1,int(math.floor((b-a)/step)))
+    dists = [a+i*step for i in range(n_steps)]
+    if not dists or dists[-1]<b: dists.append(b)
+    pts = [line_utm.interpolate(d) for d in dists]
+    pts_xy = [(p.x,p.y) for p in pts]
+    if s0>s1: pts_xy.reverse()
+    return pts_xy
 
-        # Collect placemarks (only numeric names)
-        for placemark in root.findall(".//kml:Placemark", ns):
-            name_elem = placemark.find("kml:name", ns)
-            point = placemark.find(".//kml:Point/kml:coordinates", ns)
-            if name_elem is not None and point is not None:
-                name = name_elem.text.strip()
-                if name.isnumeric():
-                    lon, lat, *_ = point.text.strip().split(",")
-                    placemarks.append((name, float(lat), float(lon)))
+def terrain_distance_m(pts_xy, to_wgs84: Transformer) -> float:
+    total = 0.0
+    xs, ys = zip(*pts_xy)
+    lons,lats = to_wgs84.transform(xs, ys)
+    elevs = [get_elevation(lat,lon) for lat,lon in zip(lats,lons)]
+    for i in range(len(pts_xy)-1):
+        x1,y1=pts_xy[i]
+        x2,y2=pts_xy[i+1]
+        h=math.hypot(x2-x1,y2-y1)
+        v=elevs[i+1]-elevs[i]
+        total+=math.hypot(h,v)
+    return total
 
-        # Look specifically for the CENTERLINE folder
-        for folder in root.findall(".//kml:Folder", ns):
-            fname = folder.find("kml:name", ns)
-            if fname is not None and fname.text.strip().upper().startswith("CENTERLINE"):
-                for linestring in folder.findall(".//kml:LineString", ns):
-                    coords_text = linestring.find("kml:coordinates", ns).text.strip()
-                    coords = []
-                    for c in coords_text.split():
-                        lon, lat, *_ = c.split(",")
-                        coords.append((float(lat), float(lon)))
-                    centerline.extend(coords)
+# ---------------- Main ----------------
+data = read_uploaded_bytes(uploaded)
+if uploaded.name.lower().endswith(".kmz"):
+    with zipfile.ZipFile(io.BytesIO(data),"r") as zf:
+        kml_filename = [f for f in zf.namelist() if f.lower().endswith(".kml")][0]
+        kml_bytes = zf.read(kml_filename)
+else:
+    kml_bytes = data
 
-        # Debug info
-        st.write(f"✅ Found {len(placemarks)} numeric placemarks.")
-        st.write(f"✅ Found CENTERLINE with {len(centerline)} points.")
+agms, centerline_ll = parse_kml_for_agms_and_centerline(kml_bytes)
+if not agms: st.error("No numeric AGMs found."); st.stop()
+if not centerline_ll: st.error("No CENTERLINE found."); st.stop()
 
-        # Map Preview (optional)
-        if show_preview:
-            fmap = folium.Map(location=[39, -98], zoom_start=4)
+# CRS
+all_lons = [lon for seg in centerline_ll for lon,_ in seg]
+all_lats = [lat for seg in centerline_ll for _,lat in seg]
+crs_utm = utm_crs_for(all_lats,all_lons)
+to_utm = Transformer.from_crs("EPSG:4326", crs_utm, always_xy=True)
+to_wgs84 = Transformer.from_crs(crs_utm, "EPSG:4326", always_xy=True)
 
-            # Simplify CENTERLINE for display
-            if centerline:
-                simplified = centerline[::simplify_factor]
-                folium.PolyLine(simplified, color="red", weight=3).add_to(fmap)
+line_utm = build_centerline_utm(centerline_ll, to_utm)
 
-            # Add placemarks
-            for name, lat, lon in placemarks:
-                folium.Marker(
-                    location=(lat, lon),
-                    popup=name,
-                    icon=folium.Icon(color="blue", icon="info-sign"),
-                ).add_to(fmap)
+# Sort AGMs and project chainage
+agms_sorted = sorted(agms,key=lambda x:parse_station(x[0]))
+agm_chain=[]
+for label, lon, lat in agms_sorted:
+    x,y = to_utm.transform(lon,lat)
+    s = line_utm.project(Point(x,y))
+    agm_chain.append((label,lon,lat,s))
 
-            st.subheader("🗺️ Map Preview (simplified)")
-            st_folium(fmap, width=800, height=600)
+# Rebase to AGM 000
+offset=None
+for lab,lo,la,s in agm_chain:
+    if parse_station(lab)[0]==0:
+        offset=s
+        break
+if offset is None: st.error("No AGM 000 found."); st.stop()
+agm_chain = [(lab,lo,la,s-offset) for lab,lo,la,s in agm_chain]
 
-    except Exception as e:
-        st.error(f"⚠️ Error while processing file: {e}")
+if show_debug:
+    st.subheader("🔧 AGM projection (chainage in feet)")
+    st.dataframe([{"AGM":lab,"lon":lo,"lat":la,"chainage_ft":round(s*METERS_TO_FEET,2)}
+                  for lab,lo,la,s in agm_chain])
+
+# Compute distances
+rows=[]
+total_ft=0.0
+for i in range(len(agm_chain)-1):
+    lab1,lo1,la1,s0=agm_chain[i]
+    lab2,lo2,la2,s1=agm_chain[i+1]
+    pts_xy = densified_points(line_utm,s0+offset,s1+offset,step_m)
+    d_m = terrain_distance_m(pts_xy,to_wgs84)
+    d_ft = d_m*METERS_TO_FEET
+    d_mi = d_ft/FEET_PER_MILE
+    total_ft+=d_ft
+    rows.append({
+        "Segment": f"{lab1} → {lab2}",
+        "Distance (ft)": round(d_ft,2),
+        "Distance (mi)": round(d_mi,4),
+        "Cumulative distance (ft)": round(total_ft,2),
+        "Cumulative distance (mi)": round(total_ft/FEET_PER_MILE,4)
+    })
+
+df = pd.DataFrame(rows)
+
+st.subheader("AGM Segment Distances (Terrain-aware)")
+st.dataframe(df,use_container_width=True)
+
+# CSV download
+csv = df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="Download CSV",
+    data=csv,
+    file_name="agm_segment_distances.csv",
+    mime="text/csv"
+)

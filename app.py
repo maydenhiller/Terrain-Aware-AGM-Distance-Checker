@@ -176,4 +176,6 @@ for i in range(len(agm_chain) - 1):
     pts_xy = densified_points(line_utm, s0 + offset, s1 + offset, step_m)
     dist_m = terrain_distance_m(pts_xy, to_wgs84)
     dist_ft = dist_m * METERS_TO_FEET
-    dist_mi = dist
+    dist_mi = dist_ft / FEET_PER_MILE
+    total_ft += dist_ft
+    rows.append({

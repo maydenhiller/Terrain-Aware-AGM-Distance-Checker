@@ -1,4 +1,3 @@
-import os
 import io
 import math
 import zipfile
@@ -13,10 +12,10 @@ from pyproj import CRS, Transformer
 import srtm
 
 # ---------------------------- Config ----------------------------
+GOOGLE_API_KEY = "AIzaSyCd7sfheaJIbB8_J9Q9cxWb5jnv4U0K0LA"
 METERS_TO_FEET = 3.28084
 FEET_PER_MILE = 5280
-DEFAULT_STEP_M = 5.0
-GOOGLE_API_KEY = "AIzaSyCd7sfheaJIbB8_J9Q9cxWb5jnv4U0K0LA"
+DENSIFY_STEP_M = 5.0
 
 # ---------------------------- Elevation ----------------------------
 @st.cache_resource
@@ -130,49 +129,44 @@ def parse_kml_for_agms_and_centerline(kml_bytes):
 st.set_page_config(page_title="Terrain-aware AGM distances", layout="wide")
 st.title("Terrain-aware AGM Segment Distances")
 
-step_m = st.number_input("Densification step (meters)", min_value=1.0, max_value=50.0, value=DEFAULT_STEP_M)
 uploaded = st.file_uploader("Upload KML or KMZ", type=["kml", "kmz"])
-if not uploaded: st.stop()
+generate = st.button("Generate Distances")
 
-raw = uploaded.read()
-kml_bytes = zipfile.ZipFile(io.BytesIO(raw)).read("doc.kml") if uploaded.name.lower().endswith(".kmz") else raw
-if isinstance(kml_bytes, str): kml_bytes = kml_bytes.encode("utf-8")
+if uploaded and generate:
+    raw = uploaded.read()
+    kml_bytes = zipfile.ZipFile(io.BytesIO(raw)).read("doc.kml") if uploaded.name.lower().endswith(".kmz") else raw
+    if isinstance(kml_bytes, str): kml_bytes = kml_bytes.encode("utf-8")
 
-agms, centerline_ll = parse_kml_for_agms_and_centerline(kml_bytes)
-if not agms or not centerline_ll:
-    st.error("AGMs or red centerline not found.")
-    st.stop()
+    agms, centerline_ll = parse_kml_for_agms_and_centerline(kml_bytes)
+    if not agms or not centerline_ll:
+        st.error("AGMs or red centerline not found.")
+        st.stop()
 
-# CRS setup
-all_lons = [lon for seg in centerline_ll for lon, _ in seg]
-all_lats = [lat for seg in centerline_ll for _, lat in seg]
-crs_utm = utm_crs_for(all_lats, all_lons)
-to_utm = Transformer.from_crs("EPSG:4326", crs_utm, always_xy=True)
-to_wgs84 = Transformer.from_crs(crs_utm, "EPSG:4326", always_xy=True)
+    all_lons = [lon for seg in centerline_ll for lon, _ in seg]
+    all_lats = [lat for seg in centerline_ll for _, lat in seg]
+    crs_utm = utm_crs_for(all_lats, all_lons)
+    to_utm = Transformer.from_crs("EPSG:4326", crs_utm, always_xy=True)
+    to_wgs84 = Transformer.from_crs(crs_utm, "EPSG:4326", always_xy=True)
 
-line_utm = build_centerline_utm(centerline_ll, to_utm)
+    line_utm = build_centerline_utm(centerline_ll, to_utm)
 
-# Project AGMs to centerline
-agm_chain = []
-for label, lon, lat in agms:
-    x, y = to_utm.transform(lon, lat)
-    s = line_utm.project(Point(x, y))
-    agm_chain.append((label, lon, lat, s))
+    agm_chain = []
+    for label, lon, lat in agms:
+        x, y = to_utm.transform(lon, lat)
+        s = line_utm.project(Point(x, y))
+        agm_chain.append((label, lon, lat, s))
 
-# Sort by station number
-agm_chain.sort(key=lambda x: extract_station_number(x[0]))
+    agm_chain.sort(key=lambda x: extract_station_number(x[0]))
+    offset = next((s for lab, _, _, s in agm_chain if extract_station_number(lab)[0] == 0), agm_chain[0][3])
+    agm_chain = [(lab, lon, lat, s - offset) for lab, lon, lat, s in agm_chain]
 
-# Rebase to AGM 000
-offset = next((s for lab, _, _, s in agm_chain if extract_station_number(lab)[0] == 0), agm_chain[0][3])
-agm_chain = [(lab, lon, lat, s - offset) for lab, lon, lat, s in agm_chain]
-
-# Compute segment distances
-rows = []
-total_ft = 0.0
-for i in range(len(agm_chain) - 1):
-    lab1, _, _, s0 = agm_chain[i]
-    lab2, _, _, s1 = agm_chain[i + 1]
-    pts_xy = densified_points(line_utm, s0 + offset, s1 + offset, step_m)
-    dist_m = terrain_distance_m(pts_xy, to_wgs84)
-    dist_ft = dist_m * METERS_TO_FEET
-    dist_mi = dist_ft
+    rows = []
+    total_ft = 0.0
+    for i in range(len(agm_chain) - 1):
+        lab1, _, _, s0 = agm_chain[i]
+        lab2, _, _, s1 = agm_chain[i + 1]
+        pts_xy = densified_points(line_utm, s0 + offset, s1 + offset, DENSIFY_STEP_M)
+        dist_m = terrain_distance_m(pts_xy, to_wgs84)
+        dist_ft = dist_m * METERS_TO_FEET
+        dist_mi = dist_ft / FEET_PER_MILE
+        total_ft

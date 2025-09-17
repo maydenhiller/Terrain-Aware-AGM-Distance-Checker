@@ -11,10 +11,16 @@ from pyproj import Transformer
 # --- CONFIG ---
 API_KEY = "AIzaSyCd7sfheaJIbB8_J9Q9cxWb5jnv4U0K0LA"
 ELEVATION_URL = "https://maps.googleapis.com/maps/api/elevation/json"
-
 transformer = Transformer.from_crs("epsg:4326", "epsg:3857", always_xy=True)
 
-# --- HELPERS ---
+# --- AGM SORTING ---
+def agm_sort_key(name_geom):
+    name = name_geom[0]
+    base = ''.join(filter(str.isdigit, name))
+    suffix = ''.join(filter(str.isalpha, name))
+    return (int(base), suffix)
+
+# --- FILE PARSING ---
 def parse_kml_kmz(uploaded_file):
     if uploaded_file.name.endswith(".kmz"):
         with zipfile.ZipFile(uploaded_file) as zf:
@@ -26,38 +32,39 @@ def parse_kml_kmz(uploaded_file):
 
     k = kml.KML()
     k.from_string(kml_data)
-    features = list(k.features())
-    placemarks = []
-
-    def recurse_features(feats):
-        for f in feats:
-            if hasattr(f, "geometry") and f.geometry:
-                placemarks.append(f)
-            if hasattr(f, "features"):
-                recurse_features(f.features())
-
-    recurse_features(features)
-    return placemarks
-
-def extract_agms_and_centerline(placemarks):
     agms = []
     centerline = None
-    for p in placemarks:
-        name = str(p.name).strip()
-        geom = p.geometry
-        if isinstance(geom, Point) and name.isalnum():
-            agms.append((name, geom))
-        elif isinstance(geom, LineString) and "centerline" in name.lower():
-            centerline = geom
+
+    def extract_from_folder(folder):
+        nonlocal agms, centerline
+        folder_name = folder.name.strip().lower()
+        if folder_name == "agms":
+            for f in folder.features():
+                if isinstance(f.geometry, Point):
+                    agms.append((f.name.strip(), f.geometry))
+        elif folder_name == "centerline":
+            for f in folder.features():
+                if isinstance(f.geometry, LineString):
+                    centerline = f.geometry
+
+    for doc in k.features():
+        for f in doc.features():
+            if hasattr(f, "features") and f.name.strip().lower() in ["agms", "centerline"]:
+                extract_from_folder(f)
+
     agms.sort(key=agm_sort_key)
     return agms, centerline
 
-def agm_sort_key(name_geom):
-    name = name_geom[0]
-    base = ''.join(filter(str.isdigit, name))
-    suffix = ''.join(filter(str.isalpha, name))
-    return (int(base), suffix)
+# --- CENTERLINE SLICING ---
+def slice_centerline(centerline, p1, p2):
+    coords = list(centerline.coords)
+    idx1 = min(range(len(coords)), key=lambda i: Point(coords[i]).distance(p1))
+    idx2 = min(range(len(coords)), key=lambda i: Point(coords[i]).distance(p2))
+    if idx1 > idx2:
+        idx1, idx2 = idx2, idx1
+    return LineString(coords[idx1:idx2+1])
 
+# --- INTERPOLATION ---
 def interpolate_line(line, spacing_m=1.0):
     coords = list(line.coords)
     points = [Point(coords[0])]
@@ -69,32 +76,31 @@ def interpolate_line(line, spacing_m=1.0):
             points.append(seg.interpolate(j * spacing_m))
     return points
 
+# --- ELEVATION API ---
 def get_elevations(points):
-    locs = "|".join([f"{p.y},{p.x}" for p in points])
-    response = requests.get(ELEVATION_URL, params={"locations": locs, "key": API_KEY})
-    data = response.json()
-    return [r["elevation"] for r in data["results"]]
+    elevations = []
+    batch_size = 512
+    for i in range(0, len(points), batch_size):
+        chunk = points[i:i+batch_size]
+        locs = "|".join([f"{p.y},{p.x}" for p in chunk])
+        response = requests.get(ELEVATION_URL, params={"locations": locs, "key": API_KEY})
+        data = response.json()
+        elevations.extend([r["elevation"] for r in data["results"]])
+    return elevations
 
+# --- 3D DISTANCE ---
 def distance_3d(p1, p2, e1, e2):
-    dx, dy = transformer.transform(p2.x, p2.y)[0] - transformer.transform(p1.x, p1.y)[0], transformer.transform(p2.x, p2.y)[1] - transformer.transform(p1.x, p1.y)[1]
+    x1, y1 = transformer.transform(p1.x, p1.y)
+    x2, y2 = transformer.transform(p2.x, p2.y)
     dz = e2 - e1
-    return np.sqrt(dx**2 + dy**2 + dz**2)
-
-def slice_centerline(centerline, p1, p2):
-    coords = list(centerline.coords)
-    idx1 = min(range(len(coords)), key=lambda i: Point(coords[i]).distance(p1))
-    idx2 = min(range(len(coords)), key=lambda i: Point(coords[i]).distance(p2))
-    if idx1 > idx2:
-        idx1, idx2 = idx2, idx1
-    return LineString(coords[idx1:idx2+1])
+    return np.sqrt((x2 - x1)**2 + (y2 - y1)**2 + dz**2)
 
 # --- STREAMLIT UI ---
 st.title("Terrain-Aware AGM Distance Calculator")
 
 uploaded_file = st.file_uploader("Upload KML or KMZ file", type=["kml", "kmz"])
 if uploaded_file:
-    placemarks = parse_kml_kmz(uploaded_file)
-    agms, centerline = extract_agms_and_centerline(placemarks)
+    agms, centerline = parse_kml_kmz(uploaded_file)
 
     if not centerline or len(agms) < 2:
         st.error("Missing CENTERLINE or insufficient AGM points.")

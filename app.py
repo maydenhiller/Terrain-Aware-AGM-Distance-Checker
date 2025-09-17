@@ -34,7 +34,7 @@ def parse_kml_kmz(uploaded_file):
     agms = []
     centerline = None
 
-    def extract_from_folder(folder):
+    def extract(folder):
         nonlocal agms, centerline
         folder_name = folder.name.strip().lower()
         if folder_name == "agms":
@@ -46,18 +46,16 @@ def parse_kml_kmz(uploaded_file):
                 if isinstance(f.geometry, LineString):
                     centerline = f.geometry
 
-    def recurse_features(features):
-        for f in features:
-            if hasattr(f, "features") and f.features():
-                recurse_features(f.features())
-            if hasattr(f, "name") and f.name:
-                folder_name = f.name.strip().lower()
-                if folder_name in ["agms", "centerline"]:
-                    extract_from_folder(f)
+    def walk(element):
+        if hasattr(element, "features"):
+            for f in element.features():
+                if hasattr(f, "name") and f.name:
+                    name = f.name.strip().lower()
+                    if name in ["agms", "centerline"]:
+                        extract(f)
+                walk(f)
 
-    for feature in k.features():
-        recurse_features([feature])
-
+    walk(k)
     agms.sort(key=agm_sort_key)
     return agms, centerline
 

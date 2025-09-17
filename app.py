@@ -1,172 +1,129 @@
-import io
-import math
-import zipfile
-import xml.etree.ElementTree as ET
-
-import requests
 import streamlit as st
 import pandas as pd
-from shapely.geometry import LineString, Point, MultiLineString
-from shapely.ops import linemerge
-from pyproj import CRS, Transformer
-import srtm
+import numpy as np
+import zipfile
+import io
+import requests
+from shapely.geometry import LineString, Point
+from fastkml import kml
+from pyproj import Transformer
 
-# ---------------------------- Config ----------------------------
-GOOGLE_API_KEY = "AIzaSyCd7sfheaJIbB8_J9Q9cxWb5jnv4U0K0LA"
-METERS_TO_FEET = 3.28084
-FEET_PER_MILE = 5280
-DENSIFY_STEP_M = 5.0
+# --- CONFIG ---
+API_KEY = "AIzaSyCd7sfheaJIbB8_J9Q9cxWb5jnv4U0K0LA"
+ELEVATION_URL = "https://maps.googleapis.com/maps/api/elevation/json"
 
-# ---------------------------- Elevation ----------------------------
-@st.cache_resource
-def get_srtm():
-    return srtm.get_data()
-srtm_data = get_srtm()
+transformer = Transformer.from_crs("epsg:4326", "epsg:3857", always_xy=True)
 
-@st.cache_data(ttl=86400)
-def get_elevation(lat: float, lon: float) -> float:
-    try:
-        r = requests.get(
-            "https://maps.googleapis.com/maps/api/elevation/json",
-            params={"locations": f"{lat},{lon}", "key": GOOGLE_API_KEY},
-            timeout=6
-        )
-        r.raise_for_status()
-        j = r.json()
-        if j["status"] == "OK" and "elevation" in j["results"][0]:
-            return float(j["results"][0]["elevation"])
-    except Exception:
-        pass
-    try:
-        e = srtm_data.get_elevation(lat, lon)
-        if e is not None:
-            return float(e)
-    except Exception:
-        pass
-    return 0.0
+# --- HELPERS ---
+def parse_kml_kmz(uploaded_file):
+    if uploaded_file.name.endswith(".kmz"):
+        with zipfile.ZipFile(uploaded_file) as zf:
+            kml_file = next((f for f in zf.namelist() if f.endswith(".kml")), None)
+            with zf.open(kml_file) as f:
+                kml_data = f.read()
+    else:
+        kml_data = uploaded_file.read()
 
-# ---------------------------- Geometry ----------------------------
-def utm_crs_for(lats, lons):
-    lat_mean = sum(lats) / len(lats)
-    lon_mean = sum(lons) / len(lons)
-    zone = int((lon_mean + 180) // 6) + 1
-    epsg = 32600 + zone if lat_mean >= 0 else 32700 + zone
-    return CRS.from_epsg(epsg)
+    k = kml.KML()
+    k.from_string(kml_data)
+    features = list(k.features())
+    placemarks = []
 
-def build_centerline_utm(segments_ll, to_utm):
-    utm_lines = []
-    for seg in segments_ll:
-        if len(seg) < 2: continue
-        xs, ys = to_utm.transform(*zip(*seg))
-        utm_lines.append(LineString(zip(xs, ys)))
-    merged = linemerge(MultiLineString(utm_lines)) if len(utm_lines) > 1 else utm_lines[0]
-    if isinstance(merged, LineString):
-        return merged
-    parts = list(merged.geoms)
-    parts.sort(key=lambda g: g.length, reverse=True)
-    return parts[0]
+    def recurse_features(feats):
+        for f in feats:
+            if hasattr(f, "geometry") and f.geometry:
+                placemarks.append(f)
+            if hasattr(f, "features"):
+                recurse_features(f.features())
 
-def densified_points(line_utm, s0, s1, step):
-    a, b = (s0, s1) if s0 <= s1 else (s1, s0)
-    if abs(b - a) < 1e-6: b = a + step
-    dists = [a + i * step for i in range(int((b - a) // step) + 1)]
-    if dists[-1] < b: dists.append(b)
-    pts = [line_utm.interpolate(d) for d in dists]
-    pts_xy = [(p.x, p.y) for p in pts]
-    return pts_xy if s0 <= s1 else list(reversed(pts_xy))
+    recurse_features(features)
+    return placemarks
 
-def terrain_distance_m(pts_xy, to_wgs84):
-    xs, ys = zip(*pts_xy)
-    lons, lats = to_wgs84.transform(xs, ys)
-    elevs = [get_elevation(lat, lon) for lat, lon in zip(lats, lons)]
-    total = 0.0
-    for i in range(len(pts_xy) - 1):
-        x1, y1 = pts_xy[i]
-        x2, y2 = pts_xy[i + 1]
-        h = math.hypot(x2 - x1, y2 - y1)
-        v = elevs[i + 1] - elevs[i]
-        total += math.hypot(h, v)
-    return total
-
-def extract_station_number(label):
-    import re
-    match = re.match(r"^(\d{3})([A-Za-z]*)$", label.strip())
-    return (int(match.group(1)), match.group(2)) if match else (999, "")
-
-# ---------------------------- KML Parsing ----------------------------
-def parse_kml_for_agms_and_centerline(kml_bytes):
-    ns = {"kml": "http://www.opengis.net/kml/2.2"}
-    root = ET.fromstring(kml_bytes)
-
+def extract_agms_and_centerline(placemarks):
     agms = []
-    for fld in root.findall(".//kml:Folder", ns):
-        name = fld.find("kml:name", ns)
-        if name is not None and name.text.strip().lower() == "agms":
-            for pm in fld.findall("kml:Placemark", ns):
-                label = pm.find("kml:name", ns).text.strip()
-                coords = pm.find(".//kml:Point/kml:coordinates", ns).text.strip()
-                lon, lat, *_ = coords.split(",")
-                agms.append((label, float(lon), float(lat)))
-
-    centerline = []
-    for fld in root.findall(".//kml:Folder", ns):
-        name = fld.find("kml:name", ns)
-        if name is not None and name.text.strip().lower() == "centerline":
-            for pm in fld.findall("kml:Placemark", ns):
-                style = pm.find("kml:styleUrl", ns)
-                if style is None or "#2_0" not in style.text: continue
-                coords = pm.find(".//kml:LineString/kml:coordinates", ns).text.strip()
-                seg = []
-                for token in coords.split():
-                    lon, lat, *_ = token.split(",")
-                    seg.append((float(lon), float(lat)))
-                if len(seg) >= 2:
-                    centerline.append(seg)
-
+    centerline = None
+    for p in placemarks:
+        name = str(p.name).strip()
+        geom = p.geometry
+        if isinstance(geom, Point) and name.isalnum():
+            agms.append((name, geom))
+        elif isinstance(geom, LineString) and "centerline" in name.lower():
+            centerline = geom
+    agms.sort(key=agm_sort_key)
     return agms, centerline
 
-# ---------------------------- Streamlit UI ----------------------------
-st.set_page_config(page_title="Terrain-aware AGM distances", layout="wide")
-st.title("Terrain-aware AGM Segment Distances")
+def agm_sort_key(name_geom):
+    name = name_geom[0]
+    base = ''.join(filter(str.isdigit, name))
+    suffix = ''.join(filter(str.isalpha, name))
+    return (int(base), suffix)
 
-uploaded = st.file_uploader("Upload KML or KMZ", type=["kml", "kmz"])
-generate = st.button("Generate Distances")
+def interpolate_line(line, spacing_m=1.0):
+    coords = list(line.coords)
+    points = [Point(coords[0])]
+    for i in range(1, len(coords)):
+        seg = LineString([coords[i-1], coords[i]])
+        dist = seg.length
+        steps = max(int(dist / spacing_m), 1)
+        for j in range(1, steps + 1):
+            points.append(seg.interpolate(j * spacing_m))
+    return points
 
-if uploaded and generate:
-    raw = uploaded.read()
-    kml_bytes = zipfile.ZipFile(io.BytesIO(raw)).read("doc.kml") if uploaded.name.lower().endswith(".kmz") else raw
-    if isinstance(kml_bytes, str): kml_bytes = kml_bytes.encode("utf-8")
+def get_elevations(points):
+    locs = "|".join([f"{p.y},{p.x}" for p in points])
+    response = requests.get(ELEVATION_URL, params={"locations": locs, "key": API_KEY})
+    data = response.json()
+    return [r["elevation"] for r in data["results"]]
 
-    agms, centerline_ll = parse_kml_for_agms_and_centerline(kml_bytes)
-    if not agms or not centerline_ll:
-        st.error("AGMs or red centerline not found.")
-        st.stop()
+def distance_3d(p1, p2, e1, e2):
+    dx, dy = transformer.transform(p2.x, p2.y)[0] - transformer.transform(p1.x, p1.y)[0], transformer.transform(p2.x, p2.y)[1] - transformer.transform(p1.x, p1.y)[1]
+    dz = e2 - e1
+    return np.sqrt(dx**2 + dy**2 + dz**2)
 
-    all_lons = [lon for seg in centerline_ll for lon, _ in seg]
-    all_lats = [lat for seg in centerline_ll for _, lat in seg]
-    crs_utm = utm_crs_for(all_lats, all_lons)
-    to_utm = Transformer.from_crs("EPSG:4326", crs_utm, always_xy=True)
-    to_wgs84 = Transformer.from_crs(crs_utm, "EPSG:4326", always_xy=True)
+def slice_centerline(centerline, p1, p2):
+    coords = list(centerline.coords)
+    idx1 = min(range(len(coords)), key=lambda i: Point(coords[i]).distance(p1))
+    idx2 = min(range(len(coords)), key=lambda i: Point(coords[i]).distance(p2))
+    if idx1 > idx2:
+        idx1, idx2 = idx2, idx1
+    return LineString(coords[idx1:idx2+1])
 
-    line_utm = build_centerline_utm(centerline_ll, to_utm)
+# --- STREAMLIT UI ---
+st.title("Terrain-Aware AGM Distance Calculator")
 
-    agm_chain = []
-    for label, lon, lat in agms:
-        x, y = to_utm.transform(lon, lat)
-        s = line_utm.project(Point(x, y))
-        agm_chain.append((label, lon, lat, s))
+uploaded_file = st.file_uploader("Upload KML or KMZ file", type=["kml", "kmz"])
+if uploaded_file:
+    placemarks = parse_kml_kmz(uploaded_file)
+    agms, centerline = extract_agms_and_centerline(placemarks)
 
-    agm_chain.sort(key=lambda x: extract_station_number(x[0]))
-    offset = next((s for lab, _, _, s in agm_chain if extract_station_number(lab)[0] == 0), agm_chain[0][3])
-    agm_chain = [(lab, lon, lat, s - offset) for lab, lon, lat, s in agm_chain]
+    if not centerline or len(agms) < 2:
+        st.error("Missing CENTERLINE or insufficient AGM points.")
+    else:
+        rows = []
+        cumulative_miles = 0.0
 
-    rows = []
-    total_ft = 0.0
-    for i in range(len(agm_chain) - 1):
-        lab1, _, _, s0 = agm_chain[i]
-        lab2, _, _, s1 = agm_chain[i + 1]
-        pts_xy = densified_points(line_utm, s0 + offset, s1 + offset, DENSIFY_STEP_M)
-        dist_m = terrain_distance_m(pts_xy, to_wgs84)
-        dist_ft = dist_m * METERS_TO_FEET
-        dist_mi = dist_ft / FEET_PER_MILE
-        total_ft
+        for i in range(len(agms) - 1):
+            name1, pt1 = agms[i]
+            name2, pt2 = agms[i + 1]
+            segment = slice_centerline(centerline, pt1, pt2)
+            interp_points = interpolate_line(segment, spacing_m=1.0)
+            elevations = get_elevations(interp_points)
+
+            dist_m = sum(distance_3d(interp_points[j], interp_points[j+1], elevations[j], elevations[j+1]) for j in range(len(interp_points)-1))
+            dist_ft = dist_m * 3.28084
+            dist_mi = dist_ft / 5280
+            cumulative_miles += dist_mi
+
+            rows.append({
+                "From AGM": name1,
+                "To AGM": name2,
+                "Distance (feet)": round(dist_ft, 2),
+                "Distance (miles)": round(dist_mi, 6),
+                "Cumulative Distance (miles)": round(cumulative_miles, 6)
+            })
+
+        df = pd.DataFrame(rows)
+        st.dataframe(df)
+
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download CSV", csv, "terrain_distances.csv", "text/csv")

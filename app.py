@@ -44,10 +44,10 @@ def parse_kml_kmz(uploaded_file):
                     for p in f.features():
                         if isinstance(p.geometry, LineString):
                             centerline = p.geometry
-            if hasattr(f, "features"):
+            if hasattr(f, "features") and callable(f.features):
                 walk_features(f.features())
 
-    walk_features(list(k.features()))
+    walk_features(k.features())
     agms.sort(key=agm_sort_key)
     return agms, centerline
 

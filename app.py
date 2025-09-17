@@ -30,7 +30,7 @@ def parse_kml_kmz(uploaded_file):
         kml_data = uploaded_file.read()
 
     k = kml.KML()
-    k.from_string(kml_data)
+    k.from_string(kml_data.decode("utf-8"))
     agms = []
     centerline = None
 
@@ -55,7 +55,7 @@ def parse_kml_kmz(uploaded_file):
                 if folder_name in ["agms", "centerline"]:
                     extract_from_folder(f)
 
-    for feature in list(k.features()):
+    for feature in k.features():
         recurse_features([feature])
 
     agms.sort(key=agm_sort_key)

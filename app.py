@@ -31,23 +31,26 @@ def parse_kml_kmz(uploaded_file):
     agms = []
     centerline = None
 
-    def walk_features(features):
+    def walk(element):
         nonlocal agms, centerline
-        for f in features:
-            if hasattr(f, "name") and f.name:
-                folder_name = f.name.strip().lower()
-                if folder_name == "agms":
-                    for p in f.features():
-                        if isinstance(p.geometry, Point):
-                            agms.append((p.name.strip(), p.geometry))
-                elif folder_name == "centerline":
-                    for p in f.features():
-                        if isinstance(p.geometry, LineString):
-                            centerline = p.geometry
-            if hasattr(f, "features"):
-                walk_features(f.features())
+        if hasattr(element, "name") and element.name:
+            folder_name = element.name.strip().lower()
+            if folder_name == "agms":
+                for f in element.features():
+                    if isinstance(f.geometry, Point):
+                        agms.append((f.name.strip(), f.geometry))
+            elif folder_name == "centerline":
+                for f in element.features():
+                    if isinstance(f.geometry, LineString):
+                        centerline = f.geometry
+        if hasattr(element, "features"):
+            for sub in element.features():
+                walk(sub)
 
-    walk_features(k.features())
+    root = next(iter(k._features), None)
+    if root:
+        walk(root)
+
     agms.sort(key=agm_sort_key)
     return agms, centerline
 

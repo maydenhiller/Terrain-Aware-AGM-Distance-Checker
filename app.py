@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import zipfile
-import io
 import requests
 from shapely.geometry import LineString, Point
 from fastkml import kml
@@ -49,15 +48,15 @@ def parse_kml_kmz(uploaded_file):
 
     def recurse_features(features):
         for f in features:
-            if hasattr(f, "features"):
+            if hasattr(f, "features") and f.features():
                 recurse_features(f.features())
-            elif hasattr(f, "name") and f.name:
+            if hasattr(f, "name") and f.name:
                 folder_name = f.name.strip().lower()
                 if folder_name in ["agms", "centerline"]:
                     extract_from_folder(f)
 
-    root_features = list(k.features())
-    recurse_features(root_features)
+    for feature in k._features:
+        recurse_features([feature])
 
     agms.sort(key=agm_sort_key)
     return agms, centerline

@@ -7,17 +7,21 @@ from shapely.geometry import LineString, Point
 from fastkml import kml
 from pyproj import Transformer
 
+# --- CONFIG ---
 API_KEY = "AIzaSyCd7sfheaJIbB8_J9Q9cxWb5jnv4U0K0LA"
 ELEVATION_URL = "https://maps.googleapis.com/maps/api/elevation/json"
 transformer = Transformer.from_crs("epsg:4326", "epsg:3857", always_xy=True)
 
+# --- AGM SORTING ---
 def agm_sort_key(name_geom):
     name = name_geom[0]
     base = ''.join(filter(str.isdigit, name))
     suffix = ''.join(filter(str.isalpha, name))
     return (int(base), suffix)
 
+# --- FILE PARSING ---
 def parse_kml_kmz(uploaded_file):
+    # Read KML data from file or KMZ archive
     if uploaded_file.name.endswith(".kmz"):
         with zipfile.ZipFile(uploaded_file) as zf:
             kml_file = next((f for f in zf.namelist() if f.endswith(".kml")), None)
@@ -26,31 +30,42 @@ def parse_kml_kmz(uploaded_file):
     else:
         kml_data = uploaded_file.read()
 
+    # Parse with fastkml
     k = kml.KML()
     k.from_string(kml_data.decode("utf-8"))
     agms = []
     centerline = None
 
     def walk_features(features):
+        """Recursively walk features, extracting AGMs and CENTERLINE."""
         nonlocal agms, centerline
-        for f in features:
+        for f in features or []:
             if hasattr(f, "name") and f.name:
                 folder_name = f.name.strip().lower()
                 if folder_name == "agms":
-                    for p in f.features():
+                    for p in getattr(f, "features", lambda: [])():
                         if isinstance(p.geometry, Point):
                             agms.append((p.name.strip(), p.geometry))
                 elif folder_name == "centerline":
-                    for p in f.features():
+                    for p in getattr(f, "features", lambda: [])():
                         if isinstance(p.geometry, LineString):
                             centerline = p.geometry
             if hasattr(f, "features") and callable(f.features):
-                walk_features(f.features())
+                try:
+                    walk_features(f.features())
+                except Exception:
+                    pass
 
-    walk_features(k.features())
+    try:
+        top_features = list(k.features())
+    except Exception:
+        top_features = []
+    walk_features(top_features)
+
     agms.sort(key=agm_sort_key)
     return agms, centerline
 
+# --- CENTERLINE SLICING ---
 def slice_centerline(centerline, p1, p2):
     coords = list(centerline.coords)
     idx1 = min(range(len(coords)), key=lambda i: Point(coords[i]).distance(p1))
@@ -59,6 +74,7 @@ def slice_centerline(centerline, p1, p2):
         idx1, idx2 = idx2, idx1
     return LineString(coords[idx1:idx2+1])
 
+# --- INTERPOLATION ---
 def interpolate_line(line, spacing_m=1.0):
     coords = list(line.coords)
     points = [Point(coords[0])]
@@ -70,6 +86,7 @@ def interpolate_line(line, spacing_m=1.0):
             points.append(seg.interpolate(j * spacing_m))
     return points
 
+# --- ELEVATION API ---
 def get_elevations(points):
     elevations = []
     batch_size = 512
@@ -81,12 +98,14 @@ def get_elevations(points):
         elevations.extend([r["elevation"] for r in data["results"]])
     return elevations
 
+# --- 3D DISTANCE ---
 def distance_3d(p1, p2, e1, e2):
     x1, y1 = transformer.transform(p1.x, p1.y)
     x2, y2 = transformer.transform(p2.x, p2.y)
     dz = e2 - e1
     return np.sqrt((x2 - x1)**2 + (y2 - y1)**2 + dz**2)
 
+# --- STREAMLIT UI ---
 st.title("Terrain-Aware AGM Distance Calculator")
 
 uploaded_file = st.file_uploader("Upload KML or KMZ file", type=["kml", "kmz"])
@@ -106,7 +125,9 @@ if uploaded_file:
             interp_points = interpolate_line(segment, spacing_m=1.0)
             elevations = get_elevations(interp_points)
 
-            dist_m = sum(distance_3d(interp_points[j], interp_points[j+1], elevations[j], elevations[j+1]) for j in range(len(interp_points)-1))
+            dist_m = sum(distance_3d(interp_points[j], interp_points[j+1],
+                                     elevations[j], elevations[j+1])
+                         for j in range(len(interp_points)-1))
             dist_ft = dist_m * 3.28084
             dist_mi = dist_ft / 5280
             cumulative_miles += dist_mi

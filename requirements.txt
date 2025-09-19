@@ -2,8 +2,6 @@ streamlit
 pandas
 numpy
 shapely
-fastkml
-simplekml
 pyproj
 requests
 zipfile36

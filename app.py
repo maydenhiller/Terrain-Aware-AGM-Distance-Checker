@@ -3,8 +3,8 @@ import pandas as pd
 import numpy as np
 import zipfile
 import requests
-from shapely.geometry import LineString, Point
-from fastkml import kml
+import xml.etree.ElementTree as ET
+from shapely.geometry import Point, LineString
 from pyproj import Transformer
 
 API_KEY = "AIzaSyCd7sfheaJIbB8_J9Q9cxWb5jnv4U0K0LA"
@@ -26,38 +26,38 @@ def parse_kml_kmz(uploaded_file):
     else:
         kml_data = uploaded_file.read()
 
-    k = kml.KML()
-    k.from_string(kml_data.decode("utf-8"))
+    root = ET.fromstring(kml_data)
+    ns = {"kml": "http://www.opengis.net/kml/2.2"}
     agms = []
     centerline = None
 
-    def walk_all(obj, depth=0):
-        nonlocal agms, centerline
-        indent = "  " * depth
-        name = getattr(obj, "name", "").strip()
-        st.text(f"{indent}📁 {name}")
-        if hasattr(obj, "features") and callable(obj.features):
-            try:
-                children = list(obj.features())
-            except Exception:
-                children = []
-            st.text(f"{indent}↳ {len(children)} children")
-            for child in children:
-                geom = getattr(child, "geometry", None)
-                geom_type = type(geom).__name__ if geom else "None"
-                child_name = getattr(child, "name", "").strip()
-                st.text(f"{indent}• {child_name} → {geom_type}")
-                if name.lower() == "agms" and isinstance(geom, Point):
-                    agms.append((child_name, geom))
-                elif name.lower() == "centerline" and isinstance(geom, LineString):
-                    centerline = geom
-                walk_all(child, depth + 1)
-
-    try:
-        for root in k.__iter__():
-            walk_all(root)
-    except Exception:
-        st.error("Failed to parse KML structure.")
+    for folder in root.findall(".//kml:Folder", ns):
+        name = folder.find("kml:name", ns)
+        if name is None:
+            continue
+        folder_name = name.text.strip().lower()
+        if folder_name == "agms":
+            for placemark in folder.findall("kml:Placemark", ns):
+                pname = placemark.find("kml:name", ns)
+                coords = placemark.find(".//kml:coordinates", ns)
+                if pname is not None and coords is not None:
+                    try:
+                        lon, lat, *_ = map(float, coords.text.strip().split(","))
+                        agms.append((pname.text.strip(), Point(lon, lat)))
+                    except:
+                        continue
+        elif folder_name == "centerline":
+            for placemark in folder.findall("kml:Placemark", ns):
+                coords = placemark.find(".//kml:coordinates", ns)
+                if coords is not None:
+                    try:
+                        pts = []
+                        for pair in coords.text.strip().split():
+                            lon, lat, *_ = map(float, pair.split(","))
+                            pts.append((lon, lat))
+                        centerline = LineString(pts)
+                    except:
+                        continue
 
     agms.sort(key=agm_sort_key)
     return agms, centerline
@@ -102,7 +102,6 @@ st.title("Terrain-Aware AGM Distance Calculator")
 
 uploaded_file = st.file_uploader("Upload KML or KMZ file", type=["kml", "kmz"])
 if uploaded_file:
-    st.subheader("📂 KML Structure Diagnostics")
     agms, centerline = parse_kml_kmz(uploaded_file)
 
     st.subheader("📌 AGM Summary")

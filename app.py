@@ -31,36 +31,33 @@ def parse_kml_kmz(uploaded_file):
     agms = []
     centerline = None
 
-    def walk_features(features, depth=0):
+    def walk_all(obj, depth=0):
         nonlocal agms, centerline
-        for f in features or []:
-            indent = "  " * depth
-            folder_name = getattr(f, "name", "").strip()
-            st.text(f"{indent}📁 Folder: {folder_name}")
-            if hasattr(f, "features") and callable(f.features):
-                placemarks = list(f.features())
-                st.text(f"{indent}↳ Contains {len(placemarks)} placemarks")
-                for p in placemarks:
-                    geom_type = type(p.geometry).__name__ if p.geometry else "None"
-                    st.text(f"{indent}   • Placemark: {getattr(p, 'name', '')} → Geometry: {geom_type}")
-                # AGM extraction
-                if folder_name.lower() == "agms":
-                    for p in placemarks:
-                        if isinstance(p.geometry, Point):
-                            agms.append((p.name.strip(), p.geometry))
-                # CENTERLINE extraction
-                elif folder_name.lower() == "centerline":
-                    for p in placemarks:
-                        if isinstance(p.geometry, LineString):
-                            centerline = p.geometry
-                # Recurse
-                walk_features(placemarks, depth + 1)
+        indent = "  " * depth
+        name = getattr(obj, "name", "").strip()
+        st.text(f"{indent}📁 {name}")
+        if hasattr(obj, "features") and callable(obj.features):
+            try:
+                children = list(obj.features())
+            except Exception:
+                children = []
+            st.text(f"{indent}↳ {len(children)} children")
+            for child in children:
+                geom = getattr(child, "geometry", None)
+                geom_type = type(geom).__name__ if geom else "None"
+                child_name = getattr(child, "name", "").strip()
+                st.text(f"{indent}• {child_name} → {geom_type}")
+                if name.lower() == "agms" and isinstance(geom, Point):
+                    agms.append((child_name, geom))
+                elif name.lower() == "centerline" and isinstance(geom, LineString):
+                    centerline = geom
+                walk_all(child, depth + 1)
 
     try:
-        top_features = list(k.features())
+        for root in k.__iter__():
+            walk_all(root)
     except Exception:
-        top_features = []
-    walk_features(top_features)
+        st.error("Failed to parse KML structure.")
 
     agms.sort(key=agm_sort_key)
     return agms, centerline

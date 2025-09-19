@@ -62,24 +62,16 @@ def parse_kml_kmz(uploaded_file):
     agms.sort(key=agm_sort_key)
     return agms, centerline
 
-def project_onto_centerline(centerline, point):
-    # Find the nearest location on the centerline to the AGM point
-    return centerline.interpolate(centerline.project(point))
-
 def slice_centerline(centerline, p1, p2):
-    proj1 = project_onto_centerline(centerline, p1)
-    proj2 = project_onto_centerline(centerline, p2)
-    dist1 = centerline.project(proj1)
-    dist2 = centerline.project(proj2)
-    if dist1 > dist2:
-        dist1, dist2 = dist2, dist1
-    segment = centerline.segmentize(1.0).interpolate(dist1).buffer(0).intersection(centerline)
-    sliced = centerline.interpolate(dist1), centerline.interpolate(dist2)
-    coords = [pt for pt in centerline.coords if dist1 <= centerline.project(Point(pt)) <= dist2]
-    coords = [c for c in coords if isinstance(c, tuple) and len(c) == 2 and all(np.isfinite(c))]
-    if len(coords) < 2:
+    d1 = centerline.project(p1)
+    d2 = centerline.project(p2)
+    if d1 > d2:
+        d1, d2 = d2, d1
+    segment = centerline.interpolate(d1), centerline.interpolate(d2)
+    sliced = centerline.cut(d1, d2)
+    if sliced is None or len(sliced.coords) < 2:
         return None
-    return LineString(coords)
+    return sliced
 
 def interpolate_line(line, spacing_m=1.0):
     total_length = line.length
@@ -102,6 +94,24 @@ def distance_3d(p1, p2, e1, e2):
     x2, y2 = transformer.transform(p2.x, p2.y)
     dz = e2 - e1
     return np.sqrt((x2 - x1)**2 + (y2 - y1)**2 + dz**2)
+
+def cut_line(line, start_dist, end_dist):
+    coords = []
+    for i in range(len(line.coords) - 1):
+        seg = LineString([line.coords[i], line.coords[i+1]])
+        seg_start = line.project(Point(line.coords[i]))
+        seg_end = line.project(Point(line.coords[i+1]))
+        if seg_end < start_dist or seg_start > end_dist:
+            continue
+        seg_start = max(seg_start, start_dist)
+        seg_end = min(seg_end, end_dist)
+        steps = max(int(seg.length / 1.0), 1)
+        for j in range(steps + 1):
+            pt = seg.interpolate(j / steps, normalized=True)
+            coords.append((pt.x, pt.y))
+    return LineString(coords) if len(coords) >= 2 else None
+
+LineString.cut = cut_line  # Monkey patch
 
 st.title("Terrain-Aware AGM Distance Calculator")
 

@@ -68,7 +68,11 @@ def slice_centerline(centerline, p1, p2):
     idx2 = min(range(len(coords)), key=lambda i: Point(coords[i]).distance(p2))
     if idx1 > idx2:
         idx1, idx2 = idx2, idx1
-    return LineString(coords[idx1:idx2+1])
+    segment_coords = coords[idx1:idx2+1]
+    segment_coords = [c for c in segment_coords if isinstance(c, tuple) and len(c) == 2 and all(np.isfinite(c))]
+    if len(segment_coords) < 2:
+        return None
+    return LineString(segment_coords)
 
 def interpolate_line(line, spacing_m=1.0):
     coords = list(line.coords)
@@ -114,11 +118,15 @@ if uploaded_file:
     else:
         rows = []
         cumulative_miles = 0.0
+        skipped = 0
 
         for i in range(len(agms) - 1):
             name1, pt1 = agms[i]
             name2, pt2 = agms[i + 1]
             segment = slice_centerline(centerline, pt1, pt2)
+            if segment is None or len(segment.coords) < 2:
+                skipped += 1
+                continue
             interp_points = interpolate_line(segment, spacing_m=1.0)
             elevations = get_elevations(interp_points)
 
@@ -140,6 +148,7 @@ if uploaded_file:
         st.subheader("📊 Distance Table")
         df = pd.DataFrame(rows)
         st.dataframe(df)
+        st.text(f"Skipped segments: {skipped}")
 
         csv = df.to_csv(index=False).encode("utf-8")
         st.download_button("Download CSV", csv, "terrain_distances.csv", "text/csv")

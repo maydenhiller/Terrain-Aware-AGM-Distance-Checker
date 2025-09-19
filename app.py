@@ -62,28 +62,29 @@ def parse_kml_kmz(uploaded_file):
     agms.sort(key=agm_sort_key)
     return agms, centerline
 
+def project_onto_centerline(centerline, point):
+    # Find the nearest location on the centerline to the AGM point
+    return centerline.interpolate(centerline.project(point))
+
 def slice_centerline(centerline, p1, p2):
-    coords = list(centerline.coords)
-    idx1 = min(range(len(coords)), key=lambda i: Point(coords[i]).distance(p1))
-    idx2 = min(range(len(coords)), key=lambda i: Point(coords[i]).distance(p2))
-    if idx1 > idx2:
-        idx1, idx2 = idx2, idx1
-    segment_coords = coords[idx1:idx2+1]
-    segment_coords = [c for c in segment_coords if isinstance(c, tuple) and len(c) == 2 and all(np.isfinite(c))]
-    if len(segment_coords) < 2:
+    proj1 = project_onto_centerline(centerline, p1)
+    proj2 = project_onto_centerline(centerline, p2)
+    dist1 = centerline.project(proj1)
+    dist2 = centerline.project(proj2)
+    if dist1 > dist2:
+        dist1, dist2 = dist2, dist1
+    segment = centerline.segmentize(1.0).interpolate(dist1).buffer(0).intersection(centerline)
+    sliced = centerline.interpolate(dist1), centerline.interpolate(dist2)
+    coords = [pt for pt in centerline.coords if dist1 <= centerline.project(Point(pt)) <= dist2]
+    coords = [c for c in coords if isinstance(c, tuple) and len(c) == 2 and all(np.isfinite(c))]
+    if len(coords) < 2:
         return None
-    return LineString(segment_coords)
+    return LineString(coords)
 
 def interpolate_line(line, spacing_m=1.0):
-    coords = list(line.coords)
-    points = [Point(coords[0])]
-    for i in range(1, len(coords)):
-        seg = LineString([coords[i-1], coords[i]])
-        dist = seg.length
-        steps = max(int(dist / spacing_m), 1)
-        for j in range(1, steps + 1):
-            points.append(seg.interpolate(j * spacing_m))
-    return points
+    total_length = line.length
+    steps = int(total_length / spacing_m)
+    return [line.interpolate(i * spacing_m) for i in range(steps + 1)]
 
 def get_elevations(points):
     elevations = []

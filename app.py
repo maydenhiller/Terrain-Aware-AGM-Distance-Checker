@@ -8,7 +8,7 @@ from shapely.geometry import Point, LineString
 from pyproj import Transformer
 
 # --- CONFIG ---
-MAPBOX_TOKEN = st.secrets["MAPBOX_TOKEN"]
+MAPBOX_TOKEN = st.secrets["mapbox"]["token"]
 TILEQUERY_URL = "https://api.mapbox.com/v4/mapbox.mapbox-terrain-v2/tilequery/{lon},{lat}.json"
 
 transformer = Transformer.from_crs("epsg:4326", "epsg:3857", always_xy=True)
@@ -64,9 +64,6 @@ def parse_kml_kmz(uploaded_file):
 
     agms.sort(key=agm_sort_key)
     return agms, centerline
-
-def project_onto_centerline(centerline, point):
-    return centerline.interpolate(centerline.project(point))
 
 def slice_centerline(centerline, p1, p2):
     d1 = centerline.project(p1)

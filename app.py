@@ -7,10 +7,13 @@ import xml.etree.ElementTree as ET
 from shapely.geometry import Point, LineString
 from pyproj import Transformer
 
-API_KEY = "AIzaSyCd7sfheaJIbB8_J9Q9cxWb5jnv4U0K0LA"
-ELEVATION_URL = "https://maps.googleapis.com/maps/api/elevation/json"
+# --- CONFIG ---
+MAPBOX_TOKEN = st.secrets["MAPBOX_TOKEN"]
+TILEQUERY_URL = "https://api.mapbox.com/v4/mapbox.mapbox-terrain-v2/tilequery/{lon},{lat}.json"
+
 transformer = Transformer.from_crs("epsg:4326", "epsg:3857", always_xy=True)
 
+# --- HELPERS ---
 def agm_sort_key(name_geom):
     name = name_geom[0]
     base = ''.join(filter(str.isdigit, name))
@@ -62,31 +65,47 @@ def parse_kml_kmz(uploaded_file):
     agms.sort(key=agm_sort_key)
     return agms, centerline
 
+def project_onto_centerline(centerline, point):
+    return centerline.interpolate(centerline.project(point))
+
 def slice_centerline(centerline, p1, p2):
     d1 = centerline.project(p1)
     d2 = centerline.project(p2)
     if d1 > d2:
         d1, d2 = d2, d1
-    segment = centerline.interpolate(d1), centerline.interpolate(d2)
-    sliced = centerline.cut(d1, d2)
-    if sliced is None or len(sliced.coords) < 2:
-        return None
-    return sliced
+    coords = []
+    for i in range(len(centerline.coords) - 1):
+        seg = LineString([centerline.coords[i], centerline.coords[i+1]])
+        seg_start = centerline.project(Point(centerline.coords[i]))
+        seg_end = centerline.project(Point(centerline.coords[i+1]))
+        if seg_end < d1 or seg_start > d2:
+            continue
+        seg_start = max(seg_start, d1)
+        seg_end = min(seg_end, d2)
+        steps = max(int(seg.length / 1.0), 1)
+        for j in range(steps + 1):
+            pt = seg.interpolate(j / steps, normalized=True)
+            coords.append((pt.x, pt.y))
+    return LineString(coords) if len(coords) >= 2 else None
 
 def interpolate_line(line, spacing_m=1.0):
     total_length = line.length
-    steps = int(total_length / spacing_m)
+    steps = max(int(total_length / spacing_m), 1)
     return [line.interpolate(i * spacing_m) for i in range(steps + 1)]
 
 def get_elevations(points):
     elevations = []
-    batch_size = 512
-    for i in range(0, len(points), batch_size):
-        chunk = points[i:i+batch_size]
-        locs = "|".join([f"{p.y},{p.x}" for p in chunk])
-        response = requests.get(ELEVATION_URL, params={"locations": locs, "key": API_KEY})
-        data = response.json()
-        elevations.extend([r["elevation"] for r in data["results"]])
+    for p in points:
+        url = TILEQUERY_URL.format(lon=p.x, lat=p.y)
+        resp = requests.get(url, params={"layers": "contour", "limit": 1, "access_token": MAPBOX_TOKEN})
+        if resp.status_code == 200:
+            data = resp.json()
+            if "features" in data and len(data["features"]) > 0:
+                elev = data["features"][0]["properties"].get("ele")
+                if elev is not None:
+                    elevations.append(float(elev))
+                    continue
+        elevations.append(0.0)  # fallback if no data
     return elevations
 
 def distance_3d(p1, p2, e1, e2):
@@ -95,25 +114,8 @@ def distance_3d(p1, p2, e1, e2):
     dz = e2 - e1
     return np.sqrt((x2 - x1)**2 + (y2 - y1)**2 + dz**2)
 
-def cut_line(line, start_dist, end_dist):
-    coords = []
-    for i in range(len(line.coords) - 1):
-        seg = LineString([line.coords[i], line.coords[i+1]])
-        seg_start = line.project(Point(line.coords[i]))
-        seg_end = line.project(Point(line.coords[i+1]))
-        if seg_end < start_dist or seg_start > end_dist:
-            continue
-        seg_start = max(seg_start, start_dist)
-        seg_end = min(seg_end, end_dist)
-        steps = max(int(seg.length / 1.0), 1)
-        for j in range(steps + 1):
-            pt = seg.interpolate(j / steps, normalized=True)
-            coords.append((pt.x, pt.y))
-    return LineString(coords) if len(coords) >= 2 else None
-
-LineString.cut = cut_line  # Monkey patch
-
-st.title("Terrain-Aware AGM Distance Calculator")
+# --- STREAMLIT UI ---
+st.title("Terrain-Aware AGM Distance Calculator (Mapbox)")
 
 uploaded_file = st.file_uploader("Upload KML or KMZ file", type=["kml", "kmz"])
 if uploaded_file:
@@ -140,6 +142,10 @@ if uploaded_file:
                 continue
             interp_points = interpolate_line(segment, spacing_m=1.0)
             elevations = get_elevations(interp_points)
+
+            if len(elevations) != len(interp_points):
+                skipped += 1
+                continue
 
             dist_m = sum(distance_3d(interp_points[j], interp_points[j+1],
                                      elevations[j], elevations[j+1])

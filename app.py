@@ -14,11 +14,11 @@ from pyproj import Transformer
 
 # --- CONFIG ---
 MAPBOX_TOKEN = st.secrets["mapbox"]["token"]
-# Terrain-RGB tileset endpoint (PNG raw for precise RGB)
 TERRAIN_TILE_URL = "https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}.pngraw"
 
-# Use Web Mercator for horizontal distance (meters)
-transformer = Transformer.from_crs("epsg:4326", "epsg:3857", always_xy=True)
+# Coordinate transformers
+to_merc = Transformer.from_crs("epsg:4326", "epsg:3857", always_xy=True)   # lon/lat -> meters
+to_geo = Transformer.from_crs("epsg:3857", "epsg:4326", always_xy=True)    # meters -> lon/lat
 
 # --- HELPERS ---
 
@@ -76,33 +76,42 @@ def parse_kml_kmz(uploaded_file):
                         lon, lat, *_ = map(float, pair.split(","))
                         pts.append((lon, lat))
                     if len(pts) >= 2:
-                        centerline = LineString(pts)
+                        centerline = LineString(pts)  # lon/lat
                 except Exception:
                     continue
 
     agms.sort(key=agm_sort_key)
     return agms, centerline
 
-def slice_centerline(centerline, p1, p2):
-    # Project AGM points onto the centerline; use distances along the line
-    d1 = centerline.project(p1)
-    d2 = centerline.project(p2)
+def to_merc_point(pt_ll):
+    x, y = to_merc.transform(pt_ll.x, pt_ll.y)
+    return Point(x, y)
+
+def to_merc_line(line_ll):
+    return LineString([to_merc.transform(x, y) for (x, y) in line_ll.coords])
+
+def to_geo_point(pt_m):
+    lon, lat = to_geo.transform(pt_m.x, pt_m.y)
+    return Point(lon, lat)
+
+def slice_centerline_merc(centerline_m, p1_m, p2_m):
+    # Distances along centerline in meters
+    d1 = centerline_m.project(p1_m)
+    d2 = centerline_m.project(p2_m)
     if d1 == d2:
         return None
     start, end = (d1, d2) if d1 < d2 else (d2, d1)
-    # Robust geometric slicing along the path
-    seg = substring(centerline, start, end, normalized=False)
+    seg = substring(centerline_m, start, end, normalized=False)
     if seg is None or seg.length == 0.0 or len(seg.coords) < 2:
         return None
     return seg
 
-def interpolate_line(line, spacing_m=1.0):
-    total_length = line.length
-    steps = max(int(total_length / spacing_m), 1)
-    # Ensure endpoints included
-    points = [line.interpolate(i * spacing_m) for i in range(steps)]
-    points.append(line.interpolate(total_length))
-    return points
+def interpolate_line_merc(line_m, spacing_m=1.0):
+    total_len = line_m.length
+    steps = max(int(total_len / spacing_m), 1)
+    points = [line_m.interpolate(i * spacing_m) for i in range(steps)]
+    points.append(line_m.interpolate(total_len))
+    return points  # Points in EPSG:3857 meters
 
 # --- Mapbox Terrain-RGB elevation sampling ---
 
@@ -112,17 +121,15 @@ def lonlat_to_tile(lon, lat, z):
     y = (1.0 - math.log(math.tan(math.radians(lat)) + 1.0 / math.cos(math.radians(lat))) / math.pi) / 2.0 * n
     return int(x), int(y), x, y
 
-def pixel_in_tile(lon, lat, z, x_tile, y_tile, x_float, y_float):
-    # Convert fractional tile position to pixel coordinate (256x256)
+def pixel_in_tile(x_tile, y_tile, x_float, y_float):
     x_pix = int((x_float - x_tile) * 256.0)
     y_pix = int((y_float - y_tile) * 256.0)
-    # Clamp to tile bounds
     x_pix = max(0, min(255, x_pix))
     y_pix = max(0, min(255, y_pix))
     return x_pix, y_pix
 
 def decode_terrain_rgb(r, g, b):
-    # Elevation in meters: E = -10000 + (R*256^2 + G*256 + B) * 0.1
+    # Elevation in meters per Mapbox formula
     return -10000.0 + (r * 256.0 * 256.0 + g * 256.0 + b) * 0.1
 
 class TerrainTileCache:
@@ -147,51 +154,54 @@ class TerrainTileCache:
         self.cache[key] = img
         return img
 
-    def elevation_at(self, lon, lat):
+    def elevation_at_lonlat(self, lon, lat):
         z = self.zoom
         x_tile, y_tile, x_float, y_float = lonlat_to_tile(lon, lat, z)
-        x_pix, y_pix = pixel_in_tile(lon, lat, z, x_tile, y_tile, x_float, y_float)
+        x_pix, y_pix = pixel_in_tile(x_tile, y_tile, x_float, y_float)
         img = self.get_tile_image(z, x_tile, y_tile)
         if img is None:
             return None
         r, g, b = img.getpixel((x_pix, y_pix))
         return decode_terrain_rgb(r, g, b)
 
-def get_elevations(points, cache: TerrainTileCache):
+def get_elevations_for_merc_points(points_m, cache: TerrainTileCache):
     elevations = []
-    for p in points:
-        elev = cache.elevation_at(p.x, p.y)
+    for pm in points_m:
+        # convert each meter-based point back to lon/lat for Mapbox sampling
+        plonlat = to_geo_point(pm)
+        elev = cache.elevation_at_lonlat(plonlat.x, plonlat.y)
         if elev is None or not np.isfinite(elev):
-            elevations.append(0.0)  # fallback
+            elevations.append(0.0)
         else:
             elevations.append(float(elev))
     return elevations
 
-def distance_3d(p1, p2, e1, e2):
-    # Horizontal in meters via EPSG:3857 + vertical component
-    x1, y1 = transformer.transform(p1.x, p1.y)
-    x2, y2 = transformer.transform(p2.x, p2.y)
-    dx = x2 - x1
-    dy = y2 - y1
+def distance_3d_between_merc_points(p1_m, p2_m, e1, e2):
+    dx = p2_m.x - p1_m.x
+    dy = p2_m.y - p1_m.y
     dz = e2 - e1
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 
 # --- STREAMLIT UI ---
 
-st.title("Terrain-Aware AGM Distance Calculator (Mapbox Terrain-RGB)")
+st.title("Terrain-Aware AGM Distance Calculator (Mapbox Terrain-RGB, meter-accurate)")
 
 uploaded_file = st.file_uploader("Upload KML or KMZ file", type=["kml", "kmz"])
 if uploaded_file:
-    agms, centerline = parse_kml_kmz(uploaded_file)
+    agms_ll, centerline_ll = parse_kml_kmz(uploaded_file)
 
     st.subheader("📌 AGM summary")
-    st.text(f"Total AGMs found: {len(agms)}")
+    st.text(f"Total AGMs found: {len(agms_ll)}")
     st.subheader("📈 CENTERLINE status")
-    st.text("CENTERLINE found" if centerline else "CENTERLINE missing")
+    st.text("CENTERLINE found" if centerline_ll else "CENTERLINE missing")
 
-    if not centerline or len(agms) < 2:
+    if not centerline_ll or len(agms_ll) < 2:
         st.warning("Missing CENTERLINE or insufficient AGM points.")
     else:
+        # Reproject centerline and AGMs to EPSG:3857 meters for true meter-based slicing
+        centerline_m = to_merc_line(centerline_ll)
+        agms_m = [(name, to_merc_point(pt)) for (name, pt) in agms_ll]
+
         rows = []
         cumulative_miles = 0.0
         skipped = 0
@@ -199,30 +209,32 @@ if uploaded_file:
         # Initialize Mapbox tile cache at max precision zoom
         tile_cache = TerrainTileCache(token=MAPBOX_TOKEN, zoom=15)
 
-        for i in range(len(agms) - 1):
-            name1, pt1 = agms[i]
-            name2, pt2 = agms[i + 1]
+        for i in range(len(agms_m) - 1):
+            name1, pt1_m = agms_m[i]
+            name2, pt2_m = agms_m[i + 1]
 
-            segment = slice_centerline(centerline, pt1, pt2)
-            if segment is None or segment.length == 0.0 or len(segment.coords) < 2:
+            segment_m = slice_centerline_merc(centerline_m, pt1_m, pt2_m)
+            if segment_m is None or segment_m.length <= 0.0 or len(segment_m.coords) < 2:
                 skipped += 1
                 continue
 
-            interp_points = interpolate_line(segment, spacing_m=1.0)
-            if len(interp_points) < 2:
+            interp_points_m = interpolate_line_merc(segment_m, spacing_m=1.0)
+            if len(interp_points_m) < 2:
                 skipped += 1
                 continue
 
-            elevations = get_elevations(interp_points, tile_cache)
-            if len(elevations) != len(interp_points):
+            elevations = get_elevations_for_merc_points(interp_points_m, tile_cache)
+            if len(elevations) != len(interp_points_m):
                 skipped += 1
                 continue
 
-            # Sum 3D distance along the path at 1m spacing
+            # Sum 3D distance along the meter-based path at 1m spacing
             dist_m = 0.0
-            for j in range(len(interp_points) - 1):
-                dist_m += distance_3d(interp_points[j], interp_points[j + 1],
-                                      elevations[j], elevations[j + 1])
+            for j in range(len(interp_points_m) - 1):
+                dist_m += distance_3d_between_merc_points(
+                    interp_points_m[j], interp_points_m[j + 1],
+                    elevations[j], elevations[j + 1]
+                )
 
             dist_ft = dist_m * 3.28084
             dist_mi = dist_ft / 5280.0

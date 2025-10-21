@@ -1,12 +1,5 @@
-import math
-import io
-import zipfile
-import requests
-import xml.etree.ElementTree as ET
-
-import streamlit as st
-import pandas as pd
-import numpy as np
+import math, io, zipfile, requests, xml.etree.ElementTree as ET
+import streamlit as st, pandas as pd, numpy as np
 from PIL import Image
 from shapely.geometry import Point, LineString
 from shapely.ops import substring
@@ -16,242 +9,142 @@ from pyproj import Transformer
 MAPBOX_TOKEN = st.secrets["mapbox"]["token"]
 TERRAIN_TILE_URL = "https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}.pngraw"
 
-# Coordinate transformers
-to_merc = Transformer.from_crs("epsg:4326", "epsg:3857", always_xy=True)   # lon/lat -> meters
-to_geo = Transformer.from_crs("epsg:3857", "epsg:4326", always_xy=True)    # meters -> lon/lat
+to_merc = Transformer.from_crs("epsg:4326","epsg:3857",always_xy=True)
+to_geo  = Transformer.from_crs("epsg:3857","epsg:4326",always_xy=True)
 
-# --- HELPERS ---
-
+# --- PARSING ---
 def agm_sort_key(name_geom):
     name = name_geom[0]
-    base_digits = ''.join(filter(str.isdigit, name))
-    base = int(base_digits) if base_digits else -1
-    suffix = ''.join(filter(str.isalpha, name))
-    return (base, suffix)
+    digits = ''.join(filter(str.isdigit,name))
+    base = int(digits) if digits else -1
+    suffix = ''.join(filter(str.isalpha,name))
+    return (base,suffix)
 
 def parse_kml_kmz(uploaded_file):
-    # Load KML from KMZ or KML
     if uploaded_file.name.endswith(".kmz"):
         with zipfile.ZipFile(uploaded_file) as zf:
-            kml_file = next((f for f in zf.namelist() if f.endswith(".kml")), None)
-            if not kml_file:
-                return [], None
-            with zf.open(kml_file) as f:
-                kml_data = f.read()
+            kml_file = next((f for f in zf.namelist() if f.endswith(".kml")),None)
+            with zf.open(kml_file) as f: kml_data = f.read()
     else:
         kml_data = uploaded_file.read()
-
     root = ET.fromstring(kml_data)
-    ns = {"kml": "http://www.opengis.net/kml/2.2"}
-
-    agms = []
-    centerline = None
-
-    for folder in root.findall(".//kml:Folder", ns):
-        name_el = folder.find("kml:name", ns)
-        if name_el is None or not name_el.text:
-            continue
-        folder_name = name_el.text.strip().lower()
-
-        if folder_name == "agms":
-            for placemark in folder.findall("kml:Placemark", ns):
-                pname = placemark.find("kml:name", ns)
-                coords = placemark.find(".//kml:coordinates", ns)
-                if pname is None or coords is None:
-                    continue
+    ns={"kml":"http://www.opengis.net/kml/2.2"}
+    agms, centerline = [], None
+    for folder in root.findall(".//kml:Folder",ns):
+        name_el = folder.find("kml:name",ns)
+        if name_el is None: continue
+        fname = name_el.text.strip().lower()
+        if fname=="agms":
+            for pm in folder.findall("kml:Placemark",ns):
+                pname=pm.find("kml:name",ns); coords=pm.find(".//kml:coordinates",ns)
+                if pname is None or coords is None: continue
                 try:
-                    lon, lat, *_ = map(float, coords.text.strip().split(","))
-                    agms.append((pname.text.strip(), Point(lon, lat)))
-                except Exception:
-                    continue
-
-        elif folder_name == "centerline":
-            for placemark in folder.findall("kml:Placemark", ns):
-                coords = placemark.find(".//kml:coordinates", ns)
-                if coords is None:
-                    continue
-                try:
-                    pts = []
-                    for pair in coords.text.strip().split():
-                        lon, lat, *_ = map(float, pair.split(","))
-                        pts.append((lon, lat))
-                    if len(pts) >= 2:
-                        centerline = LineString(pts)  # lon/lat
-                except Exception:
-                    continue
-
+                    lon,lat,*_=map(float,coords.text.strip().split(","))
+                    agms.append((pname.text.strip(),Point(lon,lat)))
+                except: continue
+        elif fname=="centerline":
+            for pm in folder.findall("kml:Placemark",ns):
+                coords=pm.find(".//kml:coordinates",ns)
+                if coords is None: continue
+                pts=[]
+                for pair in coords.text.strip().split():
+                    lon,lat,*_=map(float,pair.split(","))
+                    pts.append((lon,lat))
+                if len(pts)>=2: centerline=LineString(pts)
     agms.sort(key=agm_sort_key)
-    return agms, centerline
+    return agms,centerline
 
-def to_merc_point(pt_ll):
-    x, y = to_merc.transform(pt_ll.x, pt_ll.y)
-    return Point(x, y)
+# --- PROJECTION HELPERS ---
+def to_merc_point(pt): x,y=to_merc.transform(pt.x,pt.y); return Point(x,y)
+def to_merc_line(line): return LineString([to_merc.transform(x,y) for (x,y) in line.coords])
+def to_geo_point(pt): lon,lat=to_geo.transform(pt.x,pt.y); return Point(lon,lat)
 
-def to_merc_line(line_ll):
-    return LineString([to_merc.transform(x, y) for (x, y) in line_ll.coords])
+# --- SLICING & INTERPOLATION ---
+def slice_centerline(line_m,p1_m,p2_m):
+    d1,d2=line_m.project(p1_m),line_m.project(p2_m)
+    if d1==d2: return None
+    start,end=(d1,d2) if d1<d2 else (d2,d1)
+    seg=substring(line_m,start,end,normalized=False)
+    return seg if seg and seg.length>0 else None
 
-def to_geo_point(pt_m):
-    lon, lat = to_geo.transform(pt_m.x, pt_m.y)
-    return Point(lon, lat)
+def interpolate_line(line_m,spacing=1.0):
+    total=line_m.length; steps=max(int(total/spacing),1)
+    pts=[line_m.interpolate(i*spacing) for i in range(steps)]
+    pts.append(line_m.interpolate(total))
+    return pts
 
-def slice_centerline_merc(centerline_m, p1_m, p2_m):
-    # Distances along centerline in meters
-    d1 = centerline_m.project(p1_m)
-    d2 = centerline_m.project(p2_m)
-    if d1 == d2:
-        return None
-    start, end = (d1, d2) if d1 < d2 else (d2, d1)
-    seg = substring(centerline_m, start, end, normalized=False)
-    if seg is None or seg.length == 0.0 or len(seg.coords) < 2:
-        return None
-    return seg
+# --- MAPBOX TERRAIN-RGB ---
+def lonlat_to_tile(lon,lat,z):
+    n=2**z; x=(lon+180)/360*n
+    y=(1-math.log(math.tan(math.radians(lat))+1/math.cos(math.radians(lat)))/math.pi)/2*n
+    return int(x),int(y),x,y
+def pixel_in_tile(x_tile,y_tile,x_float,y_float):
+    x_pix=int((x_float-x_tile)*256); y_pix=int((y_float-y_tile)*256)
+    return max(0,min(255,x_pix)),max(0,min(255,y_pix))
+def decode_rgb(r,g,b): return -10000+(r*256*256+g*256+b)*0.1
 
-def interpolate_line_merc(line_m, spacing_m=1.0):
-    total_len = line_m.length
-    steps = max(int(total_len / spacing_m), 1)
-    points = [line_m.interpolate(i * spacing_m) for i in range(steps)]
-    points.append(line_m.interpolate(total_len))
-    return points  # Points in EPSG:3857 meters
+class TerrainCache:
+    def __init__(self,token,zoom=15): self.t=token; self.z=zoom; self.cache={}
+    def tile(self,z,x,y):
+        key=(z,x,y)
+        if key in self.cache: return self.cache[key]
+        url=TERRAIN_TILE_URL.format(z=z,x=x,y=y)
+        r=requests.get(url,params={"access_token":self.t},timeout=20)
+        if r.status_code!=200: return None
+        img=Image.open(io.BytesIO(r.content)).convert("RGB")
+        self.cache[key]=img; return img
+    def elevation(self,lon,lat):
+        z=self.z; x_tile,y_tile,x_f,y_f=lonlat_to_tile(lon,lat,z)
+        x_pix,y_pix=pixel_in_tile(x_tile,y_tile,x_f,y_f)
+        img=self.tile(z,x_tile,y_tile)
+        if img is None: return 0.0
+        r,g,b=img.getpixel((x_pix,y_pix))
+        return decode_rgb(r,g,b)
 
-# --- Mapbox Terrain-RGB elevation sampling ---
-
-def lonlat_to_tile(lon, lat, z):
-    n = 2 ** z
-    x = (lon + 180.0) / 360.0 * n
-    y = (1.0 - math.log(math.tan(math.radians(lat)) + 1.0 / math.cos(math.radians(lat))) / math.pi) / 2.0 * n
-    return int(x), int(y), x, y
-
-def pixel_in_tile(x_tile, y_tile, x_float, y_float):
-    x_pix = int((x_float - x_tile) * 256.0)
-    y_pix = int((y_float - y_tile) * 256.0)
-    x_pix = max(0, min(255, x_pix))
-    y_pix = max(0, min(255, y_pix))
-    return x_pix, y_pix
-
-def decode_terrain_rgb(r, g, b):
-    # Elevation in meters per Mapbox formula
-    return -10000.0 + (r * 256.0 * 256.0 + g * 256.0 + b) * 0.1
-
-class TerrainTileCache:
-    def __init__(self, token, zoom=15):
-        self.token = token
-        self.zoom = zoom
-        self.cache = {}  # (z,x,y) -> PIL Image
-
-    def get_tile_image(self, z, x, y):
-        key = (z, x, y)
-        img = self.cache.get(key)
-        if img is not None:
-            return img
-        url = TERRAIN_TILE_URL.format(z=z, x=x, y=y)
-        resp = requests.get(url, params={"access_token": self.token}, timeout=20)
-        if resp.status_code != 200:
-            return None
-        try:
-            img = Image.open(io.BytesIO(resp.content)).convert("RGB")
-        except Exception:
-            return None
-        self.cache[key] = img
-        return img
-
-    def elevation_at_lonlat(self, lon, lat):
-        z = self.zoom
-        x_tile, y_tile, x_float, y_float = lonlat_to_tile(lon, lat, z)
-        x_pix, y_pix = pixel_in_tile(x_tile, y_tile, x_float, y_float)
-        img = self.get_tile_image(z, x_tile, y_tile)
-        if img is None:
-            return None
-        r, g, b = img.getpixel((x_pix, y_pix))
-        return decode_terrain_rgb(r, g, b)
-
-def get_elevations_for_merc_points(points_m, cache: TerrainTileCache):
-    elevations = []
+def get_elevations(points_m,cache):
+    elevs=[]
     for pm in points_m:
-        # convert each meter-based point back to lon/lat for Mapbox sampling
-        plonlat = to_geo_point(pm)
-        elev = cache.elevation_at_lonlat(plonlat.x, plonlat.y)
-        if elev is None or not np.isfinite(elev):
-            elevations.append(0.0)
-        else:
-            elevations.append(float(elev))
-    return elevations
+        lonlat=to_geo_point(pm)
+        elev=cache.elevation(lonlat.x,lonlat.y)
+        elevs.append(float(elev))
+    return elevs
 
-def distance_3d_between_merc_points(p1_m, p2_m, e1, e2):
-    dx = p2_m.x - p1_m.x
-    dy = p2_m.y - p1_m.y
-    dz = e2 - e1
-    return math.sqrt(dx * dx + dy * dy + dz * dz)
+# --- DISTANCES ---
+def dist2d(p1,p2): return p1.distance(p2)
+def dist3d(p1,p2,e1,e2):
+    dx,dy=p2.x-p1.x,p2.y-p1.y; dz=e2-e1
+    return math.sqrt(dx*dx+dy*dy+dz*dz)
 
 # --- STREAMLIT UI ---
+st.title("Terrain-Aware AGM Distance Calculator (Diagnostics)")
 
-st.title("Terrain-Aware AGM Distance Calculator (Mapbox Terrain-RGB, meter-accurate)")
-
-uploaded_file = st.file_uploader("Upload KML or KMZ file", type=["kml", "kmz"])
-if uploaded_file:
-    agms_ll, centerline_ll = parse_kml_kmz(uploaded_file)
-
-    st.subheader("📌 AGM summary")
-    st.text(f"Total AGMs found: {len(agms_ll)}")
-    st.subheader("📈 CENTERLINE status")
-    st.text("CENTERLINE found" if centerline_ll else "CENTERLINE missing")
-
-    if not centerline_ll or len(agms_ll) < 2:
-        st.warning("Missing CENTERLINE or insufficient AGM points.")
-    else:
-        # Reproject centerline and AGMs to EPSG:3857 meters for true meter-based slicing
-        centerline_m = to_merc_line(centerline_ll)
-        agms_m = [(name, to_merc_point(pt)) for (name, pt) in agms_ll]
-
-        rows = []
-        cumulative_miles = 0.0
-        skipped = 0
-
-        # Initialize Mapbox tile cache at max precision zoom
-        tile_cache = TerrainTileCache(token=MAPBOX_TOKEN, zoom=15)
-
-        for i in range(len(agms_m) - 1):
-            name1, pt1_m = agms_m[i]
-            name2, pt2_m = agms_m[i + 1]
-
-            segment_m = slice_centerline_merc(centerline_m, pt1_m, pt2_m)
-            if segment_m is None or segment_m.length <= 0.0 or len(segment_m.coords) < 2:
-                skipped += 1
-                continue
-
-            interp_points_m = interpolate_line_merc(segment_m, spacing_m=1.0)
-            if len(interp_points_m) < 2:
-                skipped += 1
-                continue
-
-            elevations = get_elevations_for_merc_points(interp_points_m, tile_cache)
-            if len(elevations) != len(interp_points_m):
-                skipped += 1
-                continue
-
-            # Sum 3D distance along the meter-based path at 1m spacing
-            dist_m = 0.0
-            for j in range(len(interp_points_m) - 1):
-                dist_m += distance_3d_between_merc_points(
-                    interp_points_m[j], interp_points_m[j + 1],
-                    elevations[j], elevations[j + 1]
-                )
-
-            dist_ft = dist_m * 3.28084
-            dist_mi = dist_ft / 5280.0
-            cumulative_miles += dist_mi
-
+uploaded=st.file_uploader("Upload KML or KMZ",type=["kml","kmz"])
+if uploaded:
+    agms_ll,cl_ll=parse_kml_kmz(uploaded)
+    st.text(f"AGMs: {len(agms_ll)} | Centerline: {'found' if cl_ll else 'missing'}")
+    if cl_ll and len(agms_ll)>=2:
+        cl_m=to_merc_line(cl_ll)
+        agms_m=[(n,to_merc_point(pt)) for n,pt in agms_ll]
+        cache=TerrainCache(MAPBOX_TOKEN,zoom=15)
+        rows=[]; cum_mi=0; skipped=0
+        for i in range(len(agms_m)-1):
+            n1,p1=agms_m[i]; n2,p2=agms_m[i+1]
+            seg=slice_centerline(cl_m,p1,p2)
+            if not seg: skipped+=1; continue
+            pts=interpolate_line(seg,1.0)
+            elevs=get_elevations(pts,cache)
+            # 2D length
+            d2d=seg.length
+            # 3D length
+            d3d=sum(dist3d(pts[j],pts[j+1],elevs[j],elevs[j+1]) for j in range(len(pts)-1))
+            d2d_mi=d2d/1609.34; d3d_mi=d3d/1609.34
+            cum_mi+=d3d_mi
             rows.append({
-                "From AGM": name1,
-                "To AGM": name2,
-                "Distance (feet)": round(dist_ft, 2),
-                "Distance (miles)": round(dist_mi, 6),
-                "Cumulative Distance (miles)": round(cumulative_miles, 6)
+                "From AGM":n1,"To AGM":n2,
+                "2D miles":round(d2d_mi,6),
+                "3D miles":round(d3d_mi,6),
+                "Ratio 3D/2D":round(d3d_mi/d2d_mi if d2d_mi>0 else 0,3),
+                "Cumulative 3D miles":round(cum_mi,6)
             })
-
-        st.subheader("📊 Distance table")
-        df = pd.DataFrame(rows)
-        st.dataframe(df)
-        st.text(f"Skipped segments: {skipped}")
-
-        csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button("Download CSV", csv, "terrain_distances.csv", "text/csv")
+        st.dataframe(pd.DataFrame(rows))
+        st.text(f"Skipped: {skipped}")

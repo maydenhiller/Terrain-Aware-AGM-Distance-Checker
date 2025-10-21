@@ -16,10 +16,11 @@ from pyproj import Geod
 # =========================
 
 st.set_page_config(page_title="Terrain-Aware AGM Distance Calculator", layout="wide")
-st.title("Terrain-Aware AGM Distance Calculator (Geodesic Accurate)")
+st.title("Terrain-Aware AGM Distance Calculator (Geodesic + AGM Snap)")
 
 MAPBOX_TOKEN = st.secrets["mapbox"]["token"]
 TERRAIN_TILE_URL = "https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}.pngraw"
+GEOD = Geod(ellps="WGS84")
 
 with st.sidebar:
     st.header("Settings")
@@ -27,8 +28,6 @@ with st.sidebar:
     interp_spacing_m = st.slider("Sampling spacing (m)", 0.5, 5.0, 1.0, 0.5)
     smooth_window = st.slider("Elevation smoothing window", 1, 21, 5, 2)
     st.caption("Higher zoom and ~1 m spacing give best accuracy.")
-
-GEOD = Geod(ellps="WGS84")
 
 # =========================
 # KML / KMZ PARSER
@@ -92,11 +91,10 @@ def parse_kml_kmz(uploaded_file):
     return agms, centerline
 
 # =========================
-# GEODESIC-BASED LINE OPS
+# GEODESIC-BASED OPS
 # =========================
 
 def geodesic_cumulative_coords(line_ll: LineString):
-    """Return cumulative geodesic distances (m) and coordinates."""
     coords = list(line_ll.coords)
     cum = [0.0]
     total = 0.0
@@ -108,21 +106,49 @@ def geodesic_cumulative_coords(line_ll: LineString):
         cum.append(total)
     return np.array(cum), coords
 
+def project_point_to_centerline(point_ll: Point, line_ll: LineString):
+    """Snap an AGM point to the nearest vertex of the centerline."""
+    coords = list(line_ll.coords)
+    if not coords:
+        return point_ll
+    dists = [GEOD.inv(point_ll.x, point_ll.y, lon, lat)[2] for lon, lat in coords]
+    idx = int(np.argmin(dists))
+    lon, lat = coords[idx]
+    return Point(lon, lat)
+
 def slice_centerline_geodesic(centerline_ll, p1_ll, p2_ll):
-    """Slice lon/lat centerline between two AGMs using geodesic distances."""
-    cum, coords = geodesic_cumulative_coords(centerline_ll)
-    dists1 = [GEOD.inv(p1_ll.x, p1_ll.y, lon, lat)[2] for lon, lat in coords]
-    d1_idx = int(np.argmin(dists1))
-    dists2 = [GEOD.inv(p2_ll.x, p2_ll.y, lon, lat)[2] for lon, lat in coords]
-    d2_idx = int(np.argmin(dists2))
-    i0, i1 = sorted((d1_idx, d2_idx))
-    seg_coords = coords[i0:i1 + 1]
-    return LineString(seg_coords)
+    """Slice lon/lat centerline between two AGMs, returns LineString."""
+    try:
+        cum, coords = geodesic_cumulative_coords(centerline_ll)
+        if len(coords) < 2:
+            return None
+
+        # find nearest vertices
+        dists1 = [GEOD.inv(p1_ll.x, p1_ll.y, lon, lat)[2] for lon, lat in coords]
+        dists2 = [GEOD.inv(p2_ll.x, p2_ll.y, lon, lat)[2] for lon, lat in coords]
+        d1_idx = int(np.argmin(dists1))
+        d2_idx = int(np.argmin(dists2))
+        i0, i1 = sorted((d1_idx, d2_idx))
+        seg_coords = coords[i0:i1 + 1]
+        if len(seg_coords) < 2:
+            if i0 > 0:
+                seg_coords.insert(0, coords[i0 - 1])
+            if i1 + 1 < len(coords):
+                seg_coords.append(coords[i1 + 1])
+        seg_coords = [(float(lon), float(lat))
+                      for lon, lat in seg_coords
+                      if np.isfinite(lon) and np.isfinite(lat)]
+        if len(seg_coords) < 2:
+            return None
+        return LineString(seg_coords)
+    except Exception:
+        return None
 
 def interpolate_line_geodesic(line_ll, spacing_m=1.0):
-    """Interpolate lon/lat points every spacing_m along geodesic centerline."""
     cum, coords = geodesic_cumulative_coords(line_ll)
     total = cum[-1]
+    if total <= 0:
+        return coords
     targets = np.arange(0.0, total, spacing_m)
     result = []
     for t in targets:
@@ -143,17 +169,8 @@ def interpolate_line_geodesic(line_ll, spacing_m=1.0):
     result.append(coords[-1])
     return result
 
-def geodesic_length_ll(coords_ll):
-    total = 0.0
-    for i in range(len(coords_ll) - 1):
-        lon1, lat1 = coords_ll[i]
-        lon2, lat2 = coords_ll[i + 1]
-        _, _, d = GEOD.inv(lon1, lat1, lon2, lat2)
-        total += d
-    return total
-
 # =========================
-# MAPBOX TERRAIN-RGB (bilinear)
+# MAPBOX TERRAIN-RGB
 # =========================
 
 def lonlat_to_tile(lon, lat, z):
@@ -173,9 +190,8 @@ class TerrainTileCache:
 
     def get_tile_array(self, z, x, y):
         key = (z, x, y)
-        arr = self.cache.get(key)
-        if arr is not None:
-            return arr
+        if key in self.cache:
+            return self.cache[key]
         url = TERRAIN_TILE_URL.format(z=z, x=x, y=y)
         resp = requests.get(url, params={"access_token": self.token}, timeout=20)
         if resp.status_code != 200:
@@ -244,9 +260,12 @@ if uploaded_file:
         skipped = 0
         cumulative_miles = 0.0
 
-        for i in range(len(agms) - 1):
-            name1, pt1_ll = agms[i]
-            name2, pt2_ll = agms[i + 1]
+        # Snap AGMs to centerline
+        agms_snapped = [(name, project_point_to_centerline(pt, centerline_ll)) for name, pt in agms]
+
+        for i in range(len(agms_snapped) - 1):
+            name1, pt1_ll = agms_snapped[i]
+            name2, pt2_ll = agms_snapped[i + 1]
 
             seg_ll = slice_centerline_geodesic(centerline_ll, pt1_ll, pt2_ll)
             if seg_ll is None or len(seg_ll.coords) < 2:
@@ -256,7 +275,6 @@ if uploaded_file:
             interp_pts_ll = interpolate_line_geodesic(seg_ll, spacing_m=interp_spacing_m)
             elevations = smooth_elevations(get_elevations_ll(interp_pts_ll, tile_cache), smooth_window)
 
-            # Compute 3D distance
             dist_m = 0.0
             for j in range(len(interp_pts_ll) - 1):
                 lon1, lat1 = interp_pts_ll[j]

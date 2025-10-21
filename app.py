@@ -10,36 +10,33 @@ import numpy as np
 from PIL import Image
 from shapely.geometry import Point, LineString
 from shapely.ops import substring
-from pyproj import Transformer, CRS
+from pyproj import Transformer, CRS, Geod
 
 # =========================
 # CONFIG & UI
 # =========================
 
 st.set_page_config(page_title="Terrain-Aware AGM Distance Calculator", layout="wide")
-st.title("Terrain-Aware AGM Distance Calculator (Mapbox Terrain-RGB, UTM-precise)")
+st.title("Terrain-Aware AGM Distance Calculator (with diagnostics)")
 
-# --- Secrets / tokens ---
 MAPBOX_TOKEN = st.secrets["mapbox"]["token"]
-
-# --- Terrain-RGB tileset endpoint (PNG raw for precise RGB) ---
 TERRAIN_TILE_URL = "https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}.pngraw"
 
-# --- Sidebar controls for accuracy/performance tradeoffs ---
 with st.sidebar:
     st.header("Settings")
-    mapbox_zoom = st.slider("Terrain tile zoom (higher = finer elevation)", 15, 17, 17, help="17 ≈ ~1.2–1.5 m/pixel, 16 ≈ ~2.4–3 m/pixel, 15 ≈ ~4–5 m/pixel")
-    interp_spacing_m = st.slider("Sampling spacing along path (meters)", 0.5, 5.0, 1.0, 0.5, help="1 m recommended")
-    smooth_window = st.slider("Elevation smoothing window (points)", 1, 21, 5, 2, help="Set to 1 to disable smoothing")
-    densify_spacing_m = st.slider("Centerline densify spacing (meters)", 5, 50, 10, 5, help="Improves slicing along bends")
-    st.caption("Tip: For maximum accuracy, keep zoom=17, spacing=1 m, smoothing window ~5.")
+    mapbox_zoom = st.slider("Terrain tile zoom (higher = finer elevation)", 15, 17, 17)
+    interp_spacing_m = st.slider("Sampling spacing along path (meters)", 0.5, 5.0, 1.0, 0.5)
+    smooth_window = st.slider("Elevation smoothing window (points)", 1, 21, 5, 2)
+    densify_spacing_m = st.slider("Centerline densify spacing (meters)", 5, 50, 10, 5)
+    use_densify = st.checkbox("Use centerline densify (recommended)", value=True)
+    use_3d = st.checkbox("Use 3D distance (include elevation)", value=True)
+    st.caption("Diagnostics below will show UTM 2D, UTM 3D, and Geodesic 2D for each segment.")
 
 # =========================
 # HELPERS
 # =========================
 
 def agm_sort_key(name_geom):
-    """Sort AGMs like 1, 2, 3, ..., 10, 10A, 11..."""
     name = name_geom[0]
     base_digits = ''.join(filter(str.isdigit, name))
     base = int(base_digits) if base_digits else -1
@@ -47,7 +44,6 @@ def agm_sort_key(name_geom):
     return (base, suffix)
 
 def parse_kml_kmz(uploaded_file):
-    """Return ([(name, Point(lon,lat)), ...], LineString(lon,lat) or None)"""
     if uploaded_file.name.endswith(".kmz"):
         with zipfile.ZipFile(uploaded_file) as zf:
             kml_file = next((f for f in zf.namelist() if f.endswith(".kml")), None)
@@ -103,8 +99,9 @@ def parse_kml_kmz(uploaded_file):
 # ---- CRS / transformers ----
 
 def get_local_utm_crs(geom_ll: LineString) -> CRS:
-    """Pick a local UTM CRS from the centerline centroid for near-true metric distances."""
-    cx, cy = np.mean([c[0] for c in geom_ll.coords]), np.mean([c[1] for c in geom_ll.coords])
+    xs = [c[0] for c in geom_ll.coords]
+    ys = [c[1] for c in geom_ll.coords]
+    cx, cy = float(np.mean(xs)), float(np.mean(ys))
     zone = int((cx + 180.0) / 6.0) + 1
     is_north = cy >= 0.0
     epsg = 32600 + zone if is_north else 32700 + zone
@@ -125,7 +122,7 @@ def transform_point(pt: Point, transformer: Transformer) -> Point:
     x, y = transformer.transform(pt.x, pt.y)
     return Point(x, y)
 
-# ---- Densify centerline in meters (on metric CRS) ----
+# ---- Densify centerline in meters ----
 
 def densify_line_metric(line_metric: LineString, spacing_m: float) -> LineString:
     L = line_metric.length
@@ -142,14 +139,14 @@ def slice_centerline_metric(centerline_metric: LineString, p1_metric: Point, p2_
     d1 = centerline_metric.project(p1_metric)
     d2 = centerline_metric.project(p2_metric)
     if np.isclose(d1, d2):
-        return None
+        return None, d1, d2
     start, end = (d1, d2) if d1 < d2 else (d2, d1)
     seg = substring(centerline_metric, start, end, normalized=False)
     if seg is None or seg.length == 0.0 or len(seg.coords) < 2:
-        return None
-    return seg
+        return None, d1, d2
+    return seg, start, end
 
-# ---- Sampling points along the metric segment ----
+# ---- Sampling along the metric segment ----
 
 def interpolate_line_metric(line_metric: LineString, spacing_m: float):
     L = line_metric.length
@@ -162,24 +159,23 @@ def interpolate_line_metric(line_metric: LineString, spacing_m: float):
     return pts
 
 # =========================
-# Mapbox Terrain-RGB helpers (with bilinear sampling)
+# Mapbox Terrain-RGB (bilinear)
 # =========================
 
 def lonlat_to_tile(lon, lat, z):
     n = 2 ** z
     x = (lon + 180.0) / 360.0 * n
     y = (1.0 - math.log(math.tan(math.radians(lat)) + 1.0 / math.cos(math.radians(lat))) / math.pi) / 2.0 * n
-    return int(x), int(y), x, y  # tile indices and float tile coords
+    return int(x), int(y), x, y
 
 def decode_terrain_rgb(r, g, b):
-    # Elevation in meters: E = -10000 + (R*256^2 + G*256 + B) * 0.1
     return -10000.0 + (r * 256.0 * 256.0 + g * 256.0 + b) * 0.1
 
 class TerrainTileCache:
     def __init__(self, token, zoom=17):
         self.token = token
         self.zoom = zoom
-        self.cache = {}  # (z,x,y) -> np.ndarray HxWx3 uint8
+        self.cache = {}
 
     def get_tile_array(self, z, x, y):
         key = (z, x, y)
@@ -192,7 +188,7 @@ class TerrainTileCache:
             return None
         try:
             img = Image.open(io.BytesIO(resp.content)).convert("RGB")
-            arr = np.asarray(img, dtype=np.uint8)  # (256,256,3)
+            arr = np.asarray(img, dtype=np.uint8)
         except Exception:
             return None
         self.cache[key] = arr
@@ -209,7 +205,6 @@ class TerrainTileCache:
         dx = x_pix_f - x0
         dy = y_pix_f - y0
 
-        # Clamp base indices and neighbors into [0,255]
         x0 = max(0, min(255, x0))
         y0 = max(0, min(255, y0))
         x1 = min(x0 + 1, 255)
@@ -219,7 +214,6 @@ class TerrainTileCache:
         if arr is None:
             return None
 
-        # Note: arr indexed as [row=y, col=x]
         p00 = decode_terrain_rgb(*arr[y0, x0])
         p10 = decode_terrain_rgb(*arr[y0, x1])
         p01 = decode_terrain_rgb(*arr[y1, x0])
@@ -233,25 +227,34 @@ class TerrainTileCache:
         )
         return float(elev)
 
-# ---- Elevation series helpers ----
-
 def get_elevations_ll(points_ll, cache: TerrainTileCache):
-    """points_ll: list of (lon,lat). Returns list of elevations (meters)."""
     elevations = []
     for (lon, lat) in points_ll:
         e = cache.elevation_at_bilinear(lon, lat)
-        if e is None or not np.isfinite(e):
-            elevations.append(0.0)
-        else:
-            elevations.append(e)
+        elevations.append(0.0 if (e is None or not np.isfinite(e)) else e)
     return elevations
 
 def smooth_elevations(elevs, window: int):
     if window <= 1:
         return elevs
-    window = max(1, int(window))
     kernel = np.ones(window, dtype=float) / float(window)
     return np.convolve(elevs, kernel, mode="same").tolist()
+
+# ---- Geodesic helper (WGS84) ----
+
+GEOD = Geod(ellps="WGS84")
+
+def geodesic_length_ll(coords_ll):
+    """Total geodesic 2D length (meters) along lon/lat polyline coords."""
+    if len(coords_ll) < 2:
+        return 0.0
+    total = 0.0
+    for i in range(len(coords_ll) - 1):
+        lon1, lat1 = coords_ll[i]
+        lon2, lat2 = coords_ll[i + 1]
+        _, _, dist = GEOD.inv(lon1, lat1, lon2, lat2)  # meters
+        total += dist
+    return total
 
 # =========================
 # MAIN APP
@@ -270,27 +273,27 @@ if uploaded_file:
     if not centerline_ll or len(agms) < 2:
         st.warning("Missing CENTERLINE or insufficient AGM points.")
     else:
-        # Choose a local UTM for accurate metric operations
+        # Metric CRS (local UTM; fallback to EPSG:5070)
         try:
             crs_metric = get_local_utm_crs(centerline_ll)
         except Exception:
-            # Fallback to a robust, near-equal-area metric CRS over CONUS
-            crs_metric = CRS.from_epsg(5070)  # NAD83 / Conus Albers
+            crs_metric = CRS.from_epsg(5070)
         to_metric = xf_ll_to_metric(crs_metric)
         to_ll = xf_metric_to_ll(crs_metric)
 
-        # Transform centerline to metric CRS and densify
         centerline_metric = transform_linestring(centerline_ll, to_metric)
-        centerline_metric = densify_line_metric(centerline_metric, densify_spacing_m)
+        if use_densify:
+            centerline_metric = densify_line_metric(centerline_metric, densify_spacing_m)
 
-        # Prepare Mapbox cache at user-selected zoom
+        # Mapbox elevation cache
         tile_cache = TerrainTileCache(token=MAPBOX_TOKEN, zoom=mapbox_zoom)
 
         rows = []
+        diag_rows = []
         cumulative_miles = 0.0
         skipped = 0
 
-        # Pre-transform AGM points to metric CRS (for project/slice)
+        # Pre-transform AGMs to metric for projection/slice
         agms_metric = [(name, transform_point(pt, to_metric)) for name, pt in agms]
 
         for i in range(len(agms) - 1):
@@ -299,53 +302,85 @@ if uploaded_file:
             _, pt1_m = agms_metric[i]
             _, pt2_m = agms_metric[i + 1]
 
-            segment_m = slice_centerline_metric(centerline_metric, pt1_m, pt2_m)
+            segment_m, s0, s1 = slice_centerline_metric(centerline_metric, pt1_m, pt2_m)
             if segment_m is None or segment_m.length == 0.0 or len(segment_m.coords) < 2:
                 skipped += 1
                 continue
 
-            # Interpolate along the metric segment at fixed spacing (meters)
-            interp_pts_m = interpolate_line_metric(segment_m, spacing_m=interp_spacing_m)
-            if len(interp_pts_m) < 2:
-                skipped += 1
-                continue
+            # ==== UTM 2D baseline ====
+            utm2d_m = segment_m.length
 
-            # Convert those points to lon/lat for elevation sampling
+            # ==== Interpolate for elevation & diagnostics ====
+            interp_pts_m = interpolate_line_metric(segment_m, spacing_m=interp_spacing_m)
             xs = [p.x for p in interp_pts_m]
             ys = [p.y for p in interp_pts_m]
             lons, lats = to_ll.transform(xs, ys)
             interp_pts_ll = list(zip(lons, lats))
 
-            # Elevations via bilinear Terrain-RGB
+            # ==== Geodesic 2D along identical lon/lat polyline ====
+            geo2d_m = geodesic_length_ll(interp_pts_ll)
+
+            # ==== Elevations (bilinear) ====
             elevations = get_elevations_ll(interp_pts_ll, tile_cache)
             elevations = smooth_elevations(elevations, smooth_window)
 
-            # Sum true 3D distance in metric CRS (dx,dy from UTM; dz from elevation)
-            dist_m = 0.0
-            for j in range(len(interp_pts_m) - 1):
-                x1, y1 = interp_pts_m[j].x, interp_pts_m[j].y
-                x2, y2 = interp_pts_m[j + 1].x, interp_pts_m[j + 1].y
-                dx = x2 - x1
-                dy = y2 - y1
-                dz = elevations[j + 1] - elevations[j]
-                dist_m += math.sqrt(dx * dx + dy * dy + dz * dz)
+            # ==== UTM 3D accumulation ====
+            utm3d_m = 0.0
+            if use_3d:
+                for j in range(len(interp_pts_m) - 1):
+                    dx = xs[j + 1] - xs[j]
+                    dy = ys[j + 1] - ys[j]
+                    dz = elevations[j + 1] - elevations[j]
+                    utm3d_m += math.sqrt(dx * dx + dy * dy + dz * dz)
+            else:
+                utm3d_m = utm2d_m  # report 2D only if 3D disabled
 
-            dist_ft = dist_m * 3.28084
+            # ==== Per-segment grade diagnostics ====
+            dxy = np.sqrt(np.diff(xs)**2 + np.diff(ys)**2)
+            dzs = np.diff(np.array(elevations))
+            grades = np.divide(np.abs(dzs), np.maximum(dxy, 1e-6))  # rise/run
+            avg_grade = float(np.mean(grades)) if len(grades) else 0.0
+            p95_grade = float(np.percentile(grades, 95)) if len(grades) else 0.0
+
+            # ==== Output rows ====
+            dist_ft = utm3d_m * 3.28084
             dist_mi = dist_ft / 5280.0
             cumulative_miles += dist_mi
 
             rows.append({
                 "From AGM": name1,
                 "To AGM": name2,
-                "Distance (feet)": round(dist_ft, 2),
-                "Distance (miles)": round(dist_mi, 6),
-                "Cumulative Distance (miles)": round(cumulative_miles, 6)
+                "Distance 3D (ft)": round(dist_ft, 2),
+                "Distance 3D (mi)": round(dist_mi, 6),
+                "Cumulative (mi)": round(cumulative_miles, 6)
             })
 
-        st.subheader("📊 Distance table")
+            diag_rows.append({
+                "From AGM": name1,
+                "To AGM": name2,
+                "UTM 2D (m)": round(utm2d_m, 3),
+                "UTM 3D (m)": round(utm3d_m, 3),
+                "Geodesic 2D (m)": round(geo2d_m, 3),
+                "Avg grade": round(avg_grade, 3),
+                "95% grade": round(p95_grade, 3),
+                "%3D over 2D": round(100.0 * (utm3d_m - utm2d_m) / max(utm2d_m, 1e-6), 2),
+                "%UTM2D over Geo2D": round(100.0 * (utm2d_m - geo2d_m) / max(geo2d_m, 1e-6), 2),
+            })
+
+        # ==== Tables ====
+        st.subheader("📊 Reported distances")
         df = pd.DataFrame(rows)
         st.dataframe(df, use_container_width=True)
+
+        st.subheader("🧪 Diagnostics (compare the three distance paths)")
+        ddf = pd.DataFrame(diag_rows)
+        st.dataframe(ddf, use_container_width=True)
+
         st.text(f"Skipped segments: {skipped}")
 
+        # ==== CSV download ====
         csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button("Download CSV", csv, "terrain_distances.csv", "text/csv")
+        st.download_button("Download CSV (3D distances)", csv, "terrain_distances.csv", "text/csv")
+
+        diag_csv = ddf.to_csv(index=False).encode("utf-8")
+        st.download_button("Download CSV (diagnostics)", diag_csv, "terrain_diagnostics.csv", "text/csv")

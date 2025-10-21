@@ -5,3 +5,4 @@ shapely
 pyproj
 requests
 zipfile36
+Pillow

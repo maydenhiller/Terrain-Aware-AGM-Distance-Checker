@@ -1,8 +1,8 @@
-streamlit
-pandas
-numpy
-shapely
-pyproj
-requests
-zipfile36
-Pillow
+streamlit>=1.32
+pandas>=2.0
+numpy>=1.24
+shapely>=2.0
+pyproj>=3.6
+requests>=2.31
+zipfile36>=0.1.3
+Pillow>=10.0

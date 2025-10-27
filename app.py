@@ -157,7 +157,14 @@ if u:
 
     crs = get_crs(parts)
     xf_fwd, xf_inv = tf_ll_to(crs), tf_to_ll(crs)
-    parts_m = [LineString(xf_fwd.transform(*p.xy)) for p in parts if p.length > 0]
+
+    # ✅ FIXED: Correctly transform coordinates to tuples before creating LineStrings
+    parts_m = []
+    for p in parts:
+        if p.length > 0:
+            x, y = xf_fwd.transform(*p.xy)
+            parts_m.append(LineString(list(zip(x, y))))
+
     cache = TerrainCache(MAPBOX_TOKEN, MAPBOX_ZOOM)
     rows, cum_mi, skipped = [], 0.0, 0
 

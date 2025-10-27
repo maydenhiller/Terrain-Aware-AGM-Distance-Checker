@@ -1,5 +1,5 @@
 # app.py
-# Terrain-Aware AGM Distance Calculator — Pure NumPy Smoothing (no SciPy)
+# Terrain-Aware AGM Distance Calculator — Pure NumPy smoothing, no SciPy
 import io, math, zipfile, requests, xml.etree.ElementTree as ET
 import streamlit as st, pandas as pd, numpy as np
 from PIL import Image
@@ -15,7 +15,7 @@ GEOD = Geod(ellps="WGS84")
 FT_PER_M, MI_PER_FT = 3.28084, 1/5280.0
 MAPBOX_ZOOM = 17
 
-# Geometry & smoothing defaults
+# --- tuning constants ---
 MAX_SNAP_M = 80.0
 RESAMPLE_BASE_M = 5.0
 XY_SMOOTH_WINDOW_M = 35.0
@@ -23,7 +23,7 @@ ELEV_SMOOTH_WINDOW_M = 85.0
 SPACING_M = 15.0
 DZ_THRESHOLD_M = 0.30
 
-# ---- fallback Savitzky–Golay smoothing (pure numpy)
+# ---- pure NumPy smoothing ----
 def smooth_np(arr, window_m, spacing_m):
     if len(arr) < 5:
         return arr
@@ -39,7 +39,7 @@ def smooth_np(arr, window_m, spacing_m):
     filt = coeff[:, 0]
     return np.convolve(arr, filt / filt.sum(), mode="same")
 
-# ---- XML helpers
+# ---- XML utilities ----
 def strip_ns(e):
     e.tag = e.tag.split("}", 1)[-1]
     for k in list(e.attrib):
@@ -49,7 +49,7 @@ def strip_ns(e):
     for c in e:
         strip_ns(c)
 
-# ---- parse KML/KMZ
+# ---- KML/KMZ parsing ----
 def agm_sort_key(p):
     n = p[0]
     d = "".join(filter(str.isdigit, n))
@@ -106,7 +106,7 @@ def parse(upload):
     agms.sort(key=agm_sort_key)
     return agms, cls
 
-# ---- projection helpers
+# ---- projection helpers ----
 def get_crs(lines):
     xs = [x for l in lines for x, _ in l.coords]
     ys = [y for l in lines for _, y in l.coords]
@@ -118,7 +118,7 @@ def xf_to_ll(crs): return Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
 def tf_line(l, xf): x, y = zip(*l.coords); X, Y = xf.transform(x, y); return LineString(zip(X, Y))
 def tf_pt(p, xf): x, y = xf.transform(p.x, p.y); return Point(x, y)
 
-# ---- terrain
+# ---- terrain RGB ----
 def lonlat_to_tile(lon, lat, z):
     n = 2 ** z
     x = (lon + 180) / 360 * n
@@ -149,7 +149,7 @@ class TerrainCache:
         p01 = decode_rgb(*arr[y1, x0]); p11 = decode_rgb(*arr[y1, x1])
         return float(p00*(1-dx)*(1-dy)+p10*dx*(1-dy)+p01*(1-dx)*dy+p11*dx*dy)
 
-# ---- geometry helpers
+# ---- geometry helpers ----
 def build_arrays(ls):
     c = list(ls.coords)
     x = np.array([p[0] for p in c], float)
@@ -172,7 +172,7 @@ def choose_part(parts, p1, p2, xf, max_off):
                 best = (tot, i, s1, s2)
     return (None, None, None) if best is None else (best[1], best[2], best[3])
 
-# ---- UI + compute
+# ---- main Streamlit UI ----
 u = st.file_uploader("Upload KML or KMZ", type=["kml", "kmz"])
 if u:
     agms, parts = parse(u)
@@ -204,12 +204,8 @@ if u:
         si = np.arange(s_lo, s_hi, RESAMPLE_BASE_M)
         if si.size == 0 or si[-1] < s_hi: si = np.append(si, s_hi)
         xi, yi = interp_xy(x, y, s, si)
-
-        # smooth XY
         xi_s = smooth_np(np.asarray(xi, float), XY_SMOOTH_WINDOW_M, RESAMPLE_BASE_M)
         yi_s = smooth_np(np.asarray(yi, float), XY_SMOOTH_WINDOW_M, RESAMPLE_BASE_M)
-
-        # resample evenly
         d = np.hypot(np.diff(xi_s), np.diff(yi_s))
         s2 = np.concatenate([[0.0], np.cumsum(d)])
         L2 = s2[-1]
@@ -217,12 +213,10 @@ if u:
         sp = np.arange(0.0, L2, SPACING_M)
         if sp.size == 0 or sp[-1] < L2: sp = np.append(sp, L2)
         X, Y = interp_xy(xi_s, yi_s, s2, sp)
-
         lons, lats = xf_inv.transform(X.tolist(), Y.tolist())
         pts = list(zip(lons, lats))
         elev = [cache.elev(lo, la) for lo, la in pts]
         elev = smooth_np(np.asarray(elev, float), ELEV_SMOOTH_WINDOW_M, SPACING_M)
-
         dist_m = 0.0
         for j in range(len(pts) - 1):
             lon1, lat1 = pts[j]; lon2, lat2 = pts[j + 1]
@@ -230,7 +224,6 @@ if u:
             dz = elev[j + 1] - elev[j]
             if abs(dz) < DZ_THRESHOLD_M: dz = 0.0
             dist_m += math.hypot(dxy, dz)
-
         ft = dist_m * FT_PER_M
         mi = ft * MI_PER_FT
         cum_mi += mi

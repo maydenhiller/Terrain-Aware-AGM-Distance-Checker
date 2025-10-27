@@ -1,7 +1,4 @@
- # Terrain-Aware AGM Distance Calculator — Stable Final Build
-# Hard-targets <Folder><name>AGMs</name> and <Folder><name>CENTERLINE</name>
-# 3D geodesic distances using Mapbox Terrain-RGB
-
+# Terrain-Aware AGM Distance Calculator — tuned for accurate 3D distances
 import math, io, zipfile, requests, xml.etree.ElementTree as ET
 import streamlit as st, pandas as pd, numpy as np
 from PIL import Image
@@ -16,13 +13,12 @@ TERRAIN_TILE_URL = "https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}.png
 GEOD = Geod(ellps="WGS84")
 FT_PER_M, MI_PER_FT = 3.28084, 1 / 5280.0
 
-with st.sidebar:
-    st.header("Settings")
-    mapbox_zoom = st.slider("Terrain tile zoom", 15, 17, 17)
-    spacing_m = st.slider("Sample spacing (m)", 0.5, 10.0, 1.0, 0.5)
-    smooth_window = st.slider("Elevation smoothing window", 1, 25, 7, 2)
-    simplify_tolerance_m = st.slider("Simplify centerline (m)", 0.0, 5.0, 0.0, 0.5)
-    max_snap_offset_m = st.slider("Max AGM snap offset (m)", 5.0, 150.0, 80.0, 5.0)
+# ---- fixed tuning for accurate real-world distances ----
+SPACING_M = 5.0
+SMOOTH_WINDOW = 11
+SIMPLIFY_TOLERANCE_M = 1.0
+MAX_SNAP_OFFSET_M = 80.0
+MAPBOX_ZOOM = 17
 
 # ────────────────────────── Parser (fixed folder names)
 def agm_sort_key(name_geom):
@@ -44,8 +40,6 @@ def parse_kml_kmz(uploaded_file):
         kml_data = uploaded_file.read()
 
     root = ET.fromstring(kml_data)
-    nsfree = lambda tag: tag.split("}", 1)[-1]
-
     agms, centerlines = [], []
 
     for folder in root.findall(".//{*}Folder"):
@@ -54,7 +48,6 @@ def parse_kml_kmz(uploaded_file):
             continue
         fname = name_el.text.strip().upper()
 
-        # ---- AGMs ----
         if fname == "AGMS":
             for pm in folder.findall(".//{*}Placemark"):
                 nm = pm.find("{*}name")
@@ -67,7 +60,6 @@ def parse_kml_kmz(uploaded_file):
                 except:
                     pass
 
-        # ---- CENTERLINE ----
         elif fname == "CENTERLINE":
             for pm in folder.findall(".//{*}Placemark"):
                 coords_el = pm.find(".//{*}coordinates")
@@ -114,7 +106,7 @@ def decode_terrain_rgb(r, g, b):
     return -10000.0 + ((R * 256 * 256) + (G * 256) + B) * 0.1
 
 class TerrainCache:
-    def __init__(self, token, zoom=17):
+    def __init__(self, token, zoom=MAPBOX_ZOOM):
         self.t = token
         self.z = int(zoom)
         self.c = {}
@@ -207,21 +199,21 @@ if uploaded:
 
     crs = get_local_utm_crs(parts)
     xf_fwd, xf_inv = xf_ll_to(crs), xf_to_ll(crs)
-    parts_m = [tf_line(p, xf_fwd).simplify(simplify_tolerance_m) for p in parts]
+    parts_m = [tf_line(p, xf_fwd).simplify(SIMPLIFY_TOLERANCE_M) for p in parts]
 
-    cache = TerrainCache(MAPBOX_TOKEN, zoom=mapbox_zoom)
+    cache = TerrainCache(MAPBOX_TOKEN, zoom=MAPBOX_ZOOM)
     rows, cum_mi, skipped = [], 0.0, 0
 
     for i in range(len(agms) - 1):
         n1, a1 = agms[i]; n2, a2 = agms[i + 1]
-        part_idx, s1, s2 = choose_part(parts_m, a1, a2, xf_fwd, max_snap_offset_m)
+        part_idx, s1, s2 = choose_part(parts_m, a1, a2, xf_fwd, MAX_SNAP_OFFSET_M)
         if part_idx is None:
             skipped += 1
             continue
-        Xs, Ys = sample(parts_m[part_idx], s1, s2, spacing_m)
+        Xs, Ys = sample(parts_m[part_idx], s1, s2, SPACING_M)
         lons, lats = xf_inv.transform(Xs.tolist(), Ys.tolist())
         pts = list(zip(lons, lats))
-        elev = smooth([cache.elev(lo, la) for lo, la in pts], smooth_window)
+        elev = smooth([cache.elev(lo, la) for lo, la in pts], SMOOTH_WINDOW)
 
         dist_m = 0.0
         for j in range(len(pts) - 1):

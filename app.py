@@ -10,26 +10,29 @@ import pandas as pd
 import numpy as np
 from PIL import Image
 from shapely.geometry import Point, LineString
-from pyproj import CRS, Transformer
+from pyproj import CRS, Transformer, Geod
 
 # =========================================
 # CONFIG
 # =========================================
 
 st.set_page_config(page_title="Terrain-Aware AGM Distance Calculator", layout="wide")
-st.title("Terrain-Aware AGM Distance Calculator (Exact linear ref 2D + elevation)")
+st.title("Terrain-Aware AGM Distance Calculator (Snap, Geodesic-3D)")
 
 MAPBOX_TOKEN = st.secrets["mapbox"]["token"]
 TERRAIN_TILE_URL = "https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}.pngraw"
+GEOD = Geod(ellps="WGS84")
 
 with st.sidebar:
     st.header("Settings")
     mapbox_zoom = st.slider("Terrain tile zoom", 15, 17, 17)
     interp_spacing_m = st.slider("Sampling spacing along path (m)", 0.5, 5.0, 1.0, 0.5)
     smooth_window = st.slider("Elevation smoothing window (samples)", 1, 21, 5, 2)
-    simplify_tolerance_m = st.slider("Centerline simplify tolerance (m)", 0.0, 5.0, 0.0, 0.5,
-                                     help="Optional: remove micro-wiggles. 0 keeps original.")
-    st.caption("This build forces 2D distance = exact linear reference |s2 - s1|. Elevation adds small % only.")
+    simplify_tolerance_m = st.slider(
+        "Centerline simplify tolerance (m)", 0.0, 5.0, 0.0, 0.5,
+        help="Optional: remove micro-wiggles in the centerline (0 = off)"
+    )
+    st.caption("For best accuracy: zoom=17, spacing=1 m, smoothing≈5.")
 
 FT_PER_M = 3.28084
 MI_PER_FT = 1.0 / 5280.0
@@ -93,14 +96,13 @@ def parse_kml_kmz(uploaded_file):
                     if centerline is None:
                         centerline = LineString(pts)
                     else:
-                        # keep document order; append segments end-to-end
                         centerline = LineString(list(centerline.coords) + pts)
 
     agms.sort(key=agm_sort_key)
     return agms, centerline
 
 # =========================================
-# CRS / TRANSFORMS (for exact linear referencing)
+# CRS / TRANSFORMS (for snapping & linear reference)
 # =========================================
 
 def get_local_utm_crs(line_ll: LineString) -> CRS:
@@ -128,7 +130,7 @@ def transform_point(pt: Point, xf: Transformer) -> Point:
     return Point(x, y)
 
 # =========================================
-# EXACT LINEAR REFERENCING UTILITIES
+# EXACT LINEAR REFERENCING (metric)
 # =========================================
 
 def build_vertex_arrays_metric(centerline_m: LineString):
@@ -154,35 +156,69 @@ def interpolate_point_on_polyline(xs, ys, cum, s):
     y = ys[idx] + t * (ys[idx + 1] - ys[idx])
     return float(x), float(y), idx
 
-def linear_reference_samples(xs, ys, cum, s0, s1, spacing_m):
-    """Return lon/lat samples exactly every spacing_m along the metric line between s0..s1.
-       Guarantees 2D distance = |s1 - s0| (no inflation)."""
+def slice_polyline_by_measures(xs, ys, cum, s0, s1):
     s_lo, s_hi = (s0, s1) if s0 <= s1 else (s1, s0)
-    L = float(abs(s1 - s0))
-    if L <= 0:
-        return [], [], []
+    xA, yA, iA = interpolate_point_on_polyline(xs, ys, cum, s_lo)
+    xB, yB, iB = interpolate_point_on_polyline(xs, ys, cum, s_hi)
 
+    Xs = [xA]
+    Ys = [yA]
+    if iB >= iA and (iA + 1) <= iB:
+        Xs.extend(xs[iA + 1:iB + 1].tolist())
+        Ys.extend(ys[iA + 1:iB + 1].tolist())
+    Xs.append(xB)
+    Ys.append(yB)
+    return np.array(Xs, dtype=float), np.array(Ys, dtype=float)
+
+# =========================================
+# GEODESIC SAMPLING ALONG A LON/LAT POLYLINE
+# =========================================
+
+def geodesic_segment_m(p0, p1):
+    lon1, lat1 = p0
+    lon2, lat2 = p1
+    _, _, d = GEOD.inv(lon1, lat1, lon2, lat2)
+    return float(d)
+
+def geodesic_cum_along(coords_ll):
+    if len(coords_ll) < 2:
+        return np.array([0.0])
+    cum = [0.0]
+    total = 0.0
+    for i in range(len(coords_ll) - 1):
+        d = geodesic_segment_m(coords_ll[i], coords_ll[i + 1])
+        total += d
+        cum.append(total)
+    return np.array(cum, dtype=float)
+
+def resample_polyline_geodesic(coords_ll, spacing_m):
+    """Return lon/lat points every spacing_m along the given lon/lat polyline by geodesic arclength."""
+    if len(coords_ll) < 2:
+        return coords_ll
+    cum = geodesic_cum_along(coords_ll)
+    L = float(cum[-1])
+    if L <= 0:
+        return coords_ll
     targets = np.arange(0.0, L, float(spacing_m))
     if targets.size == 0 or targets[-1] < L:
         targets = np.append(targets, L)
 
-    # Precompute segment indices for each target (offset by s_lo)
-    t_abs = s_lo + targets
-    idxs = np.searchsorted(cum, t_abs, side="right") - 1
-    idxs = np.clip(idxs, 0, len(xs) - 2)
-
-    # Segment lengths and local fractions
-    seg_len = (cum[idxs + 1] - cum[idxs])
-    seg_len = np.where(seg_len <= 0, 1.0, seg_len)
-    frac = (t_abs - cum[idxs]) / seg_len
-
-    # Interpolate metric XY
-    dx = (xs[idxs + 1] - xs[idxs])
-    dy = (ys[idxs + 1] - ys[idxs])
-    Xs = xs[idxs] + frac * dx
-    Ys = ys[idxs] + frac * dy
-
-    return Xs, Ys, targets  # metric XY and local cumulative (0..L)
+    out = []
+    for t in targets:
+        idx = int(np.searchsorted(cum, t, side="right") - 1)
+        idx = max(0, min(idx, len(coords_ll) - 2))
+        seg_len = cum[idx + 1] - cum[idx]
+        if seg_len <= 0:
+            out.append(coords_ll[idx])
+            continue
+        frac = (t - cum[idx]) / seg_len
+        lon0, lat0 = coords_ll[idx]
+        lon1, lat1 = coords_ll[idx + 1]
+        # Linear in lon/lat is a good approximation at these tiny segments
+        lon = lon0 + frac * (lon1 - lon0)
+        lat = lat0 + frac * (lat1 - lat0)
+        out.append((lon, lat))
+    return out
 
 # =========================================
 # MAPBOX TERRAIN-RGB (bilinear)
@@ -234,7 +270,7 @@ class TerrainTileCache:
         p00 = decode_terrain_rgb(*arr[y0, x0])
         p10 = decode_terrain_rgb(*arr[y0, x1])
         p01 = decode_terrain_rgb(*arr[y1, x0])
-        p11 = decode_terrain_rgb(*arr[y1, y1 if False else x1])  # safe index
+        p11 = decode_terrain_rgb(*arr[y1, x1])
         elev = (
             p00 * (1 - dx) * (1 - dy)
             + p10 * dx * (1 - dy)
@@ -273,27 +309,27 @@ if uploaded_file:
     if not centerline_ll or len(agms) < 2:
         st.warning("Missing CENTERLINE or insufficient AGM points.")
     else:
-        # Metric CRS for exact linear referencing and snapping
+        # Local metric CRS for precise snapping/linear ref
         try:
             crs_metric = get_local_utm_crs(centerline_ll)
         except Exception:
-            crs_metric = CRS.from_epsg(5070)  # fallback (CONUS Albers)
+            crs_metric = CRS.from_epsg(5070)  # fallback CONUS Albers
         xf_ll_to_m = transformer_ll_to(crs_metric)
         xf_m_to_ll = transformer_to_ll(crs_metric)
 
-        # Centerline -> metric (optionally simplify to remove micro wiggles)
+        # Centerline in metric (optionally simplify to remove micro-noise)
         cl_m = transform_linestring(centerline_ll, xf_ll_to_m)
         if simplify_tolerance_m > 0.0:
             cl_m = cl_m.simplify(simplify_tolerance_m, preserve_topology=False)
 
-        # Vertex arrays + cumulative meters along the whole centerline
+        # Vertex arrays + cumulative meters
         xs_m, ys_m, cum_m = build_vertex_arrays_metric(cl_m)
 
-        # Snap AGMs orthogonally to the metric centerline and record measures s (meters)
+        # Snap AGMs orthogonally to metric centerline, record measure s (meters)
         snapped = []
         for name, pt_ll in agms:
             pt_m = transform_point(pt_ll, xf_ll_to_m)
-            s = cl_m.project(pt_m)  # meters from start
+            s = cl_m.project(pt_m)
             xS, yS, _ = interpolate_point_on_polyline(xs_m, ys_m, cum_m, s)
             lon_s, lat_s = xf_m_to_ll.transform(xS, yS)
             snapped.append((name, Point(lon_s, lat_s), s))
@@ -313,30 +349,30 @@ if uploaded_file:
                 skipped += 1
                 continue
 
-            # ----- EXACT 2D distance along line (meters) -----
-            L2D_m = float(abs(s2 - s1))  # exact linear-referenced length
-            # Build evenly spaced samples so horizontal deltas sum to L2D_m exactly
-            Xs, Ys, targets = linear_reference_samples(xs_m, ys_m, cum_m, s1, s2, interp_spacing_m)
+            # --- Get exact sub-polyline in METRIC coordinates (s1..s2)
+            Xs_slice, Ys_slice = slice_polyline_by_measures(xs_m, ys_m, cum_m, s1, s2)
 
-            # Transform samples back to lon/lat for elevation lookup
-            lons, lats = xf_m_to_ll.transform(Xs.tolist(), Ys.tolist())
-            pts_ll = list(zip(lons, lats))
+            # --- Convert that slice to lon/lat control points
+            lons_ctrl, lats_ctrl = xf_m_to_ll.transform(Xs_slice.tolist(), Ys_slice.tolist())
+            coords_ll_slice = list(zip(lons_ctrl, lats_ctrl))
 
-            # Elevation profile
-            elevs = smooth_elevations(get_elevations_ll(pts_ll, tile_cache), smooth_window)
+            # --- Resample ALONG GEODESIC ARCLENGTH (this fixes 2D baseline to GE's)
+            samples_ll = resample_polyline_geodesic(coords_ll_slice, interp_spacing_m)
 
-            # 3D distance: keep horizontal step fixed = diff(targets) (exactly sums to L2D_m)
+            # --- Elevations at samples
+            elevations = smooth_elevations(get_elevations_ll(samples_ll, tile_cache), smooth_window)
+
+            # --- 3D length: sum sqrt( (geodesic_dxy)^2 + dz^2 ) between successive samples
             dist_m = 0.0
-            for j in range(len(targets) - 1):
-                dh = float(targets[j + 1] - targets[j])  # meters (exact)
-                dz = float(elevs[j + 1] - elevs[j])
-                dist_m += math.sqrt(dh * dh + dz * dz)
+            for j in range(len(samples_ll) - 1):
+                dxy = geodesic_segment_m(samples_ll[j], samples_ll[j + 1])
+                dz = elevations[j + 1] - elevations[j]
+                dist_m += math.sqrt(dxy * dxy + dz * dz)
 
-            # If only one step (short segment), ensure at least 2 samples
-            if len(targets) == 1:
-                dist_m = L2D_m  # no vertical info; fallback to 2D
+            # If the segment was too short for spacing (1 point), fall back to straight-line
+            if len(samples_ll) == 1:
+                dist_m = 0.0
 
-            # Convert / accumulate
             dist_ft = dist_m * FT_PER_M
             dist_mi = dist_ft * MI_PER_FT
             cumulative_miles += dist_mi

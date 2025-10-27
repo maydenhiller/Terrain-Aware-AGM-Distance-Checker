@@ -1,4 +1,4 @@
-# Terrain-Aware AGM Distance Calculator — Final Geodesic 3D Build
+# Terrain-Aware AGM Distance Calculator — Final Geodesic 3D Build (Auto-Detect Parser)
 # Requirements: same as before (no new libraries)
 
 import math, io, zipfile, requests, xml.etree.ElementTree as ET
@@ -9,7 +9,7 @@ from pyproj import CRS, Transformer, Geod
 
 # --- CONFIG
 st.set_page_config(page_title="Terrain-Aware AGM Distance Calculator", layout="wide")
-st.title("Terrain-Aware AGM Distance Calculator (Geodesic 3D, Accurate)")
+st.title("Terrain-Aware AGM Distance Calculator (Geodesic 3D, Auto-Detect)")
 
 MAPBOX_TOKEN = st.secrets["mapbox"]["token"]
 TERRAIN_TILE_URL = "https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}.pngraw"
@@ -26,7 +26,7 @@ with st.sidebar:
     simplify_tolerance_m = st.slider("Simplify centerline parts (m)", 0.0, 5.0, 0.0, 0.5)
     st.caption("zoom 17, spacing 1 m, smoothing ≈ 7 gives best accuracy")
 
-# --- PARSE KML/KMZ
+# --- PARSE KML/KMZ (Auto Detect)
 def agm_sort_key(n_g):
     n = n_g[0]
     d = ''.join(filter(str.isdigit, n))
@@ -35,41 +35,57 @@ def agm_sort_key(n_g):
     return (b, s)
 
 def parse_kml_kmz(uploaded):
+    """Auto-detect AGMs and Centerline geometries from KML/KMZ"""
     if uploaded.name.endswith(".kmz"):
         with zipfile.ZipFile(uploaded) as zf:
-            kmlf = next((f for f in zf.namelist() if f.endswith(".kml")), None)
-            if not kmlf: return [], []
-            with zf.open(kmlf) as f: kml = f.read()
+            kml_file = next((f for f in zf.namelist() if f.endswith(".kml")), None)
+            if not kml_file:
+                return [], []
+            with zf.open(kml_file) as f:
+                kml_data = f.read()
     else:
-        kml = uploaded.read()
+        kml_data = uploaded.read()
 
-    root = ET.fromstring(kml)
+    root = ET.fromstring(kml_data)
     ns = {"kml": "http://www.opengis.net/kml/2.2"}
-    agms, parts = [], []
 
-    for folder in root.findall(".//kml:Folder", ns):
-        name_el = folder.find("kml:name", ns)
-        if not name_el or not name_el.text: continue
-        name = name_el.text.strip().lower()
-        if name == "agms":
-            for pm in folder.findall("kml:Placemark", ns):
-                nm = pm.find("kml:name", ns)
-                cr = pm.find(".//kml:coordinates", ns)
-                if not nm or not cr: continue
+    agms = []
+    parts = []
+
+    # --- Find all Placemarks anywhere in the document
+    for placemark in root.findall(".//kml:Placemark", ns):
+        name_el = placemark.find("kml:name", ns)
+        coords_el = placemark.find(".//kml:coordinates", ns)
+        linestr = placemark.find(".//kml:LineString", ns)
+        point = placemark.find(".//kml:Point", ns)
+        if coords_el is None:
+            continue
+
+        coords_text = coords_el.text.strip()
+        if not coords_text:
+            continue
+
+        # If it’s a single coordinate → AGM point
+        coord_pairs = coords_text.split()
+        if len(coord_pairs) == 1 or point is not None:
+            try:
+                lon, lat, *_ = map(float, coord_pairs[0].split(","))
+                nm = name_el.text.strip() if name_el is not None else f"AGM_{len(agms)}"
+                agms.append((nm, Point(lon, lat)))
+            except Exception:
+                continue
+        # If it’s a LineString with many coordinates → centerline
+        elif linestr is not None or len(coord_pairs) > 2:
+            pts = []
+            for pair in coord_pairs:
                 try:
-                    lon, lat, *_ = map(float, cr.text.strip().split(","))
-                    agms.append((nm.text.strip(), Point(lon, lat)))
-                except: continue
-        elif name == "centerline":
-            for pm in folder.findall("kml:Placemark", ns):
-                cr = pm.find(".//kml:coordinates", ns)
-                if not cr: continue
-                pts = []
-                for pair in cr.text.strip().split():
                     lon, lat, *_ = map(float, pair.split(","))
                     pts.append((lon, lat))
-                if len(pts) >= 2:
-                    parts.append(LineString(pts))
+                except:
+                    pass
+            if len(pts) >= 2:
+                parts.append(LineString(pts))
+
     agms.sort(key=agm_sort_key)
     return agms, parts
 

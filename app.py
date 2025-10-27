@@ -1,58 +1,60 @@
 # app.py
-# Terrain-Aware AGM Distance Calculator (Optimized)
-# --------------------------------------------------
-# • Parallel elevation fetch (#1)
-# • Faster in-memory caching (#2)
-# • Duplicate-pixel skip (#3)
-# • Thread pool tuning (#4)
-# • No accuracy loss
+# Terrain-Aware AGM Distance Calculator — FAST (no accuracy loss)
+# - Bulk elevation per tile (group points by tile; 1 HTTP fetch per tile)
+# - No per-point network calls
+# - Persistent in-memory cache between reruns (st.session_state)
+# - Accurate 3D distance (geodesic XY + Terrain-RGB Z)
+# - Centerline slicing in local meter CRS (no degree-scale error)
+# - Ignore AGMs starting with "SP"; snap AGMs to centerline
+# - Clear Mapbox 401/403/429 handling
 
 import io
 import math
 import time
 import zipfile
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 from PIL import Image
-from pyproj import Geod, Transformer
 from shapely.geometry import LineString, Point
+from pyproj import Geod, Transformer
 
 # ---------------- CONFIG ----------------
-st.set_page_config("Terrain AGM Distance", layout="wide")
-st.title("📏 Terrain-Aware AGM Distance Calculator (Optimized)")
+st.set_page_config("Terrain AGM Distance — FAST", layout="wide")
+st.title("📏 Terrain-Aware AGM Distance Calculator — FAST")
 
 MAPBOX_TOKEN = st.secrets.get("MAPBOX_TOKEN", "")
-MAPBOX_ZOOM = 14
-RESAMPLE_M = 10
-SMOOTH_WINDOW = 40
-DZ_THRESH = 0.5
+MAPBOX_ZOOM = 14            # keep 14 for good vertical detail; change if YOU want
+RESAMPLE_M = 10            # sampling step along centerline (meters)
+SMOOTH_WINDOW = 40         # moving-average window for elevation (meters)
+DZ_THRESH = 0.5            # ignore vertical jitter < 0.5 m
 FT_PER_M = 3.28084
 GEOD = Geod(ellps="WGS84")
-MAX_SNAP_M = 80
-MAX_WORKERS = 12   # ← adjust for available cores or rate limits
+MAX_SNAP_M = 80            # max snap offset for AGMs (meters)
 
-# ---------------- TERRAIN ----------------
+# ---------------- TERRAIN CACHE (tile-based) ----------------
 class TerrainCache:
-    """Mapbox Terrain-RGB tile cache (v1 endpoint) with thread-safe access."""
+    """Mapbox Terrain-RGB tile cache (v1 endpoint), tile-array based."""
     def __init__(self, token: str, zoom: int):
         self.token = token
         self.zoom = int(zoom)
-        self.cache = {}
-        self._dedup_cache = {}
+        self.tiles = {}  # {(z,x,y): np.ndarray uint8 [256,256,3]}
 
     @staticmethod
-    def _decode_rgb(r, g, b) -> float:
-        return -10000.0 + (int(r) * 256 * 256 + int(g) * 256 + int(b)) * 0.1
+    def decode_rgb_arr(rgb_arr: np.ndarray) -> np.ndarray:
+        # rgb_arr shape: (..., 3)
+        r = rgb_arr[..., 0].astype(np.int64)
+        g = rgb_arr[..., 1].astype(np.int64)
+        b = rgb_arr[..., 2].astype(np.int64)
+        return -10000.0 + (r * 256 * 256 + g * 256 + b) * 0.1
 
-    def _fetch(self, z: int, x: int, y: int):
+    def fetch_tile(self, z: int, x: int, y: int) -> np.ndarray | None:
         key = (z, x, y)
-        if key in self.cache:
-            return self.cache[key]
+        if key in self.tiles:
+            return self.tiles[key]
         url = f"https://api.mapbox.com/v1/mapbox/terrain-rgb/{z}/{x}/{y}.pngraw"
         try:
             r = requests.get(url, params={"access_token": self.token}, timeout=12)
@@ -63,54 +65,94 @@ class TerrainCache:
             st.error("❌ Mapbox 401 Unauthorized — check MAPBOX_TOKEN and Tilesets scope.")
             st.stop()
         if r.status_code == 403:
-            st.error("❌ Mapbox 403 Forbidden — token lacks tileset access or domain restrictions.")
+            st.error("❌ Mapbox 403 Forbidden — token lacks tileset access or has domain restrictions.")
             st.stop()
         if r.status_code == 429:
-            print("⚠ Mapbox 429 rate limit — pausing briefly")
+            # gentle backoff, caller may retry group
+            print("⚠ Mapbox 429 rate limit — backing off 2s")
             time.sleep(2)
             return None
         if r.status_code != 200:
-            print(f"[Mapbox HTTP {r.status_code}] for tile {z}/{x}/{y}")
+            print(f"[Mapbox HTTP {r.status_code}] tile {z}/{x}/{y}")
             return None
         arr = np.asarray(Image.open(io.BytesIO(r.content)).convert("RGB"), dtype=np.uint8)
-        self.cache[key] = arr
+        # Safety: some rare responses can be <256 — guard
+        if arr.shape[0] != 256 or arr.shape[1] != 256:
+            print(f"[Mapbox tile size unexpected] {arr.shape} for {z}/{x}/{y}")
+            return None
+        self.tiles[key] = arr
         return arr
 
-    def elev(self, lon: float, lat: float) -> float:
-        """Return interpolated elevation for lon/lat (meters)."""
-        n = 2 ** self.zoom
-        xt = (lon + 180.0) / 360.0 * n
-        lat_r = math.radians(lat)
-        yt = (1.0 - math.log(math.tan(lat_r) + 1.0 / math.cos(lat_r)) / math.pi) / 2.0 * n
-        x, y = int(xt), int(yt)
-        arr = self._fetch(self.zoom, x, y)
-        if arr is None:
-            return 0.0
-        xp = (xt - x) * 255.0
-        yp = (yt - y) * 255.0
-        x0 = max(0, min(255, int(xp)))
-        y0 = max(0, min(255, int(yp)))
-        key = (self.zoom, x, y, x0, y0)
-        if key in self._dedup_cache:  # ← skip duplicate pixel lookups
-            return self._dedup_cache[key]
-        x1 = min(255, x0 + 1)
-        y1 = min(255, y0 + 1)
-        dx = xp - x0
-        dy = yp - y0
-        r00, g00, b00 = arr[y0, x0]
-        r10, g10, b10 = arr[y0, x1]
-        r01, g01, b01 = arr[y1, x0]
-        r11, g11, b11 = arr[y1, x1]
-        e00 = self._decode_rgb(r00, g00, b00)
-        e10 = self._decode_rgb(r10, g10, b10)
-        e01 = self._decode_rgb(r01, g01, b01)
-        e11 = self._decode_rgb(r11, g11, b11)
-        val = float(e00 * (1 - dx) * (1 - dy) +
-                    e10 * dx * (1 - dy) +
-                    e01 * (1 - dx) * dy +
-                    e11 * dx * dy)
-        self._dedup_cache[key] = val
-        return val
+    # -------- BULK elevation for many points at once (SPEED) --------
+    def elevations_bulk(self, lons: np.ndarray, lats: np.ndarray) -> np.ndarray:
+        """
+        Compute elevations for arrays of lon/lat (same length), using:
+        - single fetch per tile
+        - vectorized bilinear within tile
+        Returns np.ndarray of shape (N,) in meters.
+        """
+        z = self.zoom
+        n = float(2 ** z)
+
+        # Compute tile coordinates (vectorized)
+        xt = (lons + 180.0) / 360.0 * n
+        lat_r = np.radians(lats)
+        yt = (1.0 - np.log(np.tan(lat_r) + 1.0 / np.cos(lat_r)) / math.pi) / 2.0 * n
+
+        x_tile = np.floor(xt).astype(np.int64)
+        y_tile = np.floor(yt).astype(np.int64)
+        xp = (xt - x_tile) * 255.0
+        yp = (yt - y_tile) * 255.0
+
+        # Pre-allocate result
+        out = np.zeros_like(lons, dtype=np.float64)
+
+        # Group by tile (x_tile, y_tile) to fetch once
+        # Build mapping from tile -> indices
+        tile_keys = {}
+        for idx, (xx, yy) in enumerate(zip(x_tile, y_tile)):
+            key = (z, int(xx), int(yy))
+            if key not in tile_keys:
+                tile_keys[key] = []
+            tile_keys[key].append(idx)
+
+        # Process each tile group
+        for key, idxs in tile_keys.items():
+            arr = self.fetch_tile(*key)
+            idxs = np.array(idxs, dtype=np.int64)
+            if arr is None:
+                # leave zeros at these positions
+                continue
+
+            # Per-point pixel indices in this tile
+            x0 = np.clip(xp[idxs].astype(np.int64), 0, 255)
+            y0 = np.clip(yp[idxs].astype(np.int64), 0, 255)
+            x1 = np.clip(x0 + 1, 0, 255)
+            y1 = np.clip(y0 + 1, 0, 255)
+            dx = xp[idxs] - x0
+            dy = yp[idxs] - y0
+
+            # Gather 4 corners (vectorized advanced indexing)
+            p00 = arr[y0, x0]
+            p10 = arr[y0, x1]
+            p01 = arr[y1, x0]
+            p11 = arr[y1, x1]
+
+            e00 = self.decode_rgb_arr(p00)
+            e10 = self.decode_rgb_arr(p10)
+            e01 = self.decode_rgb_arr(p01)
+            e11 = self.decode_rgb_arr(p11)
+
+            # Bilinear interpolation
+            vals = (
+                e00 * (1 - dx) * (1 - dy) +
+                e10 * dx * (1 - dy) +
+                e01 * (1 - dx) * dy +
+                e11 * dx * dy
+            )
+            out[idxs] = vals
+
+        return out
 
 # ---------------- HELPERS ----------------
 def smooth_moving_average(a: np.ndarray, window_m: float, spacing_m: float) -> np.ndarray:
@@ -214,7 +256,7 @@ to_m, to_ll = build_local_meter_crs(line_ll)
 X_m, Y_m = to_m.transform(*zip(*line_ll.coords))
 line_m = LineString(list(zip(X_m, Y_m)))
 
-# --- Persistent Mapbox cache between runs ---
+# Persistent cache between reruns
 if "cache" not in st.session_state:
     st.session_state.cache = TerrainCache(MAPBOX_TOKEN, MAPBOX_ZOOM)
 cache = st.session_state.cache
@@ -230,12 +272,14 @@ for i in range(total):
     n2, a2 = agms[i + 1]
     status.text(f"⏱ Calculating {n1} → {n2} ({i + 1}/{total}) …")
     bar.progress((i + 1) / max(1, total))
+
+    # Snap endpoints to centerline (in meters) and check offset
     p1_m = Point(*to_m.transform(a1.x, a1.y))
     p2_m = Point(*to_m.transform(a2.x, a2.y))
-    off1 = snap_offset_m(line_m, p1_m)
-    off2 = snap_offset_m(line_m, p2_m)
-    if off1 > MAX_SNAP_M or off2 > MAX_SNAP_M:
+    if snap_offset_m(line_m, p1_m) > MAX_SNAP_M or snap_offset_m(line_m, p2_m) > MAX_SNAP_M:
         continue
+
+    # Slice centerline in meters and sample uniformly
     s1 = line_m.project(p1_m)
     s2 = line_m.project(p2_m)
     s_lo, s_hi = sorted((s1, s2))
@@ -244,26 +288,20 @@ for i in range(total):
     si = np.arange(s_lo, s_hi, RESAMPLE_M)
     if si.size == 0 or si[-1] < s_hi:
         si = np.append(si, s_hi)
+
     pts_m = [line_m.interpolate(s) for s in si]
-    pts_ll = [to_ll.transform(p.x, p.y) for p in pts_m]
+    pts_ll = np.array([to_ll.transform(p.x, p.y) for p in pts_m], dtype=float)  # shape (N, 2)
 
-    # Parallel elevation fetch (#1)
-    elev = [0.0] * len(pts_ll)
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_map = {executor.submit(cache.elev, lon, lat): idx for idx, (lon, lat) in enumerate(pts_ll)}
-        for fut in as_completed(future_map):
-            idx = future_map[fut]
-            try:
-                elev[idx] = fut.result()
-            except Exception:
-                elev[idx] = 0.0
+    # ---- BULK elevation lookup (single fetch per tile) ----
+    elev = cache.elevations_bulk(pts_ll[:, 0], pts_ll[:, 1])
+    elev = smooth_moving_average(elev, SMOOTH_WINDOW, RESAMPLE_M)
 
-    elev = smooth_moving_average(np.asarray(elev, dtype=float), SMOOTH_WINDOW, RESAMPLE_M)
+    # 3D distance accumulate
     dist_m = 0.0
     for j in range(len(pts_ll) - 1):
         lon1, lat1 = pts_ll[j]
         lon2, lat2 = pts_ll[j + 1]
-        _, _, dxy = GEOD.inv(lon1, lat1, lon2, lat2)
+        _, _, dxy = GEOD.inv(lon1, lat1, lon2, lat2)  # meters (geodesic)
         dz = elev[j + 1] - elev[j]
         if abs(dz) < DZ_THRESH:
             dz = 0.0

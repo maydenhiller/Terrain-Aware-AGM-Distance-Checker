@@ -1,6 +1,6 @@
 import streamlit as st, pandas as pd, numpy as np, math, io, zipfile, xml.etree.ElementTree as ET, requests, time
 from shapely.geometry import Point, LineString
-from pyproj import Transformer, Geod
+from pyproj import Geod
 from PIL import Image
 
 # ---------------- CONFIG ----------------
@@ -12,7 +12,7 @@ FT_PER_M = 3.28084
 DZ_THRESH = 0.5
 GEOD = Geod(ellps="WGS84")
 
-# ---------------- TERRAIN CACHE (patched for Mapbox v1) ----------------
+# ---------------- TERRAIN CACHE (v1 endpoint + token checks) ----------------
 class TerrainCache:
     def __init__(self, token, zoom):
         self.token = token
@@ -23,7 +23,6 @@ class TerrainCache:
         key = (z, x, y)
         if key in self.cache:
             return self.cache[key]
-
         url = f"https://api.mapbox.com/v1/mapbox/terrain-rgb/{z}/{x}/{y}.pngraw"
         try:
             r = requests.get(url, params={"access_token": self.token}, timeout=10)
@@ -33,16 +32,15 @@ class TerrainCache:
 
         if r.status_code == 401:
             st.error(
-                "❌ Mapbox returned 401 Unauthorized — your MAPBOX_TOKEN is invalid, missing, or "
-                "does not include 'Downloads: Tilesets' scope. "
-                "Go to https://account.mapbox.com → Access Tokens → Create token → Enable Tilesets."
+                "❌ Mapbox returned 401 Unauthorized — check MAPBOX_TOKEN in secrets "
+                "and ensure it has 'Downloads: Tilesets' scope."
             )
             st.stop()
         elif r.status_code == 403:
-            st.error("❌ Mapbox 403 Forbidden — token domain restriction or tileset access missing.")
+            st.error("❌ Mapbox 403 Forbidden — token lacks tileset access or domain restrictions.")
             st.stop()
         elif r.status_code == 429:
-            st.warning("⚠ Mapbox rate limit hit — retrying...")
+            print("⚠ Rate limit hit; retrying...")
             time.sleep(2)
             return None
         elif r.status_code != 200:
@@ -66,17 +64,15 @@ class TerrainCache:
         r, g, b = arr[min(ry, 255), min(rx, 255)]
         return -10000 + (r * 256 * 256 + g * 256 + b) * 0.1
 
-
 # ---------------- HELPERS ----------------
 def smooth(a, win, dx):
-    if len(a) < 3: 
+    if len(a) < 3:
         return a
     n = max(3, int(round(win / dx)))
     if n % 2 == 0:
         n += 1
     k = np.ones(n) / n
     return np.convolve(a, k, "same")
-
 
 def parse(file):
     """Parse AGMs and CENTERLINE from a KML or KMZ file."""
@@ -93,7 +89,7 @@ def parse(file):
 
     for pm in root.findall(".//kml:Folder[kml:name='AGMs']/kml:Placemark", ns):
         name = pm.findtext("kml:name", "", ns).strip()
-        if name.startswith("SP"):  # ignore SP-prefixed AGMs
+        if name.startswith("SP"):
             continue
         c = pm.find(".//kml:coordinates", ns)
         if c is not None:
@@ -115,7 +111,6 @@ def parse(file):
 
     return agms, lines
 
-
 # ---------------- STREAMLIT UI ----------------
 st.set_page_config("Terrain AGM Distance", layout="wide")
 st.title("📏 Terrain-Aware AGM Distance Calculator")
@@ -130,16 +125,8 @@ if not agms or not lines:
     st.warning("Need both AGMs and CENTERLINE folders.")
     st.stop()
 
-xf_fwd = Transformer.from_crs("epsg:4326", "epsg:3857", always_xy=True)
-xf_inv = Transformer.from_crs("epsg:3857", "epsg:4326", always_xy=True)
-
-parts_m = []
-for p in lines:
-    if p.length > 0:
-        x, y = xf_fwd.transform(*p.xy)
-        parts_m.append(LineString(list(zip(x, y))))
-
 cache = TerrainCache(MAPBOX_TOKEN, MAPBOX_ZOOM)
+
 rows, cum_mi = [], 0.0
 bar = st.progress(0)
 msg = st.empty()
@@ -151,11 +138,8 @@ for i in range(total):
     msg.text(f"⏱ Calculating {n1} → {n2} ({i + 1}/{total}) …")
     bar.progress((i + 1) / total)
 
-    p1 = Point(xf_fwd.transform(a1.x, a1.y))
-    p2 = Point(xf_fwd.transform(a2.x, a2.y))
-    part = parts_m[0]
-
-    s1, s2 = part.project(p1), part.project(p2)
+    line_ll = lines[0]
+    s1, s2 = line_ll.project(a1), line_ll.project(a2)
     s_lo, s_hi = sorted((s1, s2))
     if s_hi - s_lo <= 0:
         continue
@@ -163,33 +147,29 @@ for i in range(total):
     si = np.arange(s_lo, s_hi, RESAMPLE_M)
     if si.size == 0 or si[-1] < s_hi:
         si = np.append(si, s_hi)
+    pts = [line_ll.interpolate(v) for v in si]
+    pts_ll = [(p.x, p.y) for p in pts]
 
-    x, y = np.asarray(part.xy[0]), np.asarray(part.xy[1])
-    s = np.concatenate([[0], np.cumsum(np.hypot(np.diff(x), np.diff(y)))])
-    xi, yi = np.interp(si, s, x), np.interp(si, s, y)
-    xi, yi = smooth(xi, SMOOTH_WINDOW, RESAMPLE_M), smooth(yi, SMOOTH_WINDOW, RESAMPLE_M)
-
-    lons, lats = xf_inv.transform(xi.tolist(), yi.tolist())
-    pts = list(zip(lons, lats))
-    elev = [cache.elev(lo, la) for lo, la in pts]
+    elev = [cache.elev(lon, lat) for lon, lat in pts_ll]
     elev = smooth(np.array(elev), SMOOTH_WINDOW, RESAMPLE_M)
 
-    dist = 0.0
-    for j in range(len(pts) - 1):
-        lon1, lat1 = pts[j]
-        lon2, lat2 = pts[j + 1]
+    dist_m = 0.0
+    for j in range(len(pts_ll) - 1):
+        lon1, lat1 = pts_ll[j]
+        lon2, lat2 = pts_ll[j + 1]
         _, _, dxy = GEOD.inv(lon1, lat1, lon2, lat2)
         dz = elev[j + 1] - elev[j]
         if abs(dz) < DZ_THRESH:
             dz = 0
-        dist += math.hypot(dxy, dz)
+        dist_m += math.hypot(dxy, dz)
 
-    ft, mi = dist * FT_PER_M, dist * FT_PER_M / 5280
+    ft = dist_m * FT_PER_M
+    mi = ft / 5280
     cum_mi += mi
     rows.append({
         "From AGM": n1,
         "To AGM": n2,
-        "Feet": round(ft, 1),
+        "Feet": round(ft, 2),
         "Miles": round(mi, 4),
         "Cumulative": round(cum_mi, 4)
     })

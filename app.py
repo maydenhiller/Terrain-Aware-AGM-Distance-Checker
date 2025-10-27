@@ -1,10 +1,10 @@
-# Terrain-Aware AGM Distance Calculator — Accurate 3D
-# Key fixes vs prior builds:
-#  - DEM-aware sampling step (>= ~1.5× meters-per-pixel) to avoid noise-driven path inflation
-#  - Two-stage elevation smoothing (median -> moving average)
-#  - Optional supersampled elevation per point (center + 4 offsets)
-#  - Exact linear-referenced slicing on a single, correct centerline part
-#  - AGM snap is orthogonal in a local metric CRS
+# app.py
+# Terrain-Aware AGM Distance Calculator — Geodesic-only snap/slice + true 3D integration
+# - No UTM used for length; only for nothing (we removed projection-based slicing entirely)
+# - Centerline parts are densified by geodesic arclength (default 5 m)
+# - AGMs snap to nearest densified vertex on a single best-matching part
+# - Slice between snapped indices; resample by DEM-aware spacing
+# - 3D distance = sum sqrt( geodesic_dxy^2 + dz^2 )
 
 import math
 import io
@@ -17,51 +17,29 @@ import pandas as pd
 import numpy as np
 from PIL import Image
 from shapely.geometry import Point, LineString
-from shapely.ops import substring
-from pyproj import CRS, Transformer
+from pyproj import Geod
 
 # =========================
 # CONFIG / UI
 # =========================
 
 st.set_page_config(page_title="Terrain-Aware AGM Distance Calculator", layout="wide")
-st.title("Terrain-Aware AGM Distance Calculator (Accurate 3D with DEM-aware sampling)")
+st.title("Terrain-Aware AGM Distance Calculator (Geodesic Snap/Slice + True 3D)")
 
 MAPBOX_TOKEN = st.secrets["mapbox"]["token"]
 TERRAIN_TILE_URL = "https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}.pngraw"
+GEOD = Geod(ellps="WGS84")
 
 with st.sidebar:
     st.header("Settings")
     mapbox_zoom = st.slider("Terrain tile zoom", 15, 17, 17)
-    interp_spacing_m_ui = st.slider(
-        "Requested sampling spacing along path (m)",
-        0.5, 10.0, 1.0, 0.5,
-        help="Actual spacing will be max(this, DEM-based min) to avoid elevation noise."
-    )
-    smooth_median_window = st.slider(
-        "Elevation median window (samples)",
-        1, 25, 9, 2,
-        help="Robust denoising. Use odd numbers; 9–15 is a good start. 1 disables."
-    )
-    smooth_mean_window = st.slider(
-        "Elevation moving-average window (samples)",
-        1, 25, 7, 2,
-        help="Second pass smoothing. 5–11 is typical. 1 disables."
-    )
-    supersample = st.checkbox(
-        "Supersample elevation per point (center + 4 offsets)", value=True,
-        help="Stabilizes elevations at pixel/tile seams (light extra cost)."
-    )
-    simplify_tolerance_m = st.slider(
-        "Simplify each centerline part (m)",
-        0.0, 5.0, 0.0, 0.5,
-        help="Optional: remove micro-wiggles. 0 = off."
-    )
-    snap_max_offset_m = st.slider(
-        "Max AGM snap offset (m)", 5.0, 150.0, 60.0, 5.0,
-        help="Skip a segment if an AGM lies farther than this from every centerline part."
-    )
-    st.caption("Best results: zoom=17, spacing≈auto, median 9–15, mean 5–11, supersample ON.")
+    densify_step_m = st.slider("Centerline densify step (m)", 2.0, 20.0, 5.0, 1.0)
+    requested_spacing_m = st.slider("Requested sampling spacing (m)", 0.5, 10.0, 1.0, 0.5)
+    snap_max_offset_m = st.slider("Max AGM snap offset (m)", 5.0, 150.0, 60.0, 5.0)
+    supersample = st.checkbox("Supersample elevation per sample (center + 4 offsets)", value=True)
+    median_win = st.slider("Elevation median window (samples)", 1, 25, 9, 2)
+    mean_win = st.slider("Elevation moving-average window (samples)", 1, 25, 7, 2)
+    st.caption("Best results: densify=5 m, zoom=17, spacing≈auto, median 9–15, mean 5–11, supersample ON.")
 
 FT_PER_M = 3.28084
 MI_PER_FT = 1.0 / 5280.0
@@ -94,7 +72,7 @@ def parse_kml_kmz(uploaded_file):
     ns = {"kml": "http://www.opengis.net/kml/2.2"}
 
     agms = []
-    parts = []  # collect each Placemark polyline separately
+    parts = []
 
     for folder in root.findall(".//kml:Folder", ns):
         name_el = folder.find("kml:name", ns)
@@ -130,94 +108,59 @@ def parse_kml_kmz(uploaded_file):
     return agms, parts
 
 # =========================
-# CRS / TRANSFORMS
+# GEODESIC HELPERS
 # =========================
 
-def get_local_utm_crs(lines_ll) -> CRS:
-    """Pick a local UTM based on all centerline parts."""
-    xs = []
-    ys = []
-    for ls in lines_ll:
-        xs.extend([c[0] for c in ls.coords])
-        ys.extend([c[1] for c in ls.coords])
-    cx = float(np.mean(xs))
-    cy = float(np.mean(ys))
-    zone = int((cx + 180.0) / 6.0) + 1
-    is_north = cy >= 0.0
-    epsg = 32600 + zone if is_north else 32700 + zone
-    return CRS.from_epsg(epsg)
+def geodesic_segment_m(p0, p1):
+    lon1, lat1 = p0
+    lon2, lat2 = p1
+    _, _, d = GEOD.inv(lon1, lat1, lon2, lat2)
+    return float(d)
 
-def transformer_ll_to(crs: CRS) -> Transformer:
-    return Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+def meters_per_pixel(lat_deg, z):
+    # Web Mercator ground resolution
+    return (INITIAL_RES_M_PER_PX * math.cos(math.radians(lat_deg))) / (2 ** z)
 
-def transformer_to_ll(crs: CRS) -> Transformer:
-    return Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+def densify_polyline_geodesic(coords_ll, step_m):
+    """Return a densified lon/lat polyline at ~step_m geodesic spacing (includes endpoints)."""
+    if len(coords_ll) < 2:
+        return coords_ll
+    out = [coords_ll[0]]
+    for i in range(len(coords_ll) - 1):
+        a = coords_ll[i]
+        b = coords_ll[i + 1]
+        seg_len = geodesic_segment_m(a, b)
+        if seg_len <= 0:
+            continue
+        n = max(int(seg_len // step_m), 1)
+        # linear in lon/lat is fine for tiny steps; GEOD.npts could also be used
+        for k in range(1, n):
+            t = k / n
+            lon = a[0] + t * (b[0] - a[0])
+            lat = a[1] + t * (b[1] - a[1])
+            out.append((lon, lat))
+        out.append(b)
+    # dedupe possible duplicates
+    dedup = [out[0]]
+    for p in out[1:]:
+        if p != dedup[-1]:
+            dedup.append(p)
+    return dedup
 
-def transform_linestring(ls: LineString, xf: Transformer) -> LineString:
-    xs, ys = zip(*ls.coords)
-    X, Y = xf.transform(xs, ys)
-    return LineString(list(zip(X, Y)))
-
-def transform_point(pt: Point, xf: Transformer) -> Point:
-    x, y = xf.transform(pt.x, pt.y)
-    return Point(x, y)
-
-# =========================
-# LINEAR REFERENCING (metric)
-# =========================
-
-def build_vertex_arrays_metric(centerline_m: LineString):
-    coords = list(centerline_m.coords)
-    xs = np.array([c[0] for c in coords], dtype=float)
-    ys = np.array([c[1] for c in coords], dtype=float)
-    dxy = np.hypot(np.diff(xs), np.diff(ys))
-    cum = np.concatenate([[0.0], np.cumsum(dxy)])
-    return xs, ys, cum
-
-def interpolate_point_on_polyline(xs, ys, cum, s):
-    if s <= 0:
-        return float(xs[0]), float(ys[0]), 0
-    if s >= cum[-1]:
-        return float(xs[-1]), float(ys[-1]), len(xs) - 2
-    idx = int(np.searchsorted(cum, s) - 1)
-    idx = max(0, min(idx, len(xs) - 2))
-    seg_len = cum[idx + 1] - cum[idx]
-    if seg_len <= 0:
-        return float(xs[idx]), float(ys[idx]), idx
-    t = (s - cum[idx]) / seg_len
-    x = xs[idx] + t * (xs[idx + 1] - xs[idx])
-    y = ys[idx] + t * (ys[idx + 1] - ys[idx])
-    return float(x), float(y), idx
-
-def linear_reference_samples(xs, ys, cum, s0, s1, spacing_m):
-    """Even samples along metric polyline between s0..s1.
-       Horizontal sum will equal |s1 - s0| exactly."""
-    s_lo, s_hi = (s0, s1) if s0 <= s1 else (s1, s0)
-    L = float(abs(s1 - s0))
-    if L <= 0:
-        return np.array([]), np.array([]), np.array([])
-
-    targets = np.arange(0.0, L, float(spacing_m))
-    if targets.size == 0 or targets[-1] < L:
-        targets = np.append(targets, L)
-
-    t_abs = s_lo + targets
-    idxs = np.searchsorted(cum, t_abs, side="right") - 1
-    idxs = np.clip(idxs, 0, len(xs) - 2)
-
-    seg_len = (cum[idxs + 1] - cum[idxs])
-    seg_len = np.where(seg_len <= 0, 1.0, seg_len)
-    frac = (t_abs - cum[idxs]) / seg_len
-
-    dx = (xs[idxs + 1] - xs[idxs])
-    dy = (ys[idxs + 1] - ys[idxs])
-    Xs = xs[idxs] + frac * dx
-    Ys = ys[idxs] + frac * dy
-
-    return Xs, Ys, targets  # metric XY; local cumulative (0..L)
+def geodesic_snap_to_polyline(agm_lonlat, densified_coords):
+    """Snap a point to the nearest densified vertex; returns (index, distance_m)."""
+    ax, ay = agm_lonlat
+    best_idx = None
+    best_d = float("inf")
+    for idx, (lon, lat) in enumerate(densified_coords):
+        _, _, d = GEOD.inv(ax, ay, lon, lat)
+        if d < best_d:
+            best_d = d
+            best_idx = idx
+    return best_idx, best_d
 
 # =========================
-# DEM helpers (Terrain-RGB)
+# MAPBOX TERRAIN-RGB (bilinear + optional supersample)
 # =========================
 
 def lonlat_to_tile(lon, lat, z):
@@ -228,10 +171,6 @@ def lonlat_to_tile(lon, lat, z):
 
 def decode_terrain_rgb(r, g, b):
     return -10000.0 + (r * 256.0 * 256.0 + g * 256.0 + b) * 0.1
-
-def meters_per_pixel(lat_deg, z):
-    # Web Mercator ground resolution
-    return (INITIAL_RES_M_PER_PX * math.cos(math.radians(lat_deg))) / (2 ** z)
 
 class TerrainTileCache:
     def __init__(self, token, zoom=17):
@@ -279,18 +218,18 @@ class TerrainTileCache:
         )
         return float(elev)
 
-# Supersampled elevation around a point (center + 4 offsets at ~0.6 px)
-def elevation_supersampled(lon, lat, cache: TerrainTileCache, xf_ll_to_m: Transformer, xf_m_to_ll: Transformer):
-    z = cache.zoom
-    mpp = meters_per_pixel(lat, z)
-    # offset radius ~ 0.6 px in meters
-    r = 0.6 * mpp
-    # transform to metric, offset, back to lon/lat
-    x, y = xf_ll_to_m.transform(lon, lat)
-    samples = [(lon, lat)]
-    for dx, dy in [(r, 0), (-r, 0), (0, r), (0, -r)]:
-        lx, ly = xf_m_to_ll.transform(x + dx, y + dy)
-        samples.append((lx, ly))
+def elevation_supersampled(lon, lat, cache: TerrainTileCache, lat_hint):
+    # supersample radius ≈ 0.6 px, based on ground resolution at this latitude
+    mpp = meters_per_pixel(lat_hint, cache.zoom)
+    r_m = 0.6 * mpp
+    # approximate lon/lat offsets (very small, ok for tiny r)
+    dlat = (r_m / 111320.0)  # meters per degree latitude
+    dlon = dlat / max(math.cos(math.radians(lat)), 1e-6)
+    samples = [(lon, lat),
+               (lon + dlon, lat),
+               (lon - dlon, lat),
+               (lon, lat + dlat),
+               (lon, lat - dlat)]
     vals = []
     for lo, la in samples:
         e = cache.elevation_at_bilinear(lo, la)
@@ -300,21 +239,20 @@ def elevation_supersampled(lon, lat, cache: TerrainTileCache, xf_ll_to_m: Transf
         return 0.0
     return float(sum(vals) / len(vals))
 
-def get_elevations_ll(points_ll, cache: TerrainTileCache, xf_ll_to_m: Transformer, xf_m_to_ll: Transformer, supersample: bool):
+def get_elevations_ll(points_ll, cache: TerrainTileCache, supersample_flag, lat_hint):
     elevs = []
     for lon, lat in points_ll:
-        if supersample:
-            e = elevation_supersampled(lon, lat, cache, xf_ll_to_m, xf_m_to_ll)
+        if supersample_flag:
+            e = elevation_supersampled(lon, lat, cache, lat_hint)
         else:
             e = cache.elevation_at_bilinear(lon, lat)
             e = 0.0 if (e is None or not np.isfinite(e)) else float(e)
-        elevs.append(e if e is not None else 0.0)
+        elevs.append(e)
     return elevs
 
-def smooth_elevations_two_stage(elevs, median_win, mean_win):
+def smooth_two_stage(elevs, median_win, mean_win):
     arr = np.asarray(elevs, dtype=float)
     if median_win > 1:
-        # robust median (use pandas centered rolling median)
         s = pd.Series(arr)
         arr = s.rolling(window=median_win, center=True, min_periods=1).median().to_numpy()
     if mean_win > 1:
@@ -323,176 +261,68 @@ def smooth_elevations_two_stage(elevs, median_win, mean_win):
     return arr.tolist()
 
 # =========================
-# CORE LOGIC
-# =========================
-
-def pick_centerline_part_for_pair(parts_m, pt1_ll, pt2_ll, xf_ll_to_m, max_offset_m):
-    """Choose the single centerline part both AGMs should snap to, minimizing total offset.
-       Returns (part_index, s1, s2) or (None, None, None)."""
-    best = None
-    p1_m = transform_point(pt1_ll, xf_ll_to_m)
-    p2_m = transform_point(pt2_ll, xf_ll_to_m)
-    for idx, part_m in enumerate(parts_m):
-        s1 = part_m.project(p1_m)
-        s2 = part_m.project(p2_m)
-        snap1 = part_m.interpolate(s1)
-        snap2 = part_m.interpolate(s2)
-        off1 = ((p1_m.x - snap1.x)**2 + (p1_m.y - snap1.y)**2) ** 0.5
-        off2 = ((p2_m.x - snap2.x)**2 + (p2_m.y - snap2.y)**2) ** 0.5
-        if off1 <= max_offset_m and off2 <= max_offset_m:
-            tot = off1 + off2
-            if (best is None) or (tot < best[0]):
-                best = (tot, idx, s1, s2)
-    if best is None:
-        return None, None, None
-    _, idx, s1, s2 = best
-    return idx, s1, s2
-
-def resample_along_part(part_m: LineString, s1, s2, spacing_m):
-    xs, ys, cum = build_vertex_arrays_metric(part_m)
-    Xs, Ys, targets = linear_reference_samples(xs, ys, cum, s1, s2, spacing_m)
-    return Xs, Ys, targets
-
-def compute_3d_distance_with_dem(Xs, Ys, targets, xf_m_to_ll, tile_cache, xf_ll_to_m, supersample_flag, med_k, mean_k, lat_hint):
-    if Xs.size == 0:
-        return 0.0
-
-    # Convert to lon/lat for elevation
-    lons, lats = xf_m_to_ll.transform(Xs.tolist(), Ys.tolist())
-    pts_ll = list(zip(lons, lats))
-
-    # Determine DEM-aware minimum spacing (>= ~1.5 px)
-    mpp = meters_per_pixel(lat_hint, tile_cache.zoom)
-    min_spacing = max(2.0, 1.5 * mpp)
-
-    # Ensure horizontal steps are not below min_spacing by thinning the sample stream
-    if len(targets) > 1:
-        keep = [0]
-        for i in range(1, len(targets)):
-            if (targets[i] - targets[keep[-1]]) >= min_spacing or i == len(targets) - 1:
-                keep.append(i)
-        pts_ll = [pts_ll[i] for i in keep]
-        targets = [targets[i] for i in keep]
-
-    # Elevations (optionally supersampled), then robust two-stage smoothing
-    elevs = get_elevations_ll(pts_ll, tile_cache, xf_ll_to_m, xf_m_to_ll, supersample_flag)
-    elevs = smooth_elevations_two_stage(elevs, med_k, mean_k)
-
-    # Accumulate 3D using exact metric dh from targets
-    dist_m = 0.0
-    for j in range(len(targets) - 1):
-        dh = float(targets[j + 1] - targets[j])
-        dz = float(elevs[j + 1] - elevs[j])
-        dist_m += math.sqrt(dh * dh + dz * dz)
-
-    if len(targets) <= 1:
-        dist_m = 0.0
-    return dist_m
-
-# =========================
 # MAIN APP
 # =========================
 
 uploaded_file = st.file_uploader("Upload KML or KMZ file", type=["kml", "kmz"])
 
 if uploaded_file:
-    agms, centerline_parts_ll = parse_kml_kmz(uploaded_file)
+    agms, parts_ll = parse_kml_kmz(uploaded_file)
 
     st.subheader("📌 AGM summary")
     st.text(f"Total AGMs found: {len(agms)}")
     st.subheader("📈 CENTERLINE parts")
-    st.text(f"Found {len(centerline_parts_ll)} centerline part(s)")
+    st.text(f"Found {len(parts_ll)} centerline part(s)")
 
-    if len(centerline_parts_ll) == 0 or len(agms) < 2:
+    if len(parts_ll) == 0 or len(agms) < 2:
         st.warning("Missing CENTERLINE parts or insufficient AGM points.")
     else:
-        # Local metric CRS from all parts
-        try:
-            crs_metric = get_local_utm_crs(centerline_parts_ll)
-        except Exception:
-            crs_metric = CRS.from_epsg(5070)  # fallback
-        xf_ll_to_m = transformer_ll_to(crs_metric)
-        xf_m_to_ll = transformer_to_ll(crs_metric)
+        # Center latitude for DEM/res clamp
+        all_lats = [c[1] for p in parts_ll for c in p.coords]
+        lat_hint = float(np.mean(all_lats)) if all_lats else 35.0
 
-        # Transform/simplify parts -> metric
-        parts_m = []
-        for ls in centerline_parts_ll:
-            lm = transform_linestring(ls, xf_ll_to_m)
-            if simplify_tolerance_m > 0.0:
-                lm = lm.simplify(simplify_tolerance_m, preserve_topology=False)
-            if lm is not None and lm.length > 0 and len(lm.coords) >= 2:
-                parts_m.append(lm)
+        # Densify each part geodesically at ~densify_step_m
+        densified_parts = []
+        for ls in parts_ll:
+            coords = list(ls.coords)
+            dens = densify_polyline_geodesic(coords, densify_step_m)
+            if len(dens) >= 2:
+                densified_parts.append(dens)
 
-        if not parts_m:
-            st.warning("All centerline parts were degenerate after transform/simplify.")
-        else:
-            tile_cache = TerrainTileCache(MAPBOX_TOKEN, zoom=mapbox_zoom)
+        tile_cache = TerrainTileCache(MAPBOX_TOKEN, zoom=mapbox_zoom)
+        mpp = meters_per_pixel(lat_hint, mapbox_zoom)
+        min_spacing = max(2.0, 1.5 * mpp)           # DEM-aware minimum
+        spacing_used = max(float(requested_spacing_m), min_spacing)
 
-            rows = []
-            skipped = 0
-            cumulative_miles = 0.0
+        rows = []
+        skipped = 0
+        cumulative_miles = 0.0
 
-            # Use center latitude as DEM resolution hint
-            all_lats = [c[1] for p in centerline_parts_ll for c in p.coords]
-            lat_hint = float(np.mean(all_lats)) if all_lats else 35.0
+        for i in range(len(agms) - 1):
+            name1, pt1 = agms[i]
+            name2, pt2 = agms[i + 1]
+            p1 = (pt1.x, pt1.y)
+            p2 = (pt2.x, pt2.y)
 
-            for i in range(len(agms) - 1):
-                name1, pt1_ll = agms[i]
-                name2, pt2_ll = agms[i + 1]
+            # Pick best single part by minimal total snap distance (both within threshold)
+            best = None
+            for idx, dens in enumerate(densified_parts):
+                i1, d1 = geodesic_snap_to_polyline(p1, dens)
+                i2, d2 = geodesic_snap_to_polyline(p2, dens)
+                if d1 <= snap_max_offset_m and d2 <= snap_max_offset_m:
+                    tot = d1 + d2
+                    if (best is None) or (tot < best[0]):
+                        lo, hi = sorted((i1, i2))
+                        seg = dens[lo:hi + 1]
+                        best = (tot, idx, lo, hi, seg)
+            if best is None:
+                skipped += 1
+                continue
 
-                part_idx, s1, s2 = pick_centerline_part_for_pair(
-                    parts_m, pt1_ll, pt2_ll, xf_ll_to_m, snap_max_offset_m
-                )
-                if part_idx is None:
-                    skipped += 1
-                    continue
+            _, part_idx, lo, hi, seg_ll = best
+            if len(seg_ll) < 2:
+                skipped += 1
+                continue
 
-                part_m = parts_m[part_idx]
-
-                # DEM-aware spacing: do not over-sample
-                mpp = meters_per_pixel(lat_hint, mapbox_zoom)
-                recommended_min = max(2.0, 1.5 * mpp)
-                spacing_used = max(float(interp_spacing_m_ui), recommended_min)
-
-                # Linear-referenced sampling along the chosen part
-                Xs, Ys, targets = resample_along_part(part_m, s1, s2, spacing_used)
-                if Xs.size == 0 or len(targets) < 1:
-                    skipped += 1
-                    continue
-
-                # Accurate 3D accumulation with smoothing & supersampling
-                dist_m = compute_3d_distance_with_dem(
-                    Xs, Ys, targets,
-                    xf_m_to_ll, tile_cache,
-                    xf_ll_to_m,
-                    supersample,
-                    int(smooth_median_window) | 1,  # ensure odd
-                    int(smooth_mean_window),
-                    lat_hint
-                )
-
-                # If spacing produced a single sample, fallback to exact 2D along the part
-                if len(targets) == 1:
-                    dist_m = abs(s2 - s1)
-
-                dist_ft = dist_m * FT_PER_M
-                dist_mi = dist_ft * MI_PER_FT
-                cumulative_miles += dist_mi
-
-                rows.append({
-                    "From AGM": name1,
-                    "To AGM": name2,
-                    "Distance (feet)": round(dist_ft, 2),
-                    "Distance (miles)": round(dist_mi, 6),
-                    "Cumulative (miles)": round(cumulative_miles, 6),
-                    "Centerline part #": part_idx,
-                    "Spacing used (m)": round(spacing_used, 3),
-                })
-
-            st.subheader("📊 Distance table")
-            df = pd.DataFrame(rows)
-            st.dataframe(df, use_container_width=True)
-            st.text(f"Skipped segments: {skipped}")
-
-            csv = df.to_csv(index=False).encode("utf-8")
-            st.download_button("Download CSV", csv, "terrain_distances.csv", "text/csv")
+            # Resample along this lon/lat segment by geodesic arclength
+            # (build

@@ -1,3 +1,4 @@
+# app.py
 import math
 import io
 import zipfile
@@ -9,28 +10,43 @@ import pandas as pd
 import numpy as np
 from PIL import Image
 from shapely.geometry import Point, LineString
-from shapely.ops import substring
-from pyproj import Transformer
+from pyproj import Geod, CRS, Transformer
 
-# --- CONFIG ---
+# =========================================
+# CONFIG
+# =========================================
+
+st.set_page_config(page_title="Terrain-Aware AGM Distance Calculator", layout="wide")
+st.title("Terrain-Aware AGM Distance Calculator (Exact linear-referenced slice, AGM snap)")
+
 MAPBOX_TOKEN = st.secrets["mapbox"]["token"]
-# Terrain-RGB tileset endpoint (PNG raw for precise RGB)
 TERRAIN_TILE_URL = "https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}.pngraw"
+GEOD = Geod(ellps="WGS84")
 
-# Use Web Mercator for horizontal distance (meters)
-transformer = Transformer.from_crs("epsg:4326", "epsg:3857", always_xy=True)
+with st.sidebar:
+    st.header("Settings")
+    mapbox_zoom = st.slider("Terrain tile zoom", 15, 17, 17)
+    interp_spacing_m = st.slider("Sampling spacing along path (m)", 0.5, 5.0, 1.0, 0.5)
+    smooth_window = st.slider("Elevation smoothing window (samples)", 1, 21, 5, 2)
+    simplify_tolerance_m = st.slider("Centerline simplify tolerance (m)", 0.0, 5.0, 0.0, 0.5,
+                                     help="Optional Douglas–Peucker simplification in meters (0 = off)")
+    st.caption("Tip: Keep zoom=17 and spacing=1 m for highest accuracy.")
 
-# --- HELPERS ---
+FT_PER_M = 3.28084
+MI_PER_FT = 1.0 / 5280.0
+
+# =========================================
+# HELPERS — parsing
+# =========================================
 
 def agm_sort_key(name_geom):
     name = name_geom[0]
     base_digits = ''.join(filter(str.isdigit, name))
     base = int(base_digits) if base_digits else -1
-    suffix = ''.join(filter(str.isalpha, name))
+    suffix = ''.join(filter(str.isalpha, name)).upper()
     return (base, suffix)
 
 def parse_kml_kmz(uploaded_file):
-    # Load KML from KMZ or KML
     if uploaded_file.name.endswith(".kmz"):
         with zipfile.ZipFile(uploaded_file) as zf:
             kml_file = next((f for f in zf.namelist() if f.endswith(".kml")), None)
@@ -70,41 +86,106 @@ def parse_kml_kmz(uploaded_file):
                 coords = placemark.find(".//kml:coordinates", ns)
                 if coords is None:
                     continue
-                try:
-                    pts = []
-                    for pair in coords.text.strip().split():
-                        lon, lat, *_ = map(float, pair.split(","))
-                        pts.append((lon, lat))
-                    if len(pts) >= 2:
+                pts = []
+                for pair in coords.text.strip().split():
+                    lon, lat, *_ = map(float, pair.split(","))
+                    pts.append((lon, lat))
+                if len(pts) >= 2:
+                    # If multiple centerlines exist, concatenate in order
+                    if centerline is None:
                         centerline = LineString(pts)
-                except Exception:
-                    continue
+                    else:
+                        centerline = LineString(list(centerline.coords) + pts)
 
     agms.sort(key=agm_sort_key)
     return agms, centerline
 
-def slice_centerline(centerline, p1, p2):
-    # Project AGM points onto the centerline; use distances along the line
-    d1 = centerline.project(p1)
-    d2 = centerline.project(p2)
-    if d1 == d2:
-        return None
-    start, end = (d1, d2) if d1 < d2 else (d2, d1)
-    # Robust geometric slicing along the path
-    seg = substring(centerline, start, end, normalized=False)
-    if seg is None or seg.length == 0.0 or len(seg.coords) < 2:
-        return None
-    return seg
+# =========================================
+# HELPERS — CRS & transforms
+# =========================================
 
-def interpolate_line(line, spacing_m=1.0):
-    total_length = line.length
-    steps = max(int(total_length / spacing_m), 1)
-    # Ensure endpoints included
-    points = [line.interpolate(i * spacing_m) for i in range(steps)]
-    points.append(line.interpolate(total_length))
-    return points
+def get_local_utm_crs(line_ll: LineString) -> CRS:
+    xs = [c[0] for c in line_ll.coords]
+    ys = [c[1] for c in line_ll.coords]
+    cx, cy = float(np.mean(xs)), float(np.mean(ys))
+    zone = int((cx + 180.0) / 6.0) + 1
+    is_north = cy >= 0.0
+    epsg = 32600 + zone if is_north else 32700 + zone
+    return CRS.from_epsg(epsg)
 
-# --- Mapbox Terrain-RGB elevation sampling ---
+def transformer_ll_to(crs: CRS) -> Transformer:
+    return Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+
+def transformer_to_ll(crs: CRS) -> Transformer:
+    return Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+
+def transform_linestring(ls: LineString, xf: Transformer) -> LineString:
+    xs, ys = zip(*ls.coords)
+    X, Y = xf.transform(xs, ys)
+    return LineString(list(zip(X, Y)))
+
+def transform_point(pt: Point, xf: Transformer) -> Point:
+    x, y = xf.transform(pt.x, pt.y)
+    return Point(x, y)
+
+# =========================================
+# EXACT LINEAR-REFERENCED SLICING (no substring bugs)
+# =========================================
+# We compute cumulative meters along the metric centerline vertices.
+# Then, for each AGM (snapped to nearest point along the metric line), we know the
+# scalar measure s (meters). We cut the vertex chain precisely between s1 and s2,
+# inserting the two interpolated boundary points, and keep the original vertex
+# sequence in between. This mirrors how Google Earth accumulates path length.
+
+def build_vertex_arrays_metric(centerline_m: LineString):
+    coords = list(centerline_m.coords)
+    xs = np.array([c[0] for c in coords], dtype=float)
+    ys = np.array([c[1] for c in coords], dtype=float)
+    dxy = np.hypot(np.diff(xs), np.diff(ys))
+    cum = np.concatenate([[0.0], np.cumsum(dxy)])
+    return xs, ys, cum  # vertex coordinates and cumulative meters at each vertex
+
+def interpolate_point_on_polyline(xs, ys, cum, s):
+    """Return (x,y) point at measure s along the polyline defined by xs,ys,cum."""
+    if s <= 0:
+        return float(xs[0]), float(ys[0]), 0
+    if s >= cum[-1]:
+        return float(xs[-1]), float(ys[-1]), len(xs) - 2
+    idx = int(np.searchsorted(cum, s) - 1)
+    idx = max(0, min(idx, len(xs) - 2))
+    seg_len = cum[idx + 1] - cum[idx]
+    if seg_len <= 0:
+        return float(xs[idx]), float(ys[idx]), idx
+    t = (s - cum[idx]) / seg_len
+    x = xs[idx] + t * (xs[idx + 1] - xs[idx])
+    y = ys[idx] + t * (ys[idx + 1] - ys[idx])
+    return float(x), float(y), idx
+
+def slice_polyline_by_measures(xs, ys, cum, s0, s1):
+    """Return lon/lat sequence of the exact slice between measures s0..s1 (meters) in metric,
+       preserving vertex order and inserting boundary points."""
+    s_lo, s_hi = (s0, s1) if s0 <= s1 else (s1, s0)
+
+    # Interpolate endpoints in metric
+    xA, yA, iA = interpolate_point_on_polyline(xs, ys, cum, s_lo)
+    xB, yB, iB = interpolate_point_on_polyline(xs, ys, cum, s_hi)
+
+    # Gather metric coordinates along the slice
+    Xs = [xA]
+    Ys = [yA]
+    if iB >= iA:
+        # include interior vertices strictly between iA and iB
+        if (iA + 1) <= iB:
+            Xs.extend(xs[iA + 1:iB + 1].tolist())
+            Ys.extend(ys[iA + 1:iB + 1].tolist())
+    Xs.append(xB)
+    Ys.append(yB)
+
+    return np.array(Xs, dtype=float), np.array(Ys, dtype=float)
+
+# =========================================
+# MAPBOX TERRAIN-RGB (bilinear)
+# =========================================
 
 def lonlat_to_tile(lon, lat, z):
     n = 2 ** z
@@ -112,120 +193,172 @@ def lonlat_to_tile(lon, lat, z):
     y = (1.0 - math.log(math.tan(math.radians(lat)) + 1.0 / math.cos(math.radians(lat))) / math.pi) / 2.0 * n
     return int(x), int(y), x, y
 
-def pixel_in_tile(lon, lat, z, x_tile, y_tile, x_float, y_float):
-    # Convert fractional tile position to pixel coordinate (256x256)
-    x_pix = int((x_float - x_tile) * 256.0)
-    y_pix = int((y_float - y_tile) * 256.0)
-    # Clamp to tile bounds
-    x_pix = max(0, min(255, x_pix))
-    y_pix = max(0, min(255, y_pix))
-    return x_pix, y_pix
-
 def decode_terrain_rgb(r, g, b):
-    # Elevation in meters: E = -10000 + (R*256^2 + G*256 + B) * 0.1
     return -10000.0 + (r * 256.0 * 256.0 + g * 256.0 + b) * 0.1
 
 class TerrainTileCache:
-    def __init__(self, token, zoom=15):
+    def __init__(self, token, zoom=17):
         self.token = token
         self.zoom = zoom
-        self.cache = {}  # (z,x,y) -> PIL Image
+        self.cache = {}
 
-    def get_tile_image(self, z, x, y):
+    def get_tile_array(self, z, x, y):
         key = (z, x, y)
-        img = self.cache.get(key)
-        if img is not None:
-            return img
+        arr = self.cache.get(key)
+        if arr is not None:
+            return arr
         url = TERRAIN_TILE_URL.format(z=z, x=x, y=y)
         resp = requests.get(url, params={"access_token": self.token}, timeout=20)
         if resp.status_code != 200:
             return None
-        try:
-            img = Image.open(io.BytesIO(resp.content)).convert("RGB")
-        except Exception:
-            return None
-        self.cache[key] = img
-        return img
+        img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+        arr = np.asarray(img, dtype=np.uint8)
+        self.cache[key] = arr
+        return arr
 
-    def elevation_at(self, lon, lat):
+    def elevation_at_bilinear(self, lon, lat):
         z = self.zoom
-        x_tile, y_tile, x_float, y_float = lonlat_to_tile(lon, lat, z)
-        x_pix, y_pix = pixel_in_tile(lon, lat, z, x_tile, y_tile, x_float, y_float)
-        img = self.get_tile_image(z, x_tile, y_tile)
-        if img is None:
+        x_tile, y_tile, x_f, y_f = lonlat_to_tile(lon, lat, z)
+        x_pix_f = (x_f - x_tile) * 256.0
+        y_pix_f = (y_f - y_tile) * 256.0
+        x0, y0 = int(math.floor(x_pix_f)), int(math.floor(y_pix_f))
+        dx, dy = x_pix_f - x0, y_pix_f - y0
+        x0 = max(0, min(255, x0))
+        y0 = max(0, min(255, y0))
+        x1 = min(x0 + 1, 255)
+        y1 = min(y0 + 1, 255)
+        arr = self.get_tile_array(z, x_tile, y_tile)
+        if arr is None:
             return None
-        r, g, b = img.getpixel((x_pix, y_pix))
-        return decode_terrain_rgb(r, g, b)
+        p00 = decode_terrain_rgb(*arr[y0, x0])
+        p10 = decode_terrain_rgb(*arr[y0, x1])
+        p01 = decode_terrain_rgb(*arr[y1, x0])
+        p11 = decode_terrain_rgb(*arr[y1, x1])
+        elev = (
+            p00 * (1 - dx) * (1 - dy)
+            + p10 * dx * (1 - dy)
+            + p01 * (1 - dx) * dy
+            + p11 * dx * dy
+        )
+        return float(elev)
 
-def get_elevations(points, cache: TerrainTileCache):
-    elevations = []
-    for p in points:
-        elev = cache.elevation_at(p.x, p.y)
-        if elev is None or not np.isfinite(elev):
-            elevations.append(0.0)  # fallback
-        else:
-            elevations.append(float(elev))
-    return elevations
+def get_elevations_ll(points_ll, cache: TerrainTileCache):
+    elevs = []
+    for lon, lat in points_ll:
+        e = cache.elevation_at_bilinear(lon, lat)
+        elevs.append(0.0 if e is None else e)
+    return elevs
 
-def distance_3d(p1, p2, e1, e2):
-    # Horizontal in meters via EPSG:3857 + vertical component
-    x1, y1 = transformer.transform(p1.x, p1.y)
-    x2, y2 = transformer.transform(p2.x, p2.y)
-    dx = x2 - x1
-    dy = y2 - y1
-    dz = e2 - e1
-    return math.sqrt(dx * dx + dy * dy + dz * dz)
+def smooth_elevations(elevs, window):
+    if window <= 1:
+        return elevs
+    kernel = np.ones(window) / window
+    return np.convolve(elevs, kernel, mode="same").tolist()
 
-# --- STREAMLIT UI ---
-
-st.title("Terrain-Aware AGM Distance Calculator (Mapbox Terrain-RGB)")
+# =========================================
+# MAIN
+# =========================================
 
 uploaded_file = st.file_uploader("Upload KML or KMZ file", type=["kml", "kmz"])
+
 if uploaded_file:
-    agms, centerline = parse_kml_kmz(uploaded_file)
+    agms, centerline_ll = parse_kml_kmz(uploaded_file)
 
     st.subheader("📌 AGM summary")
     st.text(f"Total AGMs found: {len(agms)}")
     st.subheader("📈 CENTERLINE status")
-    st.text("CENTERLINE found" if centerline else "CENTERLINE missing")
+    st.text("CENTERLINE found" if centerline_ll else "CENTERLINE missing")
 
-    if not centerline or len(agms) < 2:
+    if not centerline_ll or len(agms) < 2:
         st.warning("Missing CENTERLINE or insufficient AGM points.")
     else:
+        # Local metric CRS for precise snapping and linear referencing
+        try:
+            crs_metric = get_local_utm_crs(centerline_ll)
+        except Exception:
+            crs_metric = CRS.from_epsg(5070)  # fallback
+        xf_ll_to_m = transformer_ll_to(crs_metric)
+        xf_m_to_ll = transformer_to_ll(crs_metric)
+
+        # Optional simplification (in meters) to remove micro wiggles
+        cl_m = transform_linestring(centerline_ll, xf_ll_to_m)
+        if simplify_tolerance_m > 0.0:
+            cl_m = cl_m.simplify(simplify_tolerance_m, preserve_topology=False)
+
+        # Vertex arrays and cumulative measures
+        xs_m, ys_m, cum_m = build_vertex_arrays_metric(cl_m)
+
+        # Snap AGMs to nearest point along the metric line (true orthogonal)
+        snapped = []
+        for name, pt_ll in agms:
+            pt_m = transform_point(pt_ll, xf_ll_to_m)
+            s = cl_m.project(pt_m)  # meters along line
+            # exact snapped metric point:
+            xS, yS, _ = interpolate_point_on_polyline(xs_m, ys_m, cum_m, s)
+            lon_s, lat_s = xf_m_to_ll.transform(xS, yS)
+            snapped.append((name, Point(lon_s, lat_s), s))
+
+        # Elevation cache
+        tile_cache = TerrainTileCache(MAPBOX_TOKEN, zoom=mapbox_zoom)
+
         rows = []
-        cumulative_miles = 0.0
         skipped = 0
+        cumulative_miles = 0.0
 
-        # Initialize Mapbox tile cache at max precision zoom
-        tile_cache = TerrainTileCache(token=MAPBOX_TOKEN, zoom=15)
-
-        for i in range(len(agms) - 1):
-            name1, pt1 = agms[i]
-            name2, pt2 = agms[i + 1]
-
-            segment = slice_centerline(centerline, pt1, pt2)
-            if segment is None or segment.length == 0.0 or len(segment.coords) < 2:
+        for i in range(len(snapped) - 1):
+            name1, _, s1 = snapped[i]
+            name2, _, s2 = snapped[i + 1]
+            if np.isclose(s1, s2):
                 skipped += 1
                 continue
 
-            interp_points = interpolate_line(segment, spacing_m=1.0)
-            if len(interp_points) < 2:
+            # Exact vertex-preserving slice between s1..s2 in METERS
+            Xs, Ys = slice_polyline_by_measures(xs_m, ys_m, cum_m, s1, s2)
+
+            # Now sample along that slice every interp_spacing_m in METERS (linear ref)
+            # Build cumulative along slice:
+            dxy = np.hypot(np.diff(Xs), np.diff(Ys))
+            cum_slice = np.concatenate([[0.0], np.cumsum(dxy)])
+            L = float(cum_slice[-1])
+            if L <= 0:
                 skipped += 1
                 continue
 
-            elevations = get_elevations(interp_points, tile_cache)
-            if len(elevations) != len(interp_points):
-                skipped += 1
-                continue
+            targets = np.arange(0.0, L, float(interp_spacing_m))
+            if targets.size == 0 or targets[-1] < L:
+                targets = np.append(targets, L)
 
-            # Sum 3D distance along the path at 1m spacing
+            # Interpolate metric positions for targets
+            samp_x = []
+            samp_y = []
+            idxs = np.searchsorted(cum_slice, targets, side="right") - 1
+            idxs = np.clip(idxs, 0, len(Xs) - 2)
+            seg_len = (cum_slice[idxs + 1] - cum_slice[idxs])
+            seg_len = np.where(seg_len <= 0, 1.0, seg_len)
+            frac = (targets - cum_slice[idxs]) / seg_len
+            dx = (Xs[idxs + 1] - Xs[idxs])
+            dy = (Ys[idxs + 1] - Ys[idxs])
+            samp_x = Xs[idxs] + frac * dx
+            samp_y = Ys[idxs] + frac * dy
+
+            # Transform metric samples back to lon/lat
+            lons, lats = xf_m_to_ll.transform(samp_x.tolist(), samp_y.tolist())
+            pts_ll = list(zip(lons, lats))
+
+            # Elevations
+            elevs = smooth_elevations(get_elevations_ll(pts_ll, tile_cache), smooth_window)
+
+            # Accumulate 3D distance using geodesic horizontal between successive samples
             dist_m = 0.0
-            for j in range(len(interp_points) - 1):
-                dist_m += distance_3d(interp_points[j], interp_points[j + 1],
-                                      elevations[j], elevations[j + 1])
+            for j in range(len(pts_ll) - 1):
+                lon1, lat1 = pts_ll[j]
+                lon2, lat2 = pts_ll[j + 1]
+                _, _, dxy_m = GEOD.inv(lon1, lat1, lon2, lat2)
+                dz = elevs[j + 1] - elevs[j]
+                dist_m += math.sqrt(dxy_m * dxy_m + dz * dz)
 
-            dist_ft = dist_m * 3.28084
-            dist_mi = dist_ft / 5280.0
+            dist_ft = dist_m * FT_PER_M
+            dist_mi = dist_ft * MI_PER_FT
             cumulative_miles += dist_mi
 
             rows.append({
@@ -233,12 +366,12 @@ if uploaded_file:
                 "To AGM": name2,
                 "Distance (feet)": round(dist_ft, 2),
                 "Distance (miles)": round(dist_mi, 6),
-                "Cumulative Distance (miles)": round(cumulative_miles, 6)
+                "Cumulative (miles)": round(cumulative_miles, 6)
             })
 
         st.subheader("📊 Distance table")
         df = pd.DataFrame(rows)
-        st.dataframe(df)
+        st.dataframe(df, use_container_width=True)
         st.text(f"Skipped segments: {skipped}")
 
         csv = df.to_csv(index=False).encode("utf-8")

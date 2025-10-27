@@ -6,3 +6,4 @@ pyproj
 requests
 zipfile36
 Pillow
+scipy==1.13.1

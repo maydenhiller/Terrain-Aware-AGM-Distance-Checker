@@ -1,7 +1,5 @@
 # app.py
-# Terrain-Aware AGM Distance Calculator — GE 3D MATCH (Hann smoothing + dz threshold)
-# Goal: bring 000→010 ~ 1.20 mi and similar segments within ~1% of Google Earth 3D
-
+# Terrain-Aware AGM Distance Calculator — GE 3D MATCH + ignore "SP" AGMs
 import io, math, zipfile, requests, xml.etree.ElementTree as ET
 import streamlit as st, pandas as pd, numpy as np
 from PIL import Image
@@ -9,22 +7,22 @@ from shapely.geometry import Point, LineString
 from pyproj import CRS, Transformer, Geod
 
 st.set_page_config(page_title="Terrain-Aware AGM Distance Calculator", layout="wide")
-st.title("Terrain-Aware AGM Distance Calculator (Google Earth 3D Match)")
+st.title("Terrain-Aware AGM Distance Calculator (Google Earth 3D Match, SP Filtered)")
 
 MAPBOX_TOKEN = st.secrets["mapbox"]["token"]
 TERRAIN_URL = "https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}.pngraw"
 GEOD = Geod(ellps="WGS84")
 FT_PER_M, MI_PER_FT = 3.28084, 1/5280.0
 
-# ---- Calibrated constants to match GE 3D path tool ----
-SPACING_M = 40.0          # coarser ground sample to suppress micro-zigzags
-SIMPLIFY_TOL_M = 50.0     # strong simplification removes sub-10 m kinks
-SMOOTH_WIN = 31           # Hann window length for elevation low-pass
-DZ_THRESHOLD_M = 0.75     # ignore tiny vertical deltas (< 0.75 m) between samples
+# ---- Calibrated constants ----
+SPACING_M = 40.0
+SIMPLIFY_TOL_M = 50.0
+SMOOTH_WIN = 31
+DZ_THRESHOLD_M = 0.75
 MAX_SNAP_M = 80.0
 MAPBOX_ZOOM = 17
 
-# ─────────────────────────── Helpers: strip namespaces to plain tags
+# ─────────────────────────── Helpers
 def strip_namespaces(elem):
     elem.tag = elem.tag.split('}', 1)[-1]
     for k in list(elem.attrib.keys()):
@@ -34,7 +32,7 @@ def strip_namespaces(elem):
     for c in list(elem):
         strip_namespaces(c)
 
-# ─────────────────────────── Parse KML/KMZ (AGMs + CENTERLINE folders)
+# ─────────────────────────── Parse KML/KMZ (AGMs + CENTERLINE)
 def agm_sort_key(p):
     n = p[0]; d = ''.join(filter(str.isdigit, n)); s = ''.join(filter(str.isalpha, n))
     return (int(d) if d else -1, s)
@@ -50,7 +48,6 @@ def parse_kml_kmz(upload):
 
     root = ET.fromstring(data)
     strip_namespaces(root)
-
     agms, centerlines = [], []
 
     for folder in root.findall(".//Folder"):
@@ -59,19 +56,27 @@ def parse_kml_kmz(upload):
             continue
         fname = nm.text.strip().upper()
 
+        # ---- AGMs ----
         if fname == "AGMS":
             for pm in folder.findall(".//Placemark"):
                 n = pm.find("name")
+                if n is None or not n.text:
+                    continue
+                agm_name = n.text.strip()
+                # skip any AGM whose name starts with "SP"
+                if agm_name.upper().startswith("SP"):
+                    continue
                 c = pm.find(".//Point/coordinates")
-                if n is None or c is None or not c.text:
+                if c is None or not c.text:
                     continue
                 txt = c.text.strip().split()[0]
                 try:
                     lon, lat, *_ = map(float, txt.split(","))
-                    agms.append((n.text.strip(), Point(lon, lat)))
+                    agms.append((agm_name, Point(lon, lat)))
                 except:
                     pass
 
+        # ---- CENTERLINE ----
         elif fname == "CENTERLINE":
             for pm in folder.findall(".//Placemark"):
                 c = pm.find(".//LineString/coordinates")
@@ -134,12 +139,10 @@ class TerrainCache:
 
 def smooth_hann(vals, k):
     if k <= 1: return [float(v) for v in vals]
-    k = int(k) if int(k) % 2 == 1 else int(k) + 1  # force odd
+    k = int(k) if int(k) % 2 == 1 else int(k) + 1
     arr = np.asarray(vals, dtype=float)
-    win = np.hanning(k)
-    win /= win.sum()
+    win = np.hanning(k); win /= win.sum()
     pad = k // 2
-    # reflect-pad to avoid edge shrinkage
     arr_pad = np.pad(arr, (pad, pad), mode="reflect")
     sm = np.convolve(arr_pad, win, mode="same")[pad:-pad]
     return sm.tolist()
@@ -185,51 +188,41 @@ if u:
 
     crs = get_local_utm_crs(parts)
     xf_fwd, xf_inv = xf_ll_to(crs), xf_to_ll(crs)
-
-    # Strong simplify to emulate GE’s smoothed path
     parts_m = []
     for p in parts:
-        pm = tf_line(p, xf_fwd)
-        pm = pm.simplify(SIMPLIFY_TOL_M, preserve_topology=False)
+        pm = tf_line(p, xf_fwd).simplify(SIMPLIFY_TOL_M, preserve_topology=False)
         if pm.length > 0 and len(pm.coords) >= 2:
             parts_m.append(pm)
 
-    cache = TerrainCache(MAPBOX_ZOOM and MAPBOX_TOKEN, MAPBOX_ZOOM)
+    cache = TerrainCache(MAPBOX_TOKEN, MAPBOX_ZOOM)
 
     rows, cum_mi, skipped = [], 0.0, 0
-
     for i in range(len(agms) - 1):
         n1, a1 = agms[i]; n2, a2 = agms[i + 1]
         idx, s1, s2 = choose_part(parts_m, a1, a2, xf_fwd, MAX_SNAP_M)
         if idx is None:
-            skipped += 1
-            continue
+            skipped += 1; continue
 
         Xs, Ys = sample_between(parts_m[idx], s1, s2, SPACING_M)
         if Xs.size < 2:
-            skipped += 1
-            continue
+            skipped += 1; continue
 
         lons, lats = xf_inv.transform(Xs.tolist(), Ys.tolist())
         pts = list(zip(lons, lats))
-
         elev_raw = [cache.elev(lo, la) for lo, la in pts]
         elev = smooth_hann(elev_raw, SMOOTH_WIN)
 
-        # integrate 3D with tiny verticals ignored (thresholding)
         dist_m = 0.0
         for j in range(len(pts) - 1):
             lon1, lat1 = pts[j]; lon2, lat2 = pts[j + 1]
             _, _, dxy = GEOD.inv(lon1, lat1, lon2, lat2)
             dz = elev[j + 1] - elev[j]
-            if abs(dz) < DZ_THRESHOLD_M:
-                dz = 0.0
+            if abs(dz) < DZ_THRESHOLD_M: dz = 0.0
             dist_m += math.hypot(dxy, dz)
 
         ft = dist_m * FT_PER_M
         mi = ft * MI_PER_FT
         cum_mi += mi
-
         rows.append({
             "From AGM": n1,
             "To AGM": n2,
@@ -242,10 +235,6 @@ if u:
     st.subheader("📊 Distance table")
     st.dataframe(df, use_container_width=True)
     st.text(f"Skipped segments: {skipped}")
-
-    st.download_button(
-        "Download CSV",
-        df.to_csv(index=False).encode("utf-8"),
-        "terrain_distances.csv",
-        "text/csv"
-    )
+    st.download_button("Download CSV",
+                       df.to_csv(index=False).encode("utf-8"),
+                       "terrain_distances.csv", "text/csv")

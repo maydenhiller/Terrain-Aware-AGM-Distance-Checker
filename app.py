@@ -1,14 +1,14 @@
-# app.py — Terrain-Aware AGM Distance Calculator (Parallel Tile Prefetch Version — Robust KML Parsing)
+# app.py — Terrain-Aware AGM Distance Calculator (Safe Universal Parser)
 
-import io, math, time, zipfile, xml.etree.ElementTree as ET
+import io, math, zipfile, xml.etree.ElementTree as ET
 import numpy as np, pandas as pd, requests, streamlit as st
 from PIL import Image
 from shapely.geometry import LineString, Point
 from pyproj import Geod, Transformer
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-st.set_page_config("Terrain AGM Distance — Prefetch", layout="wide")
-st.title("📏 Terrain-Aware AGM Distance Calculator — Prefetch Enabled")
+st.set_page_config("Terrain AGM Distance", layout="wide")
+st.title("📏 Terrain-Aware AGM Distance Calculator — Safe Parser")
 
 # ---------------- CONFIG ----------------
 MAPBOX_TOKEN = st.secrets.get("MAPBOX_TOKEN", "")
@@ -19,7 +19,7 @@ DZ_THRESH = 0.5
 FT_PER_M = 3.28084
 GEOD = Geod(ellps="WGS84")
 MAX_SNAP_M = 80
-MAX_WORKERS = 8  # parallel fetch threads
+MAX_WORKERS = 8
 
 # ---------------- TERRAIN CACHE ----------------
 class TerrainCache:
@@ -42,15 +42,15 @@ class TerrainCache:
         url = f"https://api.mapbox.com/v1/mapbox/terrain-rgb/{z}/{x}/{y}.pngraw"
         try:
             r = requests.get(url, params={"access_token": self.token}, timeout=10)
+            if r.status_code != 200:
+                print(f"[Mapbox error] {r.status_code} for {z}/{x}/{y}")
+                return None
+            arr = np.asarray(Image.open(io.BytesIO(r.content)).convert("RGB"), dtype=np.uint8)
+            self.tiles[key] = arr
+            return arr
         except Exception as e:
             print(f"[Mapbox fetch error] {e}")
             return None
-        if r.status_code != 200:
-            print(f"[Mapbox error] {r.status_code} for tile {z}/{x}/{y}")
-            return None
-        arr = np.asarray(Image.open(io.BytesIO(r.content)).convert("RGB"), dtype=np.uint8)
-        self.tiles[key] = arr
-        return arr
 
     def elevations_bulk(self, lons: np.ndarray, lats: np.ndarray) -> np.ndarray:
         z = self.zoom
@@ -114,26 +114,25 @@ def strip_ns(e):
 
 # ---------------- PARSER ----------------
 def parse_kml_kmz(uploaded_file):
-    if uploaded_file.name.lower().endswith(".kmz"):
-        with zipfile.ZipFile(uploaded_file) as zf:
-            kml_name = next((n for n in zf.namelist() if n.lower().endswith(".kml")), None)
-            if not kml_name:
-                return [], []
-            data = zf.read(kml_name)
-    else:
-        data = uploaded_file.read()
-    # Decode safely, remove junk before <kml>
     try:
-        text = data.decode("utf-8-sig", errors="ignore")
-    except Exception:
-        text = str(data)
-    idx = text.find("<kml")
-    if idx > 0:
-        text = text[idx:]
-    try:
+        if uploaded_file.name.lower().endswith(".kmz"):
+            with zipfile.ZipFile(uploaded_file) as zf:
+                kml_name = next((n for n in zf.namelist() if n.lower().endswith(".kml")), None)
+                if not kml_name:
+                    return [], []
+                data = zf.read(kml_name)
+        else:
+            data = uploaded_file.read()
+
+        text = data.decode("utf-8", errors="ignore")
+        idx = text.find("<kml")
+        if idx > 0:
+            text = text[idx:]
         root = ET.fromstring(text)
-    except ET.ParseError as e:
-        raise ValueError(f"Invalid KML file: {e}")
+    except Exception as e:
+        print(f"[KML Parse Warning] {e}")
+        return [], []
+
     strip_ns(root)
     agms, centerlines = [], []
     for folder in root.findall(".//Folder"):
@@ -165,19 +164,6 @@ def parse_kml_kmz(uploaded_file):
     agms.sort(key=lambda p: int(''.join(filter(str.isdigit, p[0]))) if any(ch.isdigit() for ch in p[0]) else -1)
     return agms, centerlines
 
-def build_local_meter_crs(line_ll):
-    xs, ys = zip(*line_ll.coords)
-    lon0, lat0 = np.mean(xs), np.mean(ys)
-    proj = f"+proj=tmerc +lat_0={lat0} +lon_0={lon0} +datum=WGS84 +units=m"
-    to_m = Transformer.from_crs("EPSG:4326", proj, always_xy=True)
-    to_ll = Transformer.from_crs(proj, "EPSG:4326", always_xy=True)
-    return to_m, to_ll
-
-def snap_offset_m(line_m, pt_m):
-    s = line_m.project(pt_m)
-    sp = line_m.interpolate(s)
-    return math.hypot(pt_m.x - sp.x, pt_m.y - sp.y)
-
 # ---------------- MAIN ----------------
 u = st.file_uploader("Upload KML/KMZ", type=["kml", "kmz"])
 if not u:
@@ -190,12 +176,11 @@ if not agms or not lines:
     st.stop()
 
 line_ll = lines[0]
-to_m, to_ll = build_local_meter_crs(line_ll)
+to_m, to_ll = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True), Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
 X_m, Y_m = to_m.transform(*zip(*line_ll.coords))
 line_m = LineString(zip(X_m, Y_m))
 
 cache = TerrainCache(MAPBOX_TOKEN, MAPBOX_ZOOM)
-
 st.info("🚀 Prefetching terrain tiles in parallel...")
 cache.prefetch_tiles(list(line_ll.coords))
 st.success("✅ Tile prefetch complete — continuing computation.")
@@ -211,8 +196,6 @@ for i in range(total):
     bar.progress((i + 1) / total)
     p1_m = Point(*to_m.transform(a1.x, a1.y))
     p2_m = Point(*to_m.transform(a2.x, a2.y))
-    if snap_offset_m(line_m, p1_m) > MAX_SNAP_M or snap_offset_m(line_m, p2_m) > MAX_SNAP_M:
-        continue
     s1, s2 = sorted((line_m.project(p1_m), line_m.project(p2_m)))
     si = np.arange(s1, s2, RESAMPLE_M)
     if si[-1] < s2:

@@ -1,4 +1,4 @@
-# app.py — Terrain-Aware AGM Distance Calculator (Regex Parser, Safe Indexing)
+# app.py — Terrain-Aware AGM Distance Calculator (Robust AGM Parser v3)
 
 import io, math, re, zipfile
 import numpy as np, pandas as pd, requests, streamlit as st
@@ -8,7 +8,7 @@ from pyproj import Geod, Transformer
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config("Terrain AGM Distance", layout="wide")
-st.title("📏 Terrain-Aware AGM Distance Calculator — Regex Parser (Stable Indexing)")
+st.title("📏 Terrain-Aware AGM Distance Calculator — Robust AGM Parser")
 
 # ---------------- CONFIG ----------------
 MAPBOX_TOKEN = st.secrets.get("MAPBOX_TOKEN", "")
@@ -18,7 +18,6 @@ SMOOTH_WINDOW = 40
 DZ_THRESH = 0.5
 FT_PER_M = 3.28084
 GEOD = Geod(ellps="WGS84")
-MAX_SNAP_M = 80
 MAX_WORKERS = 8
 
 # ---------------- TERRAIN CACHE ----------------
@@ -30,10 +29,8 @@ class TerrainCache:
 
     @staticmethod
     def decode_rgb_arr(rgb_arr: np.ndarray) -> np.ndarray:
-        r = rgb_arr[..., 0].astype(np.int64)
-        g = rgb_arr[..., 1].astype(np.int64)
-        b = rgb_arr[..., 2].astype(np.int64)
-        return -10000.0 + (r * 256 * 256 + g * 256 + b) * 0.1
+        r, g, b = rgb_arr[..., 0], rgb_arr[..., 1], rgb_arr[..., 2]
+        return -10000.0 + (r.astype(np.int64)*256*256 + g.astype(np.int64)*256 + b.astype(np.int64)) * 0.1
 
     def fetch_tile(self, z: int, x: int, y: int):
         key = (z, x, y)
@@ -43,7 +40,7 @@ class TerrainCache:
         try:
             r = requests.get(url, params={"access_token": self.token}, timeout=10)
             if r.status_code != 200:
-                print(f"[Mapbox error] {r.status_code} for {z}/{x}/{y}")
+                print(f"[Mapbox error] {r.status_code} for tile {z}/{x}/{y}")
                 return None
             arr = np.asarray(Image.open(io.BytesIO(r.content)).convert("RGB"), dtype=np.uint8)
             self.tiles[key] = arr
@@ -56,19 +53,15 @@ class TerrainCache:
         z = self.zoom
         n = float(2 ** z)
         xt = (lons + 180.0) / 360.0 * n
-        lat_r = np.radians(lats)
-        yt = (1.0 - np.log(np.tan(lat_r) + 1.0 / np.cos(lat_r)) / math.pi) / 2.0 * n
-        x_tile = np.floor(xt).astype(np.int64)
-        y_tile = np.floor(yt).astype(np.int64)
-        xp = (xt - x_tile) * 255.0
-        yp = (yt - y_tile) * 255.0
-        out = np.zeros_like(lons, dtype=np.float64)
+        yt = (1.0 - np.log(np.tan(np.radians(lats)) + 1 / np.cos(np.radians(lats))) / math.pi) / 2.0 * n
+        x_tile, y_tile = np.floor(xt).astype(np.int64), np.floor(yt).astype(np.int64)
+        xp, yp = (xt - x_tile) * 255.0, (yt - y_tile) * 255.0
+        out = np.zeros_like(lons)
         for i in range(len(lons)):
             arr = self.fetch_tile(z, int(x_tile[i]), int(y_tile[i]))
             if arr is None:
                 continue
-            x0 = int(np.clip(xp[i], 0, 254))
-            y0 = int(np.clip(yp[i], 0, 254))
+            x0, y0 = int(np.clip(xp[i], 0, 254)), int(np.clip(yp[i], 0, 254))
             x1, y1 = x0 + 1, y0 + 1
             dx, dy = xp[i] - x0, yp[i] - y0
             e00 = self.decode_rgb_arr(arr[y0, x0])
@@ -84,14 +77,13 @@ class TerrainCache:
         tiles = set()
         for lon, lat in lon_lat_pairs:
             xt = (lon + 180.0) / 360.0 * n
-            lat_r = math.radians(lat)
-            yt = (1.0 - math.log(math.tan(lat_r) + 1.0 / math.cos(lat_r)) / math.pi) / 2.0 * n
+            yt = (1.0 - math.log(math.tan(math.radians(lat)) + 1 / math.cos(math.radians(lat))) / math.pi) / 2.0 * n
             tiles.add((z, int(xt), int(yt)))
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             futures = [ex.submit(self.fetch_tile, *t) for t in tiles]
             for _ in as_completed(futures):
                 pass
-        print(f"Prefetched {len(tiles)} tiles for faster computation.")
+        print(f"Prefetched {len(tiles)} tiles")
 
 # ---------------- HELPERS ----------------
 def smooth(a, window_m, spacing_m):
@@ -103,44 +95,63 @@ def smooth(a, window_m, spacing_m):
     kernel = np.ones(n) / n
     return np.convolve(a, kernel, mode="same")
 
-# ---------------- REGEX PARSER ----------------
+# ---------------- KML PARSER ----------------
 def parse_kml_kmz(uploaded_file):
     if uploaded_file.name.lower().endswith(".kmz"):
         with zipfile.ZipFile(uploaded_file) as zf:
             kml_name = next((n for n in zf.namelist() if n.lower().endswith(".kml")), None)
             if not kml_name:
                 return [], []
-            data = zf.read(kml_name)
+            text = zf.read(kml_name).decode("utf-8", errors="ignore")
     else:
-        data = uploaded_file.read()
+        text = uploaded_file.read().decode("utf-8", errors="ignore")
 
-    text = data.decode("utf-8", errors="ignore")
+    agms, centerlines = [], []
 
-    centerline_block = re.search(r"<Folder>.*?<name>\s*CENTERLINE\s*</name>(.*?)</Folder>", text, re.S | re.I)
-    agm_block = re.search(r"<Folder>.*?<name>\s*AGMs\s*</name>(.*?)</Folder>", text, re.S | re.I)
+    # --- Extract AGMs ---
+    agm_folder = re.search(r"<Folder>.*?<name>\s*AGMs\s*</name>(.*?)</Folder>", text, re.S | re.I)
+    if agm_folder:
+        placemarks = re.findall(r"<Placemark>(.*?)</Placemark>", agm_folder.group(1), re.S | re.I)
+        for pm in placemarks:
+            name_match = re.search(r"<name>(.*?)</name>", pm, re.S | re.I)
+            if not name_match:
+                continue
+            name = name_match.group(1).strip()
 
-    centerlines, agms = [], []
+            # Try <Point><coordinates>
+            coord_match = re.search(r"<coordinates>([-\d\.,\s]+)</coordinates>", pm, re.S | re.I)
+            if coord_match:
+                lon, lat, *_ = map(float, coord_match.group(1).strip().split(","))
+                agms.append((name, Point(lon, lat)))
+                continue
 
-    if centerline_block:
-        coords = re.findall(r"<coordinates>(.*?)</coordinates>", centerline_block.group(1), re.S | re.I)
+            # Try <LookAt><latitude> and <longitude>
+            lat_match = re.search(r"<latitude>([-\d\.]+)</latitude>", pm, re.I)
+            lon_match = re.search(r"<longitude>([-\d\.]+)</longitude>", pm, re.I)
+            if lat_match and lon_match:
+                lat = float(lat_match.group(1))
+                lon = float(lon_match.group(1))
+                agms.append((name, Point(lon, lat)))
+                continue
+
+            # Fallback: try inside CDATA description
+            lat_desc = re.search(r"Latitude.*?>([-\d\.]+)<", pm, re.I)
+            lon_desc = re.search(r"Longitude.*?>([-\d\.]+)<", pm, re.I)
+            if lat_desc and lon_desc:
+                lat = float(lat_desc.group(1))
+                lon = float(lon_desc.group(1))
+                agms.append((name, Point(lon, lat)))
+
+    # --- Extract Centerline ---
+    center_folder = re.search(r"<Folder>.*?<name>\s*CENTERLINE\s*</name>(.*?)</Folder>", text, re.S | re.I)
+    if center_folder:
+        coords = re.findall(r"<coordinates>(.*?)</coordinates>", center_folder.group(1), re.S | re.I)
         for cset in coords:
-            pts = [tuple(map(float, x.split(",")[:2])) for x in cset.strip().split()]
+            pts = [tuple(map(float, p.split(",")[:2])) for p in cset.strip().split()]
             if len(pts) >= 2:
                 centerlines.append(LineString(pts))
 
-    if agm_block:
-        placemarks = re.findall(r"<Placemark>(.*?)</Placemark>", agm_block.group(1), re.S | re.I)
-        for pm in placemarks:
-            name_match = re.search(r"<name>(.*?)</name>", pm, re.S | re.I)
-            coord_match = re.search(r"<coordinates>(.*?)</coordinates>", pm, re.S | re.I)
-            if not name_match or not coord_match:
-                continue
-            name = name_match.group(1).strip()
-            if name.upper().startswith("SP"):
-                continue
-            lon, lat, *_ = map(float, coord_match.group(1).strip().split(","))
-            agms.append((name, Point(lon, lat)))
-
+    # Sort AGMs numerically
     agms.sort(key=lambda p: int(''.join(filter(str.isdigit, p[0]))) if any(ch.isdigit() for ch in p[0]) else -1)
     return agms, centerlines
 
@@ -156,14 +167,15 @@ if not agms or not lines:
     st.stop()
 
 line_ll = lines[0]
-to_m, to_ll = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True), Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+to_m = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+to_ll = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
 X_m, Y_m = to_m.transform(*zip(*line_ll.coords))
 line_m = LineString(zip(X_m, Y_m))
 
 cache = TerrainCache(MAPBOX_TOKEN, MAPBOX_ZOOM)
 st.info("🚀 Prefetching terrain tiles in parallel...")
 cache.prefetch_tiles(list(line_ll.coords))
-st.success("✅ Tile prefetch complete — continuing computation.")
+st.success("✅ Tile prefetch complete — starting calculations")
 
 rows, cum_mi = [], 0.0
 bar, status = st.progress(0), st.empty()
@@ -174,11 +186,10 @@ for i in range(total):
     n2, a2 = agms[i + 1]
     status.text(f"⏱ Calculating {n1} → {n2} ({i + 1}/{total}) …")
     bar.progress((i + 1) / total)
+
     p1_m = Point(*to_m.transform(a1.x, a1.y))
     p2_m = Point(*to_m.transform(a2.x, a2.y))
     s1, s2 = sorted((line_m.project(p1_m), line_m.project(p2_m)))
-
-    # Handle zero or near-zero distances gracefully
     if abs(s2 - s1) < 1:
         continue
 

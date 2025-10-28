@@ -1,9 +1,8 @@
-# requirements.txt
-streamlit
-pandas
-numpy
-shapely
-pyproj
-requests
-zipfile36
-Pillow
+streamlit==1.50.0
+pandas==2.3.3
+numpy==2.3.4
+shapely==2.1.2
+pyproj==3.7.2
+requests==2.32.3
+Pillow==10.4.0
+zipfile36==0.1.3

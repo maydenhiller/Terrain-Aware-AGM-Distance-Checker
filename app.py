@@ -1,4 +1,4 @@
-# app.py — Terrain-Aware AGM Distance Calculator (Parallel Tile Prefetch Version)
+# app.py — Terrain-Aware AGM Distance Calculator (Parallel Tile Prefetch Version — Robust KML Parsing)
 
 import io, math, time, zipfile, xml.etree.ElementTree as ET
 import numpy as np, pandas as pd, requests, streamlit as st
@@ -46,7 +46,7 @@ class TerrainCache:
             print(f"[Mapbox fetch error] {e}")
             return None
         if r.status_code != 200:
-            print(f"[Mapbox error] {r.status_code} for {z}/{x}/{y}")
+            print(f"[Mapbox error] {r.status_code} for tile {z}/{x}/{y}")
             return None
         arr = np.asarray(Image.open(io.BytesIO(r.content)).convert("RGB"), dtype=np.uint8)
         self.tiles[key] = arr
@@ -58,13 +58,11 @@ class TerrainCache:
         xt = (lons + 180.0) / 360.0 * n
         lat_r = np.radians(lats)
         yt = (1.0 - np.log(np.tan(lat_r) + 1.0 / np.cos(lat_r)) / math.pi) / 2.0 * n
-
         x_tile = np.floor(xt).astype(np.int64)
         y_tile = np.floor(yt).astype(np.int64)
         xp = (xt - x_tile) * 255.0
         yp = (yt - y_tile) * 255.0
         out = np.zeros_like(lons, dtype=np.float64)
-
         for i in range(len(lons)):
             arr = self.fetch_tile(z, int(x_tile[i]), int(y_tile[i]))
             if arr is None:
@@ -81,23 +79,19 @@ class TerrainCache:
         return out
 
     def prefetch_tiles(self, lon_lat_pairs):
-        """Prefetch all tiles used along the centerline in parallel."""
         z = self.zoom
         n = float(2 ** z)
-        x_tiles, y_tiles = set(), set()
         tiles = set()
         for lon, lat in lon_lat_pairs:
             xt = (lon + 180.0) / 360.0 * n
             lat_r = math.radians(lat)
             yt = (1.0 - math.log(math.tan(lat_r) + 1.0 / math.cos(lat_r)) / math.pi) / 2.0 * n
             tiles.add((z, int(xt), int(yt)))
-
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             futures = [ex.submit(self.fetch_tile, *t) for t in tiles]
             for _ in as_completed(futures):
                 pass
         print(f"Prefetched {len(tiles)} tiles for faster computation.")
-
 
 # ---------------- HELPERS ----------------
 def smooth(a, window_m, spacing_m):
@@ -118,7 +112,7 @@ def strip_ns(e):
     for c in e:
         strip_ns(c)
 
-# ---------------- PARSER (UNCHANGED) ----------------
+# ---------------- PARSER ----------------
 def parse_kml_kmz(uploaded_file):
     if uploaded_file.name.lower().endswith(".kmz"):
         with zipfile.ZipFile(uploaded_file) as zf:
@@ -128,7 +122,18 @@ def parse_kml_kmz(uploaded_file):
             data = zf.read(kml_name)
     else:
         data = uploaded_file.read()
-    root = ET.fromstring(data)
+    # Decode safely, remove junk before <kml>
+    try:
+        text = data.decode("utf-8-sig", errors="ignore")
+    except Exception:
+        text = str(data)
+    idx = text.find("<kml")
+    if idx > 0:
+        text = text[idx:]
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as e:
+        raise ValueError(f"Invalid KML file: {e}")
     strip_ns(root)
     agms, centerlines = [], []
     for folder in root.findall(".//Folder"):
@@ -149,7 +154,7 @@ def parse_kml_kmz(uploaded_file):
                     continue
                 lon, lat, *_ = map(float, coords_el.text.strip().split(","))
                 agms.append((nm, Point(lon, lat)))
-        if fname == "CENTERLINE":
+        elif fname == "CENTERLINE":
             for pm in folder.findall(".//Placemark"):
                 coords_el = pm.find(".//LineString/coordinates")
                 if coords_el is None or not coords_el.text:
@@ -159,7 +164,6 @@ def parse_kml_kmz(uploaded_file):
                     centerlines.append(LineString(pts))
     agms.sort(key=lambda p: int(''.join(filter(str.isdigit, p[0]))) if any(ch.isdigit() for ch in p[0]) else -1)
     return agms, centerlines
-
 
 def build_local_meter_crs(line_ll):
     xs, ys = zip(*line_ll.coords)
@@ -192,10 +196,9 @@ line_m = LineString(zip(X_m, Y_m))
 
 cache = TerrainCache(MAPBOX_TOKEN, MAPBOX_ZOOM)
 
-# Prefetch all tiles for this line once
 st.info("🚀 Prefetching terrain tiles in parallel...")
 cache.prefetch_tiles(list(line_ll.coords))
-st.success("✅ Tile prefetch complete — continuing to computation.")
+st.success("✅ Tile prefetch complete — continuing computation.")
 
 rows, cum_mi = [], 0.0
 bar, status = st.progress(0), st.empty()
@@ -206,22 +209,18 @@ for i in range(total):
     n2, a2 = agms[i + 1]
     status.text(f"⏱ Calculating {n1} → {n2} ({i + 1}/{total}) …")
     bar.progress((i + 1) / total)
-
     p1_m = Point(*to_m.transform(a1.x, a1.y))
     p2_m = Point(*to_m.transform(a2.x, a2.y))
     if snap_offset_m(line_m, p1_m) > MAX_SNAP_M or snap_offset_m(line_m, p2_m) > MAX_SNAP_M:
         continue
-
     s1, s2 = sorted((line_m.project(p1_m), line_m.project(p2_m)))
     si = np.arange(s1, s2, RESAMPLE_M)
     if si[-1] < s2:
         si = np.append(si, s2)
     pts_m = [line_m.interpolate(s) for s in si]
     pts_ll = np.array([to_ll.transform(p.x, p.y) for p in pts_m])
-
     elev = cache.elevations_bulk(pts_ll[:, 0], pts_ll[:, 1])
     elev = smooth(elev, SMOOTH_WINDOW, RESAMPLE_M)
-
     dist_m = 0.0
     for j in range(len(pts_ll) - 1):
         lon1, lat1 = pts_ll[j]
@@ -231,7 +230,6 @@ for i in range(total):
         if abs(dz) < DZ_THRESH:
             dz = 0
         dist_m += math.hypot(dxy, dz)
-
     feet = dist_m * FT_PER_M
     miles = feet / 5280
     cum_mi += miles

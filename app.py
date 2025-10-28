@@ -1,4 +1,4 @@
-# app.py — Terrain-Aware AGM Distances (Geodesic + Elevation, 25 m spacing)
+# app.py — Terrain-Aware AGM Distances (Geodesic + Elevation, 25 m spacing, hard-coded Mapbox token)
 
 import io, math, zipfile, xml.etree.ElementTree as ET
 import numpy as np, pandas as pd, requests, streamlit as st
@@ -11,30 +11,8 @@ from pyproj import Geod, Transformer
 st.set_page_config("Terrain AGM Distance — Geodesic", layout="wide")
 st.title("📏 Terrain-Aware AGM Distance Calculator — Geodesic + Elevation")
 
-# --- UNIVERSAL MAPBOX TOKEN HANDLER ---
-def get_mapbox_token():
-    try:
-        if "MAPBOX_TOKEN" in st.secrets:
-            return st.secrets["MAPBOX_TOKEN"]
-        if "mapbox" in st.secrets:
-            mb = st.secrets["mapbox"]
-            if isinstance(mb, dict) and "token" in mb:
-                return mb["token"]
-            if isinstance(mb, str):
-                return mb
-    except Exception as e:
-        st.error(f"Error reading secrets: {e}")
-    return None
-
-MAPBOX_TOKEN = get_mapbox_token()
-
-if not MAPBOX_TOKEN:
-    st.error("❌ Missing Mapbox token. Add either:\n"
-             "• MAPBOX_TOKEN = \"pk...\"\n"
-             "or\n"
-             "[mapbox]\n  token = \"pk...\"\n"
-             "to your `.streamlit/secrets.toml`.")
-    st.stop()
+# --- HARDCODED MAPBOX TOKEN ---
+MAPBOX_TOKEN = "pk.eyJ1IjoibWF5ZGVuaGlsbGVyIiwiYSI6ImNtZ2ljMnN5ejA3amwyam9tNWZnYnZibWwifQ.GXoTyHdvCYtr7GvKIW9LPA"
 
 # Tunables
 RESAMPLE_M = 25

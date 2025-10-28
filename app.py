@@ -13,14 +13,17 @@ st.title("📏 Terrain-Aware AGM Distance Calculator — Geodesic + Elevation")
 
 # --- UNIVERSAL MAPBOX TOKEN HANDLER ---
 def get_mapbox_token():
-    if "MAPBOX_TOKEN" in st.secrets:
-        return st.secrets["MAPBOX_TOKEN"]
-    if "mapbox" in st.secrets:
-        mb = st.secrets["mapbox"]
-        if isinstance(mb, dict) and "token" in mb:
-            return mb["token"]
-        if isinstance(mb, str):
-            return mb
+    try:
+        if "MAPBOX_TOKEN" in st.secrets:
+            return st.secrets["MAPBOX_TOKEN"]
+        if "mapbox" in st.secrets:
+            mb = st.secrets["mapbox"]
+            if isinstance(mb, dict) and "token" in mb:
+                return mb["token"]
+            if isinstance(mb, str):
+                return mb
+    except Exception as e:
+        st.error(f"Error reading secrets: {e}")
     return None
 
 MAPBOX_TOKEN = get_mapbox_token()

@@ -1,4 +1,4 @@
-# app.py — Terrain-Aware AGM Distance Calculator (Hybrid Parser v4, Safe Coordinate Handling)
+# app.py — Terrain-Aware AGM Distance Calculator (Final v5: Document-based CENTERLINE support)
 
 import io, math, re, zipfile, xml.etree.ElementTree as ET
 import numpy as np, pandas as pd, requests, streamlit as st
@@ -8,7 +8,7 @@ from pyproj import Geod, Transformer
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config("Terrain AGM Distance", layout="wide")
-st.title("📏 Terrain-Aware AGM Distance Calculator — Hybrid Parser v4")
+st.title("📏 Terrain-Aware AGM Distance Calculator — Final v5")
 
 # ---------------- CONFIG ----------------
 MAPBOX_TOKEN = st.secrets.get("MAPBOX_TOKEN", "")
@@ -108,81 +108,58 @@ def parse_kml_kmz(uploaded_file):
 
     agms, centerlines = [], []
 
-    # Try XML parse first
-    try:
-        root = ET.fromstring(data)
-        for elem in root.iter():
-            tag = elem.tag.split("}")[-1].lower()
-            if tag == "folder":
-                name_el = elem.find(".//{*}name")
-                if name_el is not None and name_el.text and "agm" in name_el.text.lower():
-                    for pm in elem.findall(".//{*}Placemark"):
-                        nm_el = pm.find(".//{*}name")
-                        if nm_el is None or not nm_el.text:
-                            continue
-                        name = nm_el.text.strip()
-                        if name.upper().startswith("SP"):
-                            continue
-                        lon = lat = None
-                        coord_el = pm.find(".//{*}Point/{*}coordinates")
-                        if coord_el is not None and coord_el.text:
-                            first_pair = coord_el.text.strip().split()[0]
-                            lon, lat = map(float, first_pair.split(",")[:2])
-                        else:
-                            la = pm.find(".//{*}latitude")
-                            lo = pm.find(".//{*}longitude")
-                            if la is not None and lo is not None:
-                                lat = float(la.text)
-                                lon = float(lo.text)
-                        if lon is not None and lat is not None:
-                            agms.append((name, Point(lon, lat)))
-                if name_el is not None and "centerline" in name_el.text.lower():
-                    for pm in elem.findall(".//{*}Placemark"):
-                        coord_el = pm.find(".//{*}LineString/{*}coordinates")
-                        if coord_el is None or not coord_el.text:
-                            continue
-                        pts = []
-                        for seg in coord_el.text.strip().split():
-                            parts = seg.split(",")
-                            if len(parts) >= 2:
-                                pts.append((float(parts[0]), float(parts[1])))
-                        if len(pts) >= 2:
-                            centerlines.append(LineString(pts))
-    except Exception as e:
-        print(f"[XML warning] {e}")
-
-    # Regex fallback if needed
-    if len(agms) < 3:
-        placemarks = re.findall(r"<Placemark>(.*?)</Placemark>", data, re.S | re.I)
-        agms = []
-        for pm in placemarks:
-            name_match = re.search(r"<name>(.*?)</name>", pm, re.S | re.I)
-            if not name_match:
-                continue
-            name = name_match.group(1).strip()
-            if name.upper().startswith("SP"):
-                continue
-            lat, lon = None, None
-            coord_match = re.search(r"<coordinates>([-\d\.,\s]+)</coordinates>", pm, re.S | re.I)
-            if coord_match:
-                first_pair = coord_match.group(1).strip().split()[0]
-                lon, lat = map(float, first_pair.split(",")[:2])
-            else:
-                lat_match = re.search(r"<latitude>([-\d\.]+)</latitude>", pm)
-                lon_match = re.search(r"<longitude>([-\d\.]+)</longitude>", pm)
-                if lat_match and lon_match:
-                    lat = float(lat_match.group(1))
-                    lon = float(lon_match.group(1))
-                else:
-                    lat_desc = re.search(r"Latitude.*?>([-\d\.]+)<", pm, re.I)
-                    lon_desc = re.search(r"Longitude.*?>([-\d\.]+)<", pm, re.I)
-                    if lat_desc and lon_desc:
-                        lat = float(lat_desc.group(1))
-                        lon = float(lon_desc.group(1))
-            if lon and lat:
-                agms.append((name, Point(lon, lat)))
+    # ---- AGM extraction (same as before)
+    placemarks = re.findall(r"<Placemark>(.*?)</Placemark>", data, re.S | re.I)
+    for pm in placemarks:
+        if "<Point" not in pm:
+            continue
+        name_match = re.search(r"<name>(.*?)</name>", pm, re.S | re.I)
+        if not name_match:
+            continue
+        name = name_match.group(1).strip()
+        if name.upper().startswith("SP"):
+            continue
+        lon = lat = None
+        coord_match = re.search(r"<coordinates>([-\d\.,\s]+)</coordinates>", pm, re.S | re.I)
+        if coord_match:
+            first_pair = coord_match.group(1).strip().split()[0]
+            parts = first_pair.split(",")
+            if len(parts) >= 2:
+                lon, lat = float(parts[0]), float(parts[1])
+        else:
+            lat_match = re.search(r"<latitude>([-\d\.]+)</latitude>", pm)
+            lon_match = re.search(r"<longitude>([-\d\.]+)</longitude>", pm)
+            if lat_match and lon_match:
+                lat = float(lat_match.group(1))
+                lon = float(lon_match.group(1))
+        if lon and lat:
+            agms.append((name, Point(lon, lat)))
 
     agms.sort(key=lambda p: int(''.join(filter(str.isdigit, p[0]))) if any(ch.isdigit() for ch in p[0]) else -1)
+
+    # ---- CENTERLINE extraction (supports <Document><name>CENTERLINE</name>)
+    center_doc = re.search(r"<Document[^>]*>\s*<name>\s*CENTERLINE\s*</name>(.*?)</Document>", data, re.S | re.I)
+    center_folder = re.search(r"<Folder[^>]*>\s*<name>\s*CENTERLINE\s*</name>(.*?)</Folder>", data, re.S | re.I)
+
+    center_src = None
+    if center_doc:
+        center_src = center_doc.group(1)
+    elif center_folder:
+        center_src = center_folder.group(1)
+    else:
+        # fallback to entire file if needed
+        center_src = data
+
+    coords = re.findall(r"<coordinates>(.*?)</coordinates>", center_src, re.S | re.I)
+    for block in coords:
+        pts = []
+        for seg in block.strip().split():
+            parts = seg.split(",")
+            if len(parts) >= 2:
+                pts.append((float(parts[0]), float(parts[1])))
+        if len(pts) >= 2:
+            centerlines.append(LineString(pts))
+
     return agms, centerlines
 
 # ---------------- MAIN ----------------

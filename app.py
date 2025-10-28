@@ -1,4 +1,4 @@
-# app.py — Terrain-Aware AGM Distance Calculator (Regex-based KML Parser)
+# app.py — Terrain-Aware AGM Distance Calculator (Regex Parser, Safe Indexing)
 
 import io, math, re, zipfile
 import numpy as np, pandas as pd, requests, streamlit as st
@@ -8,7 +8,7 @@ from pyproj import Geod, Transformer
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config("Terrain AGM Distance", layout="wide")
-st.title("📏 Terrain-Aware AGM Distance Calculator — Regex Parser")
+st.title("📏 Terrain-Aware AGM Distance Calculator — Regex Parser (Stable Indexing)")
 
 # ---------------- CONFIG ----------------
 MAPBOX_TOKEN = st.secrets.get("MAPBOX_TOKEN", "")
@@ -116,7 +116,6 @@ def parse_kml_kmz(uploaded_file):
 
     text = data.decode("utf-8", errors="ignore")
 
-    # Extract CENTERLINE coordinates
     centerline_block = re.search(r"<Folder>.*?<name>\s*CENTERLINE\s*</name>(.*?)</Folder>", text, re.S | re.I)
     agm_block = re.search(r"<Folder>.*?<name>\s*AGMs\s*</name>(.*?)</Folder>", text, re.S | re.I)
 
@@ -178,9 +177,15 @@ for i in range(total):
     p1_m = Point(*to_m.transform(a1.x, a1.y))
     p2_m = Point(*to_m.transform(a2.x, a2.y))
     s1, s2 = sorted((line_m.project(p1_m), line_m.project(p2_m)))
+
+    # Handle zero or near-zero distances gracefully
+    if abs(s2 - s1) < 1:
+        continue
+
     si = np.arange(s1, s2, RESAMPLE_M)
-    if si[-1] < s2:
+    if len(si) == 0 or si[-1] < s2:
         si = np.append(si, s2)
+
     pts_m = [line_m.interpolate(s) for s in si]
     pts_ll = np.array([to_ll.transform(p.x, p.y) for p in pts_m])
     elev = cache.elevations_bulk(pts_ll[:, 0], pts_ll[:, 1])

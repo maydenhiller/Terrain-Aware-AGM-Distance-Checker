@@ -1,4 +1,4 @@
-# app.py — Terrain-Aware AGM Distance Calculator (Safe Universal Parser)
+# app.py — Terrain-Aware AGM Distance Calculator (Case-Insensitive Robust Folder Parser)
 
 import io, math, zipfile, xml.etree.ElementTree as ET
 import numpy as np, pandas as pd, requests, streamlit as st
@@ -8,7 +8,7 @@ from pyproj import Geod, Transformer
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config("Terrain AGM Distance", layout="wide")
-st.title("📏 Terrain-Aware AGM Distance Calculator — Safe Parser")
+st.title("📏 Terrain-Aware AGM Distance Calculator — Case-Insensitive Folder Parser")
 
 # ---------------- CONFIG ----------------
 MAPBOX_TOKEN = st.secrets.get("MAPBOX_TOKEN", "")
@@ -125,7 +125,7 @@ def parse_kml_kmz(uploaded_file):
             data = uploaded_file.read()
 
         text = data.decode("utf-8", errors="ignore")
-        idx = text.find("<kml")
+        idx = text.lower().find("<kml")
         if idx > 0:
             text = text[idx:]
         root = ET.fromstring(text)
@@ -136,11 +136,11 @@ def parse_kml_kmz(uploaded_file):
     strip_ns(root)
     agms, centerlines = [], []
     for folder in root.findall(".//Folder"):
-        n = folder.find("name")
-        if n is None or not n.text:
+        name_el = folder.find("name")
+        if name_el is None or not name_el.text:
             continue
-        fname = n.text.strip()
-        if fname == "AGMs":
+        fname = name_el.text.strip().lower()
+        if "agm" in fname:
             for pm in folder.findall(".//Placemark"):
                 nm_el = pm.find("name")
                 if nm_el is None or not nm_el.text:
@@ -153,7 +153,7 @@ def parse_kml_kmz(uploaded_file):
                     continue
                 lon, lat, *_ = map(float, coords_el.text.strip().split(","))
                 agms.append((nm, Point(lon, lat)))
-        elif fname == "CENTERLINE":
+        if "centerline" in fname:
             for pm in folder.findall(".//Placemark"):
                 coords_el = pm.find(".//LineString/coordinates")
                 if coords_el is None or not coords_el.text:

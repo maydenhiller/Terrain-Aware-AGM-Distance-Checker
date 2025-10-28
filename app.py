@@ -1,4 +1,4 @@
-# app.py — Terrain-Aware AGM Distance Calculator (v6: Strict AGM Folder Filtering + Document-based Centerline)
+# app.py — Terrain-Aware AGM Distance Calculator (Numeric AGM Auto-Detect)
 
 import io, math, re, zipfile, xml.etree.ElementTree as ET
 import numpy as np, pandas as pd, requests, streamlit as st
@@ -8,7 +8,7 @@ from pyproj import Geod, Transformer
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config("Terrain AGM Distance", layout="wide")
-st.title("📏 Terrain-Aware AGM Distance Calculator — v6")
+st.title("📏 Terrain-Aware AGM Distance Calculator — Numeric AGM Auto-Detect")
 
 # ---------------- CONFIG ----------------
 MAPBOX_TOKEN = st.secrets.get("MAPBOX_TOKEN", "")
@@ -108,44 +108,39 @@ def parse_kml_kmz(uploaded_file):
 
     agms, centerlines = [], []
 
-    # AGM SECTION — only inside folders/documents named AGMs
-    agm_blocks = re.findall(
-        r"(<(?:Folder|Document)[^>]*>\s*<name>\s*AGMs\s*</name>.*?</(?:Folder|Document)>)",
-        data, re.S | re.I
-    )
-    for block in agm_blocks:
-        placemarks = re.findall(r"<Placemark>(.*?)</Placemark>", block, re.S | re.I)
-        for pm in placemarks:
-            if "<Point" not in pm:
-                continue
-            name_match = re.search(r"<name>(.*?)</name>", pm, re.S | re.I)
-            if not name_match:
-                continue
-            name = name_match.group(1).strip()
-            if name.upper().startswith("SP"):
-                continue
-            lon = lat = None
-            coord_match = re.search(r"<coordinates>([-\d\.,\s]+)</coordinates>", pm, re.S | re.I)
-            if coord_match:
-                first_pair = coord_match.group(1).strip().split()[0]
-                parts = first_pair.split(",")
-                if len(parts) >= 2:
-                    lon, lat = float(parts[0]), float(parts[1])
-            else:
-                lat_match = re.search(r"<latitude>([-\d\.]+)</latitude>", pm)
-                lon_match = re.search(r"<longitude>([-\d\.]+)</longitude>", pm)
-                if lat_match and lon_match:
-                    lat = float(lat_match.group(1))
-                    lon = float(lon_match.group(1))
-            if lon and lat:
-                agms.append((name, Point(lon, lat)))
+    # --- AGMs: numeric name only ---
+    placemarks = re.findall(r"<Placemark>(.*?)</Placemark>", data, re.S | re.I)
+    for pm in placemarks:
+        name_match = re.search(r"<name>(.*?)</name>", pm, re.S | re.I)
+        if not name_match:
+            continue
+        name = name_match.group(1).strip()
+        if not re.fullmatch(r"\d+", name):  # only pure numeric names
+            continue
 
-    agms.sort(key=lambda p: int(''.join(filter(str.isdigit, p[0]))) if any(ch.isdigit() for ch in p[0]) else -1)
+        # get coords from <coordinates> or <latitude>/<longitude>
+        lon = lat = None
+        coord_match = re.search(r"<coordinates>([-\d\.,\s]+)</coordinates>", pm, re.S | re.I)
+        if coord_match:
+            first_pair = coord_match.group(1).strip().split()[0]
+            parts = first_pair.split(",")
+            if len(parts) >= 2:
+                lon, lat = float(parts[0]), float(parts[1])
+        else:
+            lat_match = re.search(r"<latitude>([-\d\.]+)</latitude>", pm)
+            lon_match = re.search(r"<longitude>([-\d\.]+)</longitude>", pm)
+            if lat_match and lon_match:
+                lat = float(lat_match.group(1))
+                lon = float(lon_match.group(1))
 
-    # CENTERLINE SECTION — supports Document or Folder
+        if lon is not None and lat is not None:
+            agms.append((name, Point(lon, lat)))
+
+    agms.sort(key=lambda p: int(p[0]))
+
+    # --- CENTERLINE ---
     center_doc = re.search(r"<Document[^>]*>\s*<name>\s*CENTERLINE\s*</name>(.*?)</Document>", data, re.S | re.I)
     center_folder = re.search(r"<Folder[^>]*>\s*<name>\s*CENTERLINE\s*</name>(.*?)</Folder>", data, re.S | re.I)
-
     center_src = center_doc.group(1) if center_doc else center_folder.group(1) if center_folder else ""
     coords = re.findall(r"<coordinates>(.*?)</coordinates>", center_src, re.S | re.I)
     for block in coords:

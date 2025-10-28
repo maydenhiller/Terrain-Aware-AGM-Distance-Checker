@@ -1,19 +1,19 @@
-# app.py — Terrain-Aware AGM Distance Calculator (Fault-tolerant KML parsing)
+# app.py — Terrain-Aware AGM Distance Calculator (Namespace-safe robust parser)
 
-import io, math, zipfile, xml.etree.ElementTree as ET, re
+import io, math, zipfile, re, xml.etree.ElementTree as ET
 import numpy as np, pandas as pd, requests, streamlit as st
 from PIL import Image
 from shapely.geometry import LineString, Point, MultiLineString
 from shapely.ops import linemerge
 from pyproj import Geod, Transformer
 
-# ---------------- CONFIG ----------------
 st.set_page_config("Terrain AGM Distance — Geodesic", layout="wide")
-st.title("📏 Terrain-Aware AGM Distance Calculator — Robust Parser")
+st.title("📏 Terrain-Aware AGM Distance Calculator — Robust XML Parser")
 
-# Hardcoded Mapbox token
+# --- Hardcoded Mapbox Token ---
 MAPBOX_TOKEN = "pk.eyJ1IjoibWF5ZGVuaGlsbGVyIiwiYSI6ImNtZ2ljMnN5ejA3amwyam9tNWZnYnZibWwifQ.GXoTyHdvCYtr7GvKIW9LPA"
 
+# --- Settings ---
 RESAMPLE_M = 25
 SMOOTH_WINDOW_M = 50
 ELEV_DZ_THRESHOLD = 0.25
@@ -38,7 +38,7 @@ class TerrainRGBCache:
         yt = (1.0 - np.log(np.tan(lat_r) + 1.0 / np.cos(lat_r)) / math.pi) / 2.0 * n
         return xt, yt
 
-    def fetch_tile(self, x_tile: int, y_tile: int):
+    def fetch_tile(self, x_tile, y_tile):
         key = (self.z, x_tile, y_tile)
         if key in self.cache:
             return self.cache[key]
@@ -61,7 +61,8 @@ class TerrainRGBCache:
         keys, inv = np.unique(np.stack([tx, ty], 1), axis=0, return_inverse=True)
         for i, (x_tile, y_tile) in enumerate(keys):
             arr = self.fetch_tile(int(x_tile), int(y_tile))
-            if arr is None: continue
+            if arr is None:
+                continue
             m = inv == i
             x0, y0 = np.clip(xp[m].astype(int), 0, 254), np.clip(yp[m].astype(int), 0, 254)
             x1, y1 = x0 + 1, y0 + 1
@@ -71,59 +72,73 @@ class TerrainRGBCache:
             out[m] = e00*(1-dx)*(1-dy) + e10*dx*(1-dy) + e01*(1-dx)*dy + e11*dx*dy
         return out
 
-# ---------------- HELPERS ----------------
-def moving_average(v, w_m, s_m):
-    if len(v) < 3: return v
-    n = max(3, int(round(w_m/max(s_m,1e-6))))
-    if n % 2 == 0: n += 1
-    k = np.ones(n)/n
-    return np.convolve(v, k, "same")
-
-def strip_ns(e):
-    e.tag = e.tag.split("}",1)[-1]
-    e.attrib = {k.split("}",1)[-1]:v for k,v in e.attrib.items()}
-    for c in list(e): strip_ns(c)
-
-def safe_parse_xml(raw):
-    """Parse XML, removing invalid characters and malformed tags."""
+# ---------------- XML HELPERS ----------------
+def clean_xml(raw: bytes | str) -> str:
+    """Strip namespaces, invalid characters, and unbound prefixes."""
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8", errors="ignore")
-    # remove illegal href or control chars
-    raw = re.sub(r"<href>[^<>\s]+ [^<]*</href>", "", raw)
-    raw = re.sub(r"[^\x09\x0A\x0D\x20-\x7E]", "", raw)
-    # find first < and last >
-    s = raw[raw.find("<"): raw.rfind(">")+1]
-    return ET.fromstring(s)
 
+    # remove illegal characters
+    raw = re.sub(r"[^\x09\x0A\x0D\x20-\x7E]", "", raw)
+    # remove unbound prefixes like xsi:, gx:, kml:
+    raw = re.sub(r"\bxsi:|gx:|kml:|xmlns:gx=\"[^\"]*\"|xmlns:xsi=\"[^\"]*\"", "", raw)
+    # remove malformed hrefs like <href>https://Red X</href>
+    raw = re.sub(r"<href>[^<>\s]+ [^<]*</href>", "", raw)
+    # remove redundant schema declarations
+    raw = re.sub(r"xsi:schemaLocation=\"[^\"]*\"", "", raw)
+    # ensure we start at first < and end at last >
+    start, end = raw.find("<"), raw.rfind(">")
+    return raw[start:end+1] if start >= 0 and end > start else raw
+
+def safe_parse_kml(raw: bytes | str):
+    xml_clean = clean_xml(raw)
+    try:
+        root = ET.fromstring(xml_clean)
+    except Exception as e:
+        raise ValueError(f"XML parse failed even after cleaning: {e}")
+    strip_ns(root)
+    return root
+
+def strip_ns(elem):
+    elem.tag = elem.tag.split("}", 1)[-1]
+    elem.attrib = {k.split("}", 1)[-1]: v for k, v in elem.attrib.items()}
+    for c in list(elem):
+        strip_ns(c)
+
+# ---------------- KML PARSER ----------------
 def parse_kml_kmz(uploaded):
     if uploaded.name.lower().endswith(".kmz"):
         with zipfile.ZipFile(uploaded) as zf:
             kml_name = next((n for n in zf.namelist() if n.lower().endswith(".kml")), None)
-            if not kml_name: return [], []
+            if not kml_name:
+                return [], []
             raw = zf.read(kml_name)
     else:
         raw = uploaded.read()
+
     try:
-        root = safe_parse_xml(raw)
+        root = safe_parse_kml(raw)
     except Exception as e:
         st.error(f"Failed to parse XML: {e}")
         return [], []
-    strip_ns(root)
 
     agms, centerlines = [], []
     for folder in root.findall(".//Folder"):
         n = folder.find("name")
-        if n is None or not n.text: continue
+        if n is None or not n.text:
+            continue
         fname = n.text.strip().upper()
         if fname == "AGMS":
             for pm in folder.findall(".//Placemark"):
                 name = pm.findtext("name", "").strip()
-                if not name or name.upper().startswith("SP"): continue
+                if not name or name.upper().startswith("SP"):
+                    continue
                 coords = pm.findtext(".//Point/coordinates", "")
                 try:
                     lon, lat = map(float, coords.split(",")[:2])
                     agms.append((name, Point(lon, lat)))
-                except: continue
+                except:
+                    continue
         elif fname == "CENTERLINE":
             for c in folder.findall(".//LineString/coordinates"):
                 pts = []
@@ -131,16 +146,21 @@ def parse_kml_kmz(uploaded):
                     try:
                         lon, lat = map(float, pair.split(",")[:2])
                         pts.append((lon, lat))
-                    except: pass
-                if len(pts) >= 2: centerlines.append(LineString(pts))
+                    except:
+                        pass
+                if len(pts) >= 2:
+                    centerlines.append(LineString(pts))
 
     agms.sort(key=lambda p: int("".join(filter(str.isdigit,p[0]))) if any(ch.isdigit() for ch in p[0]) else -1)
     if len(centerlines) > 1:
         merged = linemerge(MultiLineString(centerlines))
-        if isinstance(merged, LineString): centerlines=[merged]
-        elif isinstance(merged, MultiLineString): centerlines=list(merged.geoms)
+        if isinstance(merged, LineString):
+            centerlines = [merged]
+        elif isinstance(merged, MultiLineString):
+            centerlines = list(merged.geoms)
     return agms, centerlines
 
+# ---------------- COORD HELPERS ----------------
 def build_local_meter_crs(line_ll):
     xs, ys = zip(*line_ll.coords)
     lon0, lat0 = np.mean(xs), np.mean(ys)
@@ -159,19 +179,26 @@ def choose_best_centerline(lines,p1,p2):
         if d<best_d: best_d,best=d,ln
     return best
 
-# ---------------- MAIN ----------------
-u=st.file_uploader("Upload KML/KMZ",type=["kml","kmz"])
-if not u: st.stop()
+def moving_average(v, w_m, s_m):
+    if len(v) < 3: return v
+    n = max(3, int(round(w_m / max(s_m, 1e-6))))
+    if n % 2 == 0: n += 1
+    return np.convolve(v, np.ones(n)/n, mode="same")
 
-agms,lines=parse_kml_kmz(u)
+# ---------------- MAIN ----------------
+u = st.file_uploader("Upload KML/KMZ", type=["kml", "kmz"])
+if not u:
+    st.stop()
+
+agms, lines = parse_kml_kmz(u)
 st.text(f"{len(agms)} AGMs | {len(lines)} centerline part(s)")
 if not agms or not lines:
     st.warning("Need both AGMs and CENTERLINE.")
     st.stop()
 
-cache=TerrainRGBCache(MAPBOX_TOKEN,MAPBOX_ZOOM)
-rows,cum_mi=[],0.0
-bar,status=st.progress(0.0),st.empty()
+cache = TerrainRGBCache(MAPBOX_TOKEN, MAPBOX_ZOOM)
+rows, cum_mi = [], 0.0
+bar, status = st.progress(0.0), st.empty()
 
 for i in range(len(agms)-1):
     n1,a1=agms[i]; n2,a2=agms[i+1]
@@ -204,5 +231,5 @@ for i in range(len(agms)-1):
 status.success("✅ Complete.")
 df=pd.DataFrame(rows)
 st.dataframe(df,use_container_width=True)
-st.download_button("Download CSV",df.to_csv(index=False).encode("utf-8"),
-                   "terrain_distances.csv","text/csv")
+st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8"),
+                   "terrain_distances.csv", "text/csv")

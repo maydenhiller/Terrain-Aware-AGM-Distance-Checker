@@ -1,4 +1,4 @@
-# app.py — Terrain-Aware AGM Distance Calculator (Hybrid XML+Regex Parser, Final Stable Version)
+# app.py — Terrain-Aware AGM Distance Calculator (Hybrid Parser v4, Safe Coordinate Handling)
 
 import io, math, re, zipfile, xml.etree.ElementTree as ET
 import numpy as np, pandas as pd, requests, streamlit as st
@@ -8,7 +8,7 @@ from pyproj import Geod, Transformer
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config("Terrain AGM Distance", layout="wide")
-st.title("📏 Terrain-Aware AGM Distance Calculator — Hybrid Parser")
+st.title("📏 Terrain-Aware AGM Distance Calculator — Hybrid Parser v4")
 
 # ---------------- CONFIG ----------------
 MAPBOX_TOKEN = st.secrets.get("MAPBOX_TOKEN", "")
@@ -95,7 +95,7 @@ def smooth(a, window_m, spacing_m):
     kernel = np.ones(n) / n
     return np.convolve(a, kernel, mode="same")
 
-# ---------------- HYBRID PARSER ----------------
+# ---------------- PARSER ----------------
 def parse_kml_kmz(uploaded_file):
     if uploaded_file.name.lower().endswith(".kmz"):
         with zipfile.ZipFile(uploaded_file) as zf:
@@ -108,7 +108,7 @@ def parse_kml_kmz(uploaded_file):
 
     agms, centerlines = [], []
 
-    # ---- First try XML parsing safely ----
+    # Try XML parse first
     try:
         root = ET.fromstring(data)
         for elem in root.iter():
@@ -126,8 +126,8 @@ def parse_kml_kmz(uploaded_file):
                         lon = lat = None
                         coord_el = pm.find(".//{*}Point/{*}coordinates")
                         if coord_el is not None and coord_el.text:
-                            parts = list(map(float, coord_el.text.strip().split(",")[:2]))
-                            lon, lat = parts[0], parts[1]
+                            first_pair = coord_el.text.strip().split()[0]
+                            lon, lat = map(float, first_pair.split(",")[:2])
                         else:
                             la = pm.find(".//{*}latitude")
                             lo = pm.find(".//{*}longitude")
@@ -141,15 +141,18 @@ def parse_kml_kmz(uploaded_file):
                         coord_el = pm.find(".//{*}LineString/{*}coordinates")
                         if coord_el is None or not coord_el.text:
                             continue
-                        pts = [tuple(map(float, x.split(",")[:2])) for x in coord_el.text.strip().split()]
+                        pts = []
+                        for seg in coord_el.text.strip().split():
+                            parts = seg.split(",")
+                            if len(parts) >= 2:
+                                pts.append((float(parts[0]), float(parts[1])))
                         if len(pts) >= 2:
                             centerlines.append(LineString(pts))
     except Exception as e:
-        print(f"[XML Parse warning] {e}")
+        print(f"[XML warning] {e}")
 
-    # ---- Fallback to Regex if too few AGMs found ----
+    # Regex fallback if needed
     if len(agms) < 3:
-        print(f"[Fallback parser triggered: found {len(agms)} AGMs]")
         placemarks = re.findall(r"<Placemark>(.*?)</Placemark>", data, re.S | re.I)
         agms = []
         for pm in placemarks:
@@ -162,7 +165,8 @@ def parse_kml_kmz(uploaded_file):
             lat, lon = None, None
             coord_match = re.search(r"<coordinates>([-\d\.,\s]+)</coordinates>", pm, re.S | re.I)
             if coord_match:
-                lon, lat, *_ = map(float, coord_match.group(1).strip().split(","))
+                first_pair = coord_match.group(1).strip().split()[0]
+                lon, lat = map(float, first_pair.split(",")[:2])
             else:
                 lat_match = re.search(r"<latitude>([-\d\.]+)</latitude>", pm)
                 lon_match = re.search(r"<longitude>([-\d\.]+)</longitude>", pm)

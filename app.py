@@ -1,6 +1,6 @@
-# app.py — Terrain-Aware AGM Distance Calculator (Robust AGM Parser v3)
+# app.py — Terrain-Aware AGM Distance Calculator (Hybrid XML+Regex Parser, Final Stable Version)
 
-import io, math, re, zipfile
+import io, math, re, zipfile, xml.etree.ElementTree as ET
 import numpy as np, pandas as pd, requests, streamlit as st
 from PIL import Image
 from shapely.geometry import LineString, Point
@@ -8,7 +8,7 @@ from pyproj import Geod, Transformer
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config("Terrain AGM Distance", layout="wide")
-st.title("📏 Terrain-Aware AGM Distance Calculator — Robust AGM Parser")
+st.title("📏 Terrain-Aware AGM Distance Calculator — Hybrid Parser")
 
 # ---------------- CONFIG ----------------
 MAPBOX_TOKEN = st.secrets.get("MAPBOX_TOKEN", "")
@@ -22,17 +22,17 @@ MAX_WORKERS = 8
 
 # ---------------- TERRAIN CACHE ----------------
 class TerrainCache:
-    def __init__(self, token: str, zoom: int):
+    def __init__(self, token, zoom):
         self.token = token
         self.zoom = int(zoom)
         self.tiles = {}
 
     @staticmethod
-    def decode_rgb_arr(rgb_arr: np.ndarray) -> np.ndarray:
+    def decode_rgb_arr(rgb_arr):
         r, g, b = rgb_arr[..., 0], rgb_arr[..., 1], rgb_arr[..., 2]
         return -10000.0 + (r.astype(np.int64)*256*256 + g.astype(np.int64)*256 + b.astype(np.int64)) * 0.1
 
-    def fetch_tile(self, z: int, x: int, y: int):
+    def fetch_tile(self, z, x, y):
         key = (z, x, y)
         if key in self.tiles:
             return self.tiles[key]
@@ -40,7 +40,7 @@ class TerrainCache:
         try:
             r = requests.get(url, params={"access_token": self.token}, timeout=10)
             if r.status_code != 200:
-                print(f"[Mapbox error] {r.status_code} for tile {z}/{x}/{y}")
+                print(f"[Mapbox error] {r.status_code} for {z}/{x}/{y}")
                 return None
             arr = np.asarray(Image.open(io.BytesIO(r.content)).convert("RGB"), dtype=np.uint8)
             self.tiles[key] = arr
@@ -49,7 +49,7 @@ class TerrainCache:
             print(f"[Mapbox fetch error] {e}")
             return None
 
-    def elevations_bulk(self, lons: np.ndarray, lats: np.ndarray) -> np.ndarray:
+    def elevations_bulk(self, lons, lats):
         z = self.zoom
         n = float(2 ** z)
         xt = (lons + 180.0) / 360.0 * n
@@ -83,7 +83,7 @@ class TerrainCache:
             futures = [ex.submit(self.fetch_tile, *t) for t in tiles]
             for _ in as_completed(futures):
                 pass
-        print(f"Prefetched {len(tiles)} tiles")
+        print(f"Prefetched {len(tiles)} tiles.")
 
 # ---------------- HELPERS ----------------
 def smooth(a, window_m, spacing_m):
@@ -95,63 +95,89 @@ def smooth(a, window_m, spacing_m):
     kernel = np.ones(n) / n
     return np.convolve(a, kernel, mode="same")
 
-# ---------------- KML PARSER ----------------
+# ---------------- HYBRID PARSER ----------------
 def parse_kml_kmz(uploaded_file):
     if uploaded_file.name.lower().endswith(".kmz"):
         with zipfile.ZipFile(uploaded_file) as zf:
             kml_name = next((n for n in zf.namelist() if n.lower().endswith(".kml")), None)
             if not kml_name:
                 return [], []
-            text = zf.read(kml_name).decode("utf-8", errors="ignore")
+            data = zf.read(kml_name).decode("utf-8", errors="ignore")
     else:
-        text = uploaded_file.read().decode("utf-8", errors="ignore")
+        data = uploaded_file.read().decode("utf-8", errors="ignore")
 
     agms, centerlines = [], []
 
-    # --- Extract AGMs ---
-    agm_folder = re.search(r"<Folder>.*?<name>\s*AGMs\s*</name>(.*?)</Folder>", text, re.S | re.I)
-    if agm_folder:
-        placemarks = re.findall(r"<Placemark>(.*?)</Placemark>", agm_folder.group(1), re.S | re.I)
+    # ---- First try XML parsing safely ----
+    try:
+        root = ET.fromstring(data)
+        for elem in root.iter():
+            tag = elem.tag.split("}")[-1].lower()
+            if tag == "folder":
+                name_el = elem.find(".//{*}name")
+                if name_el is not None and name_el.text and "agm" in name_el.text.lower():
+                    for pm in elem.findall(".//{*}Placemark"):
+                        nm_el = pm.find(".//{*}name")
+                        if nm_el is None or not nm_el.text:
+                            continue
+                        name = nm_el.text.strip()
+                        if name.upper().startswith("SP"):
+                            continue
+                        lon = lat = None
+                        coord_el = pm.find(".//{*}Point/{*}coordinates")
+                        if coord_el is not None and coord_el.text:
+                            parts = list(map(float, coord_el.text.strip().split(",")[:2]))
+                            lon, lat = parts[0], parts[1]
+                        else:
+                            la = pm.find(".//{*}latitude")
+                            lo = pm.find(".//{*}longitude")
+                            if la is not None and lo is not None:
+                                lat = float(la.text)
+                                lon = float(lo.text)
+                        if lon is not None and lat is not None:
+                            agms.append((name, Point(lon, lat)))
+                if name_el is not None and "centerline" in name_el.text.lower():
+                    for pm in elem.findall(".//{*}Placemark"):
+                        coord_el = pm.find(".//{*}LineString/{*}coordinates")
+                        if coord_el is None or not coord_el.text:
+                            continue
+                        pts = [tuple(map(float, x.split(",")[:2])) for x in coord_el.text.strip().split()]
+                        if len(pts) >= 2:
+                            centerlines.append(LineString(pts))
+    except Exception as e:
+        print(f"[XML Parse warning] {e}")
+
+    # ---- Fallback to Regex if too few AGMs found ----
+    if len(agms) < 3:
+        print(f"[Fallback parser triggered: found {len(agms)} AGMs]")
+        placemarks = re.findall(r"<Placemark>(.*?)</Placemark>", data, re.S | re.I)
+        agms = []
         for pm in placemarks:
             name_match = re.search(r"<name>(.*?)</name>", pm, re.S | re.I)
             if not name_match:
                 continue
             name = name_match.group(1).strip()
-
-            # Try <Point><coordinates>
+            if name.upper().startswith("SP"):
+                continue
+            lat, lon = None, None
             coord_match = re.search(r"<coordinates>([-\d\.,\s]+)</coordinates>", pm, re.S | re.I)
             if coord_match:
                 lon, lat, *_ = map(float, coord_match.group(1).strip().split(","))
-                agms.append((name, Point(lon, lat)))
-                continue
-
-            # Try <LookAt><latitude> and <longitude>
-            lat_match = re.search(r"<latitude>([-\d\.]+)</latitude>", pm, re.I)
-            lon_match = re.search(r"<longitude>([-\d\.]+)</longitude>", pm, re.I)
-            if lat_match and lon_match:
-                lat = float(lat_match.group(1))
-                lon = float(lon_match.group(1))
-                agms.append((name, Point(lon, lat)))
-                continue
-
-            # Fallback: try inside CDATA description
-            lat_desc = re.search(r"Latitude.*?>([-\d\.]+)<", pm, re.I)
-            lon_desc = re.search(r"Longitude.*?>([-\d\.]+)<", pm, re.I)
-            if lat_desc and lon_desc:
-                lat = float(lat_desc.group(1))
-                lon = float(lon_desc.group(1))
+            else:
+                lat_match = re.search(r"<latitude>([-\d\.]+)</latitude>", pm)
+                lon_match = re.search(r"<longitude>([-\d\.]+)</longitude>", pm)
+                if lat_match and lon_match:
+                    lat = float(lat_match.group(1))
+                    lon = float(lon_match.group(1))
+                else:
+                    lat_desc = re.search(r"Latitude.*?>([-\d\.]+)<", pm, re.I)
+                    lon_desc = re.search(r"Longitude.*?>([-\d\.]+)<", pm, re.I)
+                    if lat_desc and lon_desc:
+                        lat = float(lat_desc.group(1))
+                        lon = float(lon_desc.group(1))
+            if lon and lat:
                 agms.append((name, Point(lon, lat)))
 
-    # --- Extract Centerline ---
-    center_folder = re.search(r"<Folder>.*?<name>\s*CENTERLINE\s*</name>(.*?)</Folder>", text, re.S | re.I)
-    if center_folder:
-        coords = re.findall(r"<coordinates>(.*?)</coordinates>", center_folder.group(1), re.S | re.I)
-        for cset in coords:
-            pts = [tuple(map(float, p.split(",")[:2])) for p in cset.strip().split()]
-            if len(pts) >= 2:
-                centerlines.append(LineString(pts))
-
-    # Sort AGMs numerically
     agms.sort(key=lambda p: int(''.join(filter(str.isdigit, p[0]))) if any(ch.isdigit() for ch in p[0]) else -1)
     return agms, centerlines
 
@@ -186,17 +212,14 @@ for i in range(total):
     n2, a2 = agms[i + 1]
     status.text(f"⏱ Calculating {n1} → {n2} ({i + 1}/{total}) …")
     bar.progress((i + 1) / total)
-
     p1_m = Point(*to_m.transform(a1.x, a1.y))
     p2_m = Point(*to_m.transform(a2.x, a2.y))
     s1, s2 = sorted((line_m.project(p1_m), line_m.project(p2_m)))
     if abs(s2 - s1) < 1:
         continue
-
     si = np.arange(s1, s2, RESAMPLE_M)
     if len(si) == 0 or si[-1] < s2:
         si = np.append(si, s2)
-
     pts_m = [line_m.interpolate(s) for s in si]
     pts_ll = np.array([to_ll.transform(p.x, p.y) for p in pts_m])
     elev = cache.elevations_bulk(pts_ll[:, 0], pts_ll[:, 1])

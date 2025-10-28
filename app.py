@@ -1,6 +1,6 @@
-# app.py — Terrain-Aware AGM Distance Calculator (Case-Insensitive Robust Folder Parser)
+# app.py — Terrain-Aware AGM Distance Calculator (Regex-based KML Parser)
 
-import io, math, zipfile, xml.etree.ElementTree as ET
+import io, math, re, zipfile
 import numpy as np, pandas as pd, requests, streamlit as st
 from PIL import Image
 from shapely.geometry import LineString, Point
@@ -8,7 +8,7 @@ from pyproj import Geod, Transformer
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config("Terrain AGM Distance", layout="wide")
-st.title("📏 Terrain-Aware AGM Distance Calculator — Case-Insensitive Folder Parser")
+st.title("📏 Terrain-Aware AGM Distance Calculator — Regex Parser")
 
 # ---------------- CONFIG ----------------
 MAPBOX_TOKEN = st.secrets.get("MAPBOX_TOKEN", "")
@@ -103,64 +103,45 @@ def smooth(a, window_m, spacing_m):
     kernel = np.ones(n) / n
     return np.convolve(a, kernel, mode="same")
 
-def strip_ns(e):
-    e.tag = e.tag.split("}", 1)[-1]
-    for k in list(e.attrib):
-        nk = k.split("}", 1)[-1]
-        if nk != k:
-            e.attrib[nk] = e.attrib.pop(k)
-    for c in e:
-        strip_ns(c)
-
-# ---------------- PARSER ----------------
+# ---------------- REGEX PARSER ----------------
 def parse_kml_kmz(uploaded_file):
-    try:
-        if uploaded_file.name.lower().endswith(".kmz"):
-            with zipfile.ZipFile(uploaded_file) as zf:
-                kml_name = next((n for n in zf.namelist() if n.lower().endswith(".kml")), None)
-                if not kml_name:
-                    return [], []
-                data = zf.read(kml_name)
-        else:
-            data = uploaded_file.read()
+    if uploaded_file.name.lower().endswith(".kmz"):
+        with zipfile.ZipFile(uploaded_file) as zf:
+            kml_name = next((n for n in zf.namelist() if n.lower().endswith(".kml")), None)
+            if not kml_name:
+                return [], []
+            data = zf.read(kml_name)
+    else:
+        data = uploaded_file.read()
 
-        text = data.decode("utf-8", errors="ignore")
-        idx = text.lower().find("<kml")
-        if idx > 0:
-            text = text[idx:]
-        root = ET.fromstring(text)
-    except Exception as e:
-        print(f"[KML Parse Warning] {e}")
-        return [], []
+    text = data.decode("utf-8", errors="ignore")
 
-    strip_ns(root)
-    agms, centerlines = [], []
-    for folder in root.findall(".//Folder"):
-        name_el = folder.find("name")
-        if name_el is None or not name_el.text:
-            continue
-        fname = name_el.text.strip().lower()
-        if "agm" in fname:
-            for pm in folder.findall(".//Placemark"):
-                nm_el = pm.find("name")
-                if nm_el is None or not nm_el.text:
-                    continue
-                nm = nm_el.text.strip()
-                if nm.upper().startswith("SP"):
-                    continue
-                coords_el = pm.find(".//Point/coordinates")
-                if coords_el is None or not coords_el.text:
-                    continue
-                lon, lat, *_ = map(float, coords_el.text.strip().split(","))
-                agms.append((nm, Point(lon, lat)))
-        if "centerline" in fname:
-            for pm in folder.findall(".//Placemark"):
-                coords_el = pm.find(".//LineString/coordinates")
-                if coords_el is None or not coords_el.text:
-                    continue
-                pts = [tuple(map(float, c.split(",")[:2])) for c in coords_el.text.strip().split()]
-                if len(pts) >= 2:
-                    centerlines.append(LineString(pts))
+    # Extract CENTERLINE coordinates
+    centerline_block = re.search(r"<Folder>.*?<name>\s*CENTERLINE\s*</name>(.*?)</Folder>", text, re.S | re.I)
+    agm_block = re.search(r"<Folder>.*?<name>\s*AGMs\s*</name>(.*?)</Folder>", text, re.S | re.I)
+
+    centerlines, agms = [], []
+
+    if centerline_block:
+        coords = re.findall(r"<coordinates>(.*?)</coordinates>", centerline_block.group(1), re.S | re.I)
+        for cset in coords:
+            pts = [tuple(map(float, x.split(",")[:2])) for x in cset.strip().split()]
+            if len(pts) >= 2:
+                centerlines.append(LineString(pts))
+
+    if agm_block:
+        placemarks = re.findall(r"<Placemark>(.*?)</Placemark>", agm_block.group(1), re.S | re.I)
+        for pm in placemarks:
+            name_match = re.search(r"<name>(.*?)</name>", pm, re.S | re.I)
+            coord_match = re.search(r"<coordinates>(.*?)</coordinates>", pm, re.S | re.I)
+            if not name_match or not coord_match:
+                continue
+            name = name_match.group(1).strip()
+            if name.upper().startswith("SP"):
+                continue
+            lon, lat, *_ = map(float, coord_match.group(1).strip().split(","))
+            agms.append((name, Point(lon, lat)))
+
     agms.sort(key=lambda p: int(''.join(filter(str.isdigit, p[0]))) if any(ch.isdigit() for ch in p[0]) else -1)
     return agms, centerlines
 

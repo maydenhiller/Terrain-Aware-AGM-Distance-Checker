@@ -1,4 +1,4 @@
-# app.py — Terrain-Aware AGM Distance Calculator (Final v5: Document-based CENTERLINE support)
+# app.py — Terrain-Aware AGM Distance Calculator (Final v6: strict AGM isolation, Document-based CENTERLINE support)
 
 import io, math, re, zipfile, xml.etree.ElementTree as ET
 import numpy as np, pandas as pd, requests, streamlit as st
@@ -8,7 +8,7 @@ from pyproj import Geod, Transformer
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config("Terrain AGM Distance", layout="wide")
-st.title("📏 Terrain-Aware AGM Distance Calculator — Final v5")
+st.title("📏 Terrain-Aware AGM Distance Calculator — Final v6")
 
 # ---------------- CONFIG ----------------
 MAPBOX_TOKEN = st.secrets.get("MAPBOX_TOKEN", "")
@@ -108,8 +108,20 @@ def parse_kml_kmz(uploaded_file):
 
     agms, centerlines = [], []
 
-    # ---- AGM extraction (same as before)
-    placemarks = re.findall(r"<Placemark>(.*?)</Placemark>", data, re.S | re.I)
+    # --- find AGM folder or document content only ---
+    agm_block = None
+    m_doc = re.search(r"<Document[^>]*>\s*<name>\s*AGMs\s*</name>(.*?)</Document>", data, re.S | re.I)
+    m_fold = re.search(r"<Folder[^>]*>\s*<name>\s*AGMs\s*</name>(.*?)</Folder>", data, re.S | re.I)
+    if m_doc:
+        agm_block = m_doc.group(1)
+    elif m_fold:
+        agm_block = m_fold.group(1)
+    else:
+        print("[Warning] Could not locate AGM folder — using fallback scan.")
+        agm_block = data
+
+    # --- extract only AGM placemarks ---
+    placemarks = re.findall(r"<Placemark>(.*?)</Placemark>", agm_block, re.S | re.I)
     for pm in placemarks:
         if "<Point" not in pm:
             continue
@@ -137,17 +149,15 @@ def parse_kml_kmz(uploaded_file):
 
     agms.sort(key=lambda p: int(''.join(filter(str.isdigit, p[0]))) if any(ch.isdigit() for ch in p[0]) else -1)
 
-    # ---- CENTERLINE extraction (supports <Document><name>CENTERLINE</name>)
+    # --- CENTERLINE extraction ---
     center_doc = re.search(r"<Document[^>]*>\s*<name>\s*CENTERLINE\s*</name>(.*?)</Document>", data, re.S | re.I)
-    center_folder = re.search(r"<Folder[^>]*>\s*<name>\s*CENTERLINE\s*</name>(.*?)</Folder>", data, re.S | re.I)
-
+    center_fold = re.search(r"<Folder[^>]*>\s*<name>\s*CENTERLINE\s*</name>(.*?)</Folder>", data, re.S | re.I)
     center_src = None
     if center_doc:
         center_src = center_doc.group(1)
-    elif center_folder:
-        center_src = center_folder.group(1)
+    elif center_fold:
+        center_src = center_fold.group(1)
     else:
-        # fallback to entire file if needed
         center_src = data
 
     coords = re.findall(r"<coordinates>(.*?)</coordinates>", center_src, re.S | re.I)

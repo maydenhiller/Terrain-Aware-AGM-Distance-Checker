@@ -1,143 +1,136 @@
 import streamlit as st
 import zipfile
+import io
 import xml.etree.ElementTree as ET
-from io import BytesIO
-from math import radians, sin, cos, sqrt, atan2
+import numpy as np
+import requests
+from math import sin, cos, sqrt, atan2, radians
 
-st.set_page_config(layout="wide")
+# ==============================
+# CONFIG
+# ==============================
+MAPBOX_TOKEN = "pk.eyJ1IjoibWF5ZGVuaGlsbGVyIiwiYSI6ImNtZ2ljMnN5ejA3amwyam9tNWZnYnZibWwifQ.GXoTyHdvCYtr7GvKIW9LPA"
+DENSIFY_M = 10
+EARTH_RADIUS_M = 6371000
 
-# ------------------------
-# Geometry utilities
-# ------------------------
-
-def haversine_miles(lat1, lon1, lat2, lon2):
-    R = 3958.7613  # Earth radius in miles
+# ==============================
+# GEO UTILS
+# ==============================
+def haversine_m(lat1, lon1, lat2, lon2):
     dlat = radians(lat2 - lat1)
     dlon = radians(lon2 - lon1)
-    a = sin(dlat / 2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2)**2
-    return R * 2 * atan2(sqrt(a), sqrt(1 - a))
+    a = sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
+    return 2 * EARTH_RADIUS_M * atan2(sqrt(a), sqrt(1-a))
 
-
-def polyline_length(coords):
-    dist = 0.0
-    for i in range(len(coords) - 1):
+def densify(coords, step_m):
+    out = [coords[0]]
+    for i in range(len(coords)-1):
         lat1, lon1 = coords[i]
-        lat2, lon2 = coords[i + 1]
-        dist += haversine_miles(lat1, lon1, lat2, lon2)
-    return dist
+        lat2, lon2 = coords[i+1]
+        d = haversine_m(lat1, lon1, lat2, lon2)
+        n = max(1, int(d // step_m))
+        for j in range(1, n+1):
+            f = j / n
+            out.append((
+                lat1 + f*(lat2-lat1),
+                lon1 + f*(lon2-lon1)
+            ))
+    return out
 
+# ==============================
+# MAPBOX TERRAIN SAMPLING
+# ==============================
+def tile_xy(lat, lon, z=14):
+    lat_rad = radians(lat)
+    n = 2 ** z
+    xtile = int((lon + 180) / 360 * n)
+    ytile = int((1 - np.log(np.tan(lat_rad) + 1 / cos(lat_rad)) / np.pi) / 2 * n)
+    return xtile, ytile, z
 
-# ------------------------
-# KML / KMZ Parsing
-# ------------------------
+def elevation_mapbox(lat, lon):
+    x, y, z = tile_xy(lat, lon)
+    url = f"https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}.pngraw?access_token={MAPBOX_TOKEN}"
+    r = requests.get(url)
+    if r.status_code != 200:
+        return 0
+    from PIL import Image
+    img = Image.open(io.BytesIO(r.content))
+    px = img.load()
+    n = img.size[0]
+    fx = int((lon + 180) / 360 * n) % n
+    fy = int((1 - np.log(np.tan(radians(lat)) + 1/cos(radians(lat))) / np.pi) / 2 * n) % n
+    R, G, B = px[fx, fy][:3]
+    return -10000 + (R*256*256 + G*256 + B) * 0.1
 
-KML_NS = {
-    "kml": "http://www.opengis.net/kml/2.2",
-    "gx": "http://www.google.com/kml/ext/2.2"
-}
-
-
-def extract_kml(uploaded_file):
-    if uploaded_file.name.lower().endswith(".kmz"):
-        with zipfile.ZipFile(uploaded_file) as z:
-            for name in z.namelist():
-                if name.endswith(".kml"):
-                    return z.read(name).decode("utf-8")
-        raise ValueError("KMZ contains no KML")
+# ==============================
+# KML / KMZ PARSER
+# ==============================
+def load_kml(upload):
+    if upload.name.lower().endswith(".kmz"):
+        z = zipfile.ZipFile(upload)
+        kml = z.read([n for n in z.namelist() if n.endswith(".kml")][0])
     else:
-        return uploaded_file.read().decode("utf-8")
+        kml = upload.read()
+    return ET.fromstring(kml)
 
-
-def parse_kml_kmz(uploaded_file):
-    text = extract_kml(uploaded_file)
-
-    try:
-        root = ET.fromstring(text)
-    except ET.ParseError as e:
-        st.error(f"Failed to parse XML: {e}")
-        return [], []
-
+def parse(root):
+    ns = {"kml": "http://www.opengis.net/kml/2.2"}
     agms = []
-    centerlines = []
+    centerline = []
 
-    # Find all Folders (namespace safe)
-    for folder in root.findall(".//kml:Folder", KML_NS):
-        name_el = folder.find("kml:name", KML_NS)
-        if name_el is None:
+    for folder in root.findall(".//kml:Folder", ns):
+        name = folder.find("kml:name", ns)
+        if name is None:
             continue
 
-        folder_name = name_el.text.strip().upper()
+        if name.text.strip().upper() == "AGMS":
+            for pm in folder.findall(".//kml:Placemark", ns):
+                n = pm.find("kml:name", ns).text
+                coords = pm.find(".//kml:coordinates", ns)
+                lon, lat, *_ = map(float, coords.text.strip().split(","))
+                agms.append((n, lat, lon))
 
-        # ------------------------
-        # AGMs
-        # ------------------------
-        if folder_name == "AGMS":
-            for pm in folder.findall(".//kml:Placemark", KML_NS):
-                name = pm.findtext("kml:name", default="AGM", namespaces=KML_NS)
-                coord_el = pm.find(".//kml:Point/kml:coordinates", KML_NS)
-                if coord_el is None:
-                    continue
-                lon, lat, *_ = map(float, coord_el.text.strip().split(","))
-                agms.append({
-                    "name": name,
-                    "lat": lat,
-                    "lon": lon
-                })
+        if name.text.strip().upper() == "CENTERLINE":
+            for ls in folder.findall(".//kml:LineString", ns):
+                pts = []
+                for c in ls.find("kml:coordinates", ns).text.strip().split():
+                    lon, lat, *_ = map(float, c.split(","))
+                    pts.append((lat, lon))
+                centerline.extend(pts)
 
-        # ------------------------
-        # CENTERLINE
-        # ------------------------
-        elif folder_name == "CENTERLINE":
-            for pm in folder.findall(".//kml:Placemark", KML_NS):
+    return agms, centerline
 
-                coords = []
+# ==============================
+# DISTANCE ENGINE
+# ==============================
+def terrain_distance(coords):
+    coords = densify(coords, DENSIFY_M)
+    elev = [elevation_mapbox(lat, lon) for lat, lon in coords]
 
-                # 1️⃣ gx:Track (MOST ACCURATE)
-                track = pm.find(".//gx:Track", KML_NS)
-                if track is not None:
-                    for gxcoord in track.findall("gx:coord", KML_NS):
-                        lon, lat, *_ = map(float, gxcoord.text.strip().split())
-                        coords.append((lat, lon))
+    dist = 0
+    for i in range(len(coords)-1):
+        lat1, lon1 = coords[i]
+        lat2, lon2 = coords[i+1]
+        dz = elev[i+1] - elev[i]
+        dxy = haversine_m(lat1, lon1, lat2, lon2)
+        dist += sqrt(dxy**2 + dz**2)
+    return dist
 
-                # 2️⃣ Fallback LineString
-                if not coords:
-                    coord_el = pm.find(".//kml:LineString/kml:coordinates", KML_NS)
-                    if coord_el is not None:
-                        for c in coord_el.text.strip().split():
-                            lon, lat, *_ = map(float, c.split(","))
-                            coords.append((lat, lon))
-
-                if coords:
-                    centerlines.append(coords)
-
-    return agms, centerlines
-
-
-# ------------------------
-# Streamlit UI
-# ------------------------
-
+# ==============================
+# STREAMLIT UI
+# ==============================
 st.title("Terrain-Aware AGM Distance Checker")
 
-uploaded = st.file_uploader(
-    "Drag and drop file here",
-    type=["kml", "kmz"],
-    accept_multiple_files=False
-)
+f = st.file_uploader("Drop KML or KMZ", type=["kml", "kmz"])
 
-if uploaded:
-    agms, centerlines = parse_kml_kmz(uploaded)
+if f:
+    root = load_kml(f)
+    agms, centerline = parse(root)
 
-    st.write(f"**{len(agms)} AGMs | {len(centerlines)} centerline part(s)**")
+    st.write(f"{len(agms)} AGMs | {len(centerline)} centerline pts")
 
-    if not agms or not centerlines:
-        st.error("Need both AGMs and CENTERLINE.")
-        st.stop()
-
-    centerline_coords = centerlines[0]
-    total_miles = polyline_length(centerline_coords)
-
-    st.success(f"Centerline length: **{total_miles:.3f} miles**")
-
-    st.subheader("AGMs")
-    st.dataframe(agms, use_container_width=True)
+    if agms and centerline:
+        total_m = terrain_distance(centerline)
+        st.success(f"Total terrain-aware distance: {total_m/1609.34:.3f} miles")
+    else:
+        st.error("Need both AGMs and CENTERLINE")

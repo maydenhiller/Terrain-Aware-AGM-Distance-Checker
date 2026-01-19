@@ -14,7 +14,7 @@ EARTH_R = 6371000
 TILE_ZOOM = 14
 
 # ======================
-# GEO
+# GEO HELPERS
 # ======================
 def haversine(lat1, lon1, lat2, lon2):
     dlat = math.radians(lat2-lat1)
@@ -96,15 +96,15 @@ def parse(root):
     return agms, center
 
 # ======================
-# MAIN LOGIC
+# STREAMLIT APP
 # ======================
 st.title("Terrain-Aware AGM Distance Checker")
 
-f=st.file_uploader("KML / KMZ",["kml","kmz"])
+f = st.file_uploader("KML / KMZ", ["kml","kmz"])
 
 if f:
-    root=load_kml(f)
-    agms, center=parse(root)
+    root = load_kml(f)
+    agms, center = parse(root)
 
     st.write(f"{len(agms)} AGMs | {len(center)} centerline pts")
 
@@ -112,28 +112,40 @@ if f:
         st.error("Need both AGMs and CENTERLINE")
         st.stop()
 
-    center=densify(center)
-    elev=[elevation(lat,lon) for lat,lon in center]
+    center = densify(center)
 
-    # snap AGMs
-    idx=[]
-    for _,lat,lon in agms:
-        d=[haversine(lat,lon,p[0],p[1]) for p in center]
-        idx.append(int(np.argmin(d)))
+    elev = np.array([elevation(lat,lon) for lat,lon in center])
+
+    # snap AGMs to centerline
+    snapped = []
+    for name,lat,lon in agms:
+        d = [haversine(lat,lon,p[0],p[1]) for p in center]
+        snapped.append((name, np.argmin(d)))
+
+    # 🔴 CRITICAL FIX: SORT BY CENTERLINE POSITION
+    snapped.sort(key=lambda x: x[1])
 
     rows=[]
-    for i in range(len(idx)-1):
-        d=0
-        for j in range(idx[i],idx[i+1]):
-            h=haversine(*center[j],*center[j+1])
-            v=elev[j+1]-elev[j]
-            d+=math.sqrt(h*h+v*v)
-        rows.append((agms[i][0],agms[i+1][0],d/1609.34))
+    total=0.0
+
+    for i in range(len(snapped)-1):
+        a_name,a_idx = snapped[i]
+        b_name,b_idx = snapped[i+1]
+
+        d=0.0
+        for j in range(a_idx, b_idx):
+            h = haversine(*center[j], *center[j+1])
+            v = elev[j+1] - elev[j]
+            d += math.sqrt(h*h + v*v)
+
+        miles = d / 1609.34
+        total += miles
+        rows.append((a_name, b_name, miles))
 
     st.table({
-        "From AGM":[r[0] for r in rows],
-        "To AGM":[r[1] for r in rows],
-        "Terrain Miles":[round(r[2],3) for r in rows]
+        "From AGM": [r[0] for r in rows],
+        "To AGM":   [r[1] for r in rows],
+        "Terrain Miles": [round(r[2],4) for r in rows]
     })
 
-    st.success(f"Total: {sum(r[2] for r in rows):.3f} miles")
+    st.success(f"Total terrain-aware distance: {total:.3f} miles")

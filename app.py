@@ -10,31 +10,25 @@ import pandas as pd
 # CONFIG
 # ======================
 DENSIFY_FEET = 30        # ~10 m
-EARTH_R_FT = 20925524.9
+EARTH_R_FT = 20925524.9  # Earth radius in feet
 TILE_ZOOM = 14
 TILE_SIZE = 256
 
-def load_mapbox_token():
-    # Handles:
-    # - secrets: MAPBOX_TOKEN = "pk...."
-    # - secrets: mapbox: { token: "pk...." }  (common pattern)
-    # - env var MAPBOX_TOKEN
-    token = ""
+def get_mapbox_token():
+    # Your exact secrets format:
+    # [mapbox]
+    # token = "pk...."
     try:
-        if hasattr(st, "secrets"):
-            if "MAPBOX_TOKEN" in st.secrets:
-                token = st.secrets["MAPBOX_TOKEN"]
-            elif "mapbox" in st.secrets and isinstance(st.secrets["mapbox"], dict):
-                token = st.secrets["mapbox"].get("token", "")
+        tok = str(st.secrets["mapbox"]["token"]).strip()
+        if tok:
+            return tok
     except Exception:
-        token = ""
+        pass
 
-    if not token:
-        token = os.getenv("MAPBOX_TOKEN", "")
+    # fallback (optional)
+    return os.getenv("MAPBOX_TOKEN", "").strip()
 
-    return (token or "").strip()
-
-MAPBOX_TOKEN = load_mapbox_token()
+MAPBOX_TOKEN = get_mapbox_token()
 
 # ======================
 # GEO HELPERS
@@ -64,7 +58,7 @@ def densify(line):
     return out
 
 # ======================
-# MAPBOX TERRAIN (cached tiles + correct pixel-in-tile)
+# MAPBOX TERRAIN-RGB (tile cached, correct pixel-in-tile)
 # ======================
 tile_cache = {}
 
@@ -81,7 +75,6 @@ def get_tile(z, x, y):
         return tile_cache[key]
 
     url = f"https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}.pngraw?access_token={MAPBOX_TOKEN}"
-
     headers = {
         "User-Agent": "terrain-aware-agm-distance-checker/1.0",
         "Accept": "image/png,image/*;q=0.9,*/*;q=0.8",
@@ -90,7 +83,7 @@ def get_tile(z, x, y):
 
     ct = (r.headers.get("Content-Type") or "").lower()
     if r.status_code != 200 or ("image" not in ct):
-        snippet = (r.text or "")[:350]
+        snippet = (r.text or "")[:400]
         raise RuntimeError(
             f"Mapbox tile error status={r.status_code}, content-type={ct}, response={snippet!r}"
         )
@@ -111,16 +104,9 @@ def elevation_ft(lat, lon):
 
     img = get_tile(TILE_ZOOM, x_tile, y_tile)
     R, G, B = img.getpixel((px, py))
-    meters = -10000.0 + (R * 256.0 * 256.0 + G * 256.0 + B) * 0.1
-    return meters * 3.28084
 
-def test_mapbox_token():
-    # Known tile that should always exist. If this fails, it's token/permissions.
-    z, x, y = 0, 0, 0
-    url = f"https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}.pngraw?access_token={MAPBOX_TOKEN}"
-    headers = {"User-Agent": "terrain-aware-agm-distance-checker/1.0", "Accept": "image/png,image/*;q=0.9,*/*;q=0.8"}
-    r = requests.get(url, headers=headers, timeout=25)
-    return r.status_code, (r.headers.get("Content-Type") or ""), (r.text or "")[:400]
+    meters = -10000.0 + (R * 256.0 * 256.0 + G * 256.0 + B) * 0.1
+    return meters * 3.28084  # feet
 
 # ======================
 # KML / KMZ
@@ -169,23 +155,13 @@ def parse(root):
     return agms, center
 
 # ======================
-# APP UI
+# STREAMLIT APP
 # ======================
 st.title("Terrain-Aware AGM Distance Checker")
 
-# Token sanity info (masked)
-if MAPBOX_TOKEN:
-    st.caption(f"Mapbox token loaded: length={len(MAPBOX_TOKEN)} prefix={MAPBOX_TOKEN[:3]}… suffix=…{MAPBOX_TOKEN[-4:]}")
-else:
-    st.error("MAPBOX_TOKEN not found. Add it to Streamlit Secrets as MAPBOX_TOKEN or set env var MAPBOX_TOKEN.")
+if not MAPBOX_TOKEN:
+    st.error('Mapbox token not found. Your secrets must be:\n\n[mapbox]\n token = "pk...."\n')
     st.stop()
-
-with st.expander("Mapbox token self-test"):
-    if st.button("Test Mapbox Terrain-RGB access"):
-        code, ctype, snippet = test_mapbox_token()
-        st.write({"status_code": code, "content_type": ctype})
-        if code != 200:
-            st.code(snippet)
 
 upload = st.file_uploader("Drag & drop KML or KMZ", ["kml", "kmz"])
 
@@ -203,13 +179,14 @@ if upload:
         st.error("Need both AGMS and CENTERLINE folders")
         st.stop()
 
-    # Start at 000
+    # Start at 000 by AGM name
     try:
         agms.sort(key=lambda x: int(x[0]))
     except Exception:
         st.error("AGM names must be numeric (e.g., 000, 005, 010...)")
         st.stop()
 
+    # Densify centerline and sample elevations once
     center = densify(center)
 
     with st.spinner("Sampling terrain elevations (cached tiles)..."):
@@ -219,13 +196,13 @@ if upload:
             st.error(f"Elevation sampling failed: {e}")
             st.stop()
 
-    # Snap each AGM to nearest densified center vertex
+    # Snap AGMs to nearest densified center point
     snapped = []
     for name, lat, lon in agms:
         dists = [haversine_ft(lat, lon, p[0], p[1]) for p in center]
         snapped.append((name, int(np.argmin(dists))))
 
-    # Fix direction to match 000..end
+    # Reverse centerline if it runs opposite of AGM stationing
     if snapped[0][1] > snapped[-1][1]:
         center.reverse()
         elevations = elevations[::-1]
@@ -238,6 +215,7 @@ if upload:
         a_name, a_idx = snapped[i]
         b_name, b_idx = snapped[i + 1]
 
+        # if two AGMs snap to same index, segment will be 0 (real data condition)
         if b_idx < a_idx:
             a_idx, b_idx = b_idx, a_idx
 

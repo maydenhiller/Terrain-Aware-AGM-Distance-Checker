@@ -10,23 +10,18 @@ import pandas as pd
 # CONFIG
 # ======================
 DENSIFY_FEET = 30        # ~10 m
-EARTH_R_FT = 20925524.9  # Earth radius in feet
+EARTH_R_FT = 20925524.9
 TILE_ZOOM = 14
 TILE_SIZE = 256
 
 def get_mapbox_token():
-    # Your exact secrets format:
+    # Your secrets format:
     # [mapbox]
     # token = "pk...."
     try:
-        tok = str(st.secrets["mapbox"]["token"]).strip()
-        if tok:
-            return tok
+        return str(st.secrets["mapbox"]["token"]).strip()
     except Exception:
-        pass
-
-    # fallback (optional)
-    return os.getenv("MAPBOX_TOKEN", "").strip()
+        return os.getenv("MAPBOX_TOKEN", "").strip()
 
 MAPBOX_TOKEN = get_mapbox_token()
 
@@ -58,7 +53,65 @@ def densify(line):
     return out
 
 # ======================
-# MAPBOX TERRAIN-RGB (tile cached, correct pixel-in-tile)
+# CENTERLINE STITCHING (fixes multi-LineString teleport jumps)
+# ======================
+def stitch_centerline_parts(parts, gap_warn_ft=200.0):
+    """
+    Given multiple line parts (each a list[(lat,lon)]), build one continuous polyline
+    by attaching parts to the current end that minimizes endpoint gap, reversing parts if needed.
+    """
+    parts = [p for p in parts if p and len(p) >= 2]
+    if not parts:
+        return [], []
+
+    used = [False] * len(parts)
+    # start with the longest part (more stable)
+    start_idx = int(np.argmax([len(p) for p in parts]))
+    poly = parts[start_idx][:]
+    used[start_idx] = True
+
+    gaps = []
+
+    def dist(a, b):
+        return haversine_ft(a[0], a[1], b[0], b[1])
+
+    while not all(used):
+        best = None  # (gap, idx, mode, reversed?)
+        end_pt = poly[-1]
+
+        for i, p in enumerate(parts):
+            if used[i]:
+                continue
+            p_start, p_end = p[0], p[-1]
+            # attach p to end of poly:
+            gap_end_to_start = dist(end_pt, p_start)
+            gap_end_to_end   = dist(end_pt, p_end)
+
+            # choose smaller gap; reverse part if needed
+            if best is None or gap_end_to_start < best[0]:
+                best = (gap_end_to_start, i, "append", False)  # p as-is
+            if gap_end_to_end < best[0]:
+                best = (gap_end_to_end, i, "append", True)     # p reversed
+
+        gap, i, mode, rev = best
+        p = parts[i][:]
+        if rev:
+            p.reverse()
+
+        # append, dropping duplicate join point if essentially same
+        if dist(poly[-1], p[0]) < 5.0:
+            poly.extend(p[1:])
+        else:
+            poly.extend(p)
+
+        used[i] = True
+        gaps.append(gap)
+
+    # warn if any big seam remains
+    return poly, gaps
+
+# ======================
+# MAPBOX TERRAIN (tile cached + correct pixel-in-tile)
 # ======================
 tile_cache = {}
 
@@ -109,7 +162,7 @@ def elevation_ft(lat, lon):
     return meters * 3.28084  # feet
 
 # ======================
-# KML / KMZ
+# KML / KMZ PARSE
 # ======================
 def load_kml(upload):
     if upload.name.lower().endswith(".kmz"):
@@ -125,7 +178,7 @@ def load_kml(upload):
 def parse(root):
     ns = {"k": "http://www.opengis.net/kml/2.2"}
     agms = []
-    center = []
+    center_parts = []
 
     for f in root.findall(".//k:Folder", ns):
         name_el = f.find("k:name", ns)
@@ -148,11 +201,14 @@ def parse(root):
                 coord_el = ls.find("k:coordinates", ns)
                 if coord_el is None or not coord_el.text:
                     continue
+                part = []
                 for c in coord_el.text.split():
                     lon, lat, *_ = map(float, c.split(","))
-                    center.append((lat, lon))
+                    part.append((lat, lon))
+                if len(part) >= 2:
+                    center_parts.append(part)
 
-    return agms, center
+    return agms, center_parts
 
 # ======================
 # STREAMLIT APP
@@ -160,7 +216,7 @@ def parse(root):
 st.title("Terrain-Aware AGM Distance Checker")
 
 if not MAPBOX_TOKEN:
-    st.error('Mapbox token not found. Your secrets must be:\n\n[mapbox]\n token = "pk...."\n')
+    st.error('Mapbox token not found in secrets. Expecting:\n\n[mapbox]\n token = "pk...."\n')
     st.stop()
 
 upload = st.file_uploader("Drag & drop KML or KMZ", ["kml", "kmz"])
@@ -168,15 +224,23 @@ upload = st.file_uploader("Drag & drop KML or KMZ", ["kml", "kmz"])
 if upload:
     try:
         root = load_kml(upload)
-        agms, center = parse(root)
+        agms, center_parts = parse(root)
     except Exception as e:
         st.error(f"Failed to read/parse file: {e}")
         st.stop()
 
-    st.write(f"{len(agms)} AGMs | {len(center)} centerline pts")
+    # stitch multiple line parts (THIS fixes the 060->070 seam issue)
+    center, seam_gaps = stitch_centerline_parts(center_parts)
+
+    st.write(f"{len(agms)} AGMs | {sum(len(p) for p in center_parts)} raw centerline pts | {len(center_parts)} line part(s)")
+
+    if seam_gaps:
+        worst = max(seam_gaps)
+        if worst > 200:
+            st.warning(f"Centerline has a large seam gap (~{worst:,.1f} ft). That can break a span. (We stitched the best we could.)")
 
     if not agms or not center:
-        st.error("Need both AGMS and CENTERLINE folders")
+        st.error("Need both AGMS and CENTERLINE folders (and CENTERLINE must contain LineString coordinates).")
         st.stop()
 
     # Start at 000 by AGM name
@@ -186,7 +250,7 @@ if upload:
         st.error("AGM names must be numeric (e.g., 000, 005, 010...)")
         st.stop()
 
-    # Densify centerline and sample elevations once
+    # densify stitched centerline
     center = densify(center)
 
     with st.spinner("Sampling terrain elevations (cached tiles)..."):
@@ -196,13 +260,13 @@ if upload:
             st.error(f"Elevation sampling failed: {e}")
             st.stop()
 
-    # Snap AGMs to nearest densified center point
+    # snap AGMs to densified centerline vertices
     snapped = []
     for name, lat, lon in agms:
         dists = [haversine_ft(lat, lon, p[0], p[1]) for p in center]
         snapped.append((name, int(np.argmin(dists))))
 
-    # Reverse centerline if it runs opposite of AGM stationing
+    # reverse traversal if centerline digitized opposite stationing
     if snapped[0][1] > snapped[-1][1]:
         center.reverse()
         elevations = elevations[::-1]
@@ -215,7 +279,6 @@ if upload:
         a_name, a_idx = snapped[i]
         b_name, b_idx = snapped[i + 1]
 
-        # if two AGMs snap to same index, segment will be 0 (real data condition)
         if b_idx < a_idx:
             a_idx, b_idx = b_idx, a_idx
 

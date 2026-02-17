@@ -6,3 +6,4 @@ pyproj
 requests
 Pillow
 zipfile36
+fastkml

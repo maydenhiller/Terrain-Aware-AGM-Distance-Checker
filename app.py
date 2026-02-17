@@ -30,32 +30,43 @@ if uploaded_file:
 
         kml_file = [f for f in os.listdir(tmpdir) if f.endswith(".kml")][0]
         with open(os.path.join(tmpdir, kml_file), 'rb') as f:
-            doc = f.read()
+            doc_bytes = f.read()
 
     # ---------- PARSE KML ----------
     k = kml.KML()
-    k.from_string(doc)
+    k.from_string(doc_bytes)
 
-    doc = list(k.features)[0]
-    folders = list(doc.features)
+    # --- WALK DOWN UNTIL WE FIND FOLDERS ---
+    def get_all_features(container):
+        feats = []
+        if hasattr(container, "features") and container.features:
+            for f in container.features:
+                feats.append(f)
+                feats.extend(get_all_features(f))
+        return feats
+
+    all_features = get_all_features(k)
 
     centerline = None
     agms_folder = None
 
-    for f in folders:
-        if f.name.lower() == "centerline":
-            for feat in f.features:
-                if isinstance(feat.geometry, LineString):
-                    centerline = feat.geometry
+    for f in all_features:
+        if hasattr(f, "name") and f.name:
+            name = f.name.lower()
 
-        if f.name.lower() == "agms":
-            agms_folder = f
+            if name == "centerline":
+                for feat in f.features:
+                    if isinstance(feat.geometry, LineString):
+                        centerline = feat.geometry
+
+            if name == "agms":
+                agms_folder = f
 
     if centerline is None or agms_folder is None:
         st.error("Missing Centerline or AGMs folder.")
         st.stop()
 
-    # ---------- GET ALL PLACEMARKS IN AGMs FOLDER ----------
+    # ---------- GET ALL PLACEMARKS IN AGMs ----------
     agm_points = []
 
     for placemark in agms_folder.features:

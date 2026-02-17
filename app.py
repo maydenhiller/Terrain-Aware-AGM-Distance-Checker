@@ -10,7 +10,7 @@ import pandas as pd
 
 st.set_page_config(layout="wide")
 
-# ---------------- MAPBOX TOKEN (ORIGINAL WORKING METHOD) ----------------
+# ---------------- MAPBOX TOKEN ----------------
 MAPBOX_TOKEN = st.secrets["mapbox"]["token"]
 
 st.title("Terrain-Aware AGM Distance Checker")
@@ -36,15 +36,15 @@ if uploaded_file:
     k = kml.KML()
     k.from_string(doc)
 
-    doc = list(k.features())[0]
-    folders = list(doc.features())
+    doc = list(k.features)[0]
+    folders = list(doc.features)
 
     centerline = None
     agms_folder = None
 
     for f in folders:
         if f.name.lower() == "centerline":
-            for feat in f.features():
+            for feat in f.features:
                 if isinstance(feat.geometry, LineString):
                     centerline = feat.geometry
 
@@ -58,7 +58,7 @@ if uploaded_file:
     # ---------- GET ALL PLACEMARKS IN AGMs FOLDER ----------
     agm_points = []
 
-    for placemark in agms_folder.features():
+    for placemark in agms_folder.features:
         if isinstance(placemark.geometry, Point):
             agm_points.append({
                 "name": placemark.name,

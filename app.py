@@ -1,161 +1,193 @@
 import streamlit as st
-import zipfile
-import tempfile
-import os
-import math
+import zipfile, io, math
+import xml.etree.ElementTree as ET
+import numpy as np
 import requests
-from shapely.geometry import LineString, Point
-from fastkml import kml
+from PIL import Image
 import pandas as pd
 
-st.set_page_config(layout="wide")
-
-# ---------------- MAPBOX TOKEN ----------------
+# ======================
+# CONFIG
+# ======================
 MAPBOX_TOKEN = st.secrets["mapbox"]["token"]
+DENSIFY_FEET = 30
+EARTH_R_FT = 20925524.9
+TILE_ZOOM = 14
 
+# ======================
+# GEO HELPERS
+# ======================
+def haversine_ft(lat1, lon1, lat2, lon2):
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(dlon / 2) ** 2
+    )
+    return 2 * EARTH_R_FT * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def densify(line):
+    out = [line[0]]
+    for i in range(len(line) - 1):
+        a, b = line[i], line[i + 1]
+        d = haversine_ft(*a, *b)
+        n = max(1, int(d // DENSIFY_FEET))
+        for j in range(1, n + 1):
+            f = j / n
+            out.append((a[0] + f * (b[0] - a[0]), a[1] + f * (b[1] - a[1])))
+    return out
+
+# ======================
+# MAPBOX TERRAIN
+# ======================
+tile_cache = {}
+
+def tile_xy(lat, lon, z):
+    lat = math.radians(lat)
+    n = 2 ** z
+    x = int((lon + 180) / 360 * n)
+    y = int((1 - math.log(math.tan(lat) + 1 / math.cos(lat)) / math.pi) / 2 * n)
+    return x, y
+
+
+def get_tile(z, x, y):
+    key = (z, x, y)
+    if key in tile_cache:
+        return tile_cache[key]
+
+    url = f"https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}.pngraw?access_token={MAPBOX_TOKEN}"
+    r = requests.get(url)
+
+    img = Image.open(io.BytesIO(r.content))
+    tile_cache[key] = img
+    return img
+
+
+def elevation_ft(lat, lon):
+    x, y = tile_xy(lat, lon, TILE_ZOOM)
+    img = get_tile(TILE_ZOOM, x, y)
+    px = img.load()
+    w, h = img.size
+
+    fx = int((lon + 180) / 360 * w) % w
+    fy = int((1 - math.log(math.tan(math.radians(lat)) + 1 / math.cos(math.radians(lat))) / math.pi) / 2 * h) % h
+
+    R, G, B = px[fx, fy][:3]
+    meters = -10000 + (R * 256 * 256 + G * 256 + B) * 0.1
+    return meters * 3.28084
+
+# ======================
+# KML / KMZ LOAD
+# ======================
+def load_kml(upload):
+    if upload.name.lower().endswith(".kmz"):
+        z = zipfile.ZipFile(upload)
+        kml = z.read([n for n in z.namelist() if n.endswith(".kml")][0])
+    else:
+        kml = upload.read()
+    return ET.fromstring(kml)
+
+# ======================
+# ROBUST PARSE
+# ======================
+def parse(root):
+    ns = {"k": "http://www.opengis.net/kml/2.2"}
+    agms = []
+    center = []
+
+    # FIND ANY FOLDER THAT CONTAINS "AGM"
+    for folder in root.findall(".//k:Folder", ns):
+        name = folder.find("k:name", ns)
+        if name is None:
+            continue
+
+        fname = name.text.lower()
+
+        # -------- FIND AGMS FOLDER --------
+        if "agm" in fname:
+            for p in folder.findall(".//k:Placemark", ns):
+                pname = p.find("k:name", ns)
+                coords = p.find(".//k:coordinates", ns)
+
+                if pname is None or coords is None:
+                    continue
+
+                lon, lat, _ = map(float, coords.text.split(","))
+                agms.append((pname.text.strip(), lat, lon))
+
+        # -------- FIND CENTERLINE --------
+        if "center" in fname:
+            for ls in folder.findall(".//k:LineString", ns):
+                for c in ls.find("k:coordinates", ns).text.split():
+                    lon, lat, _ = map(float, c.split(","))
+                    center.append((lat, lon))
+
+    return agms, center
+
+# ======================
+# STREAMLIT
+# ======================
 st.title("Terrain-Aware AGM Distance Checker")
 
-uploaded_file = st.file_uploader("Upload KMZ", type=["kmz"])
+upload = st.file_uploader("Drag & drop KML or KMZ", ["kml", "kmz"])
 
-if uploaded_file:
+if upload:
 
-    # ---------- UNZIP KMZ ----------
-    with tempfile.TemporaryDirectory() as tmpdir:
-        kmz_path = os.path.join(tmpdir, "file.kmz")
-        with open(kmz_path, "wb") as f:
-            f.write(uploaded_file.read())
+    root = load_kml(upload)
+    agms, center = parse(root)
 
-        with zipfile.ZipFile(kmz_path, 'r') as z:
-            z.extractall(tmpdir)
-
-        kml_file = [f for f in os.listdir(tmpdir) if f.endswith(".kml")][0]
-        with open(os.path.join(tmpdir, kml_file), 'rb') as f:
-            doc_bytes = f.read()
-
-    # ---------- PARSE KML ----------
-    k = kml.KML()
-    k.from_string(doc_bytes)
-
-    # --- WALK DOWN UNTIL WE FIND FOLDERS ---
-    def get_all_features(container):
-        feats = []
-        if hasattr(container, "features") and container.features:
-            for f in container.features:
-                feats.append(f)
-                feats.extend(get_all_features(f))
-        return feats
-
-    all_features = get_all_features(k)
-
-    centerline = None
-    agms_folder = None
-
-    for f in all_features:
-        if hasattr(f, "name") and f.name:
-            name = f.name.lower()
-
-            if name == "centerline":
-                for feat in f.features:
-                    if isinstance(feat.geometry, LineString):
-                        centerline = feat.geometry
-
-            if name == "agms":
-                agms_folder = f
-
-    if centerline is None or agms_folder is None:
-        st.error("Missing Centerline or AGMs folder.")
+    if not agms or not center:
+        st.error("Could not find AGMs or Centerline in file")
         st.stop()
 
-    # ---------- GET ALL PLACEMARKS IN AGMs ----------
-    agm_points = []
+    center = densify(center)
 
-    for placemark in agms_folder.features:
-        if isinstance(placemark.geometry, Point):
-            agm_points.append({
-                "name": placemark.name,
-                "lon": placemark.geometry.x,
-                "lat": placemark.geometry.y
-            })
+    elevations = np.array([elevation_ft(lat, lon) for lat, lon in center])
 
-    # ---------- PROJECT ONTO CENTERLINE ----------
-    def project_onto_line(point):
-        p = Point(point["lon"], point["lat"])
-        d = centerline.project(p)
-        snap = centerline.interpolate(d)
-        return {
-            "name": point["name"],
-            "distance": d,
-            "lon": snap.x,
-            "lat": snap.y
-        }
+    # SNAP AGMS TO CENTERLINE
+    snapped = []
+    for name, lat, lon in agms:
+        dists = [haversine_ft(lat, lon, p[0], p[1]) for p in center]
+        snapped.append((name, int(np.argmin(dists))))
 
-    projected = [project_onto_line(p) for p in agm_points]
+    # ORDER BY CENTERLINE POSITION
+    snapped.sort(key=lambda x: x[1])
 
-    # ---------- SORT BY POSITION ALONG CENTERLINE ----------
-    projected.sort(key=lambda x: x["distance"])
-
-    # ---------- ELEVATION CACHE ----------
-    @st.cache_data
-    def get_elevation(lon, lat):
-        url = f"https://api.mapbox.com/v4/mapbox.mapbox-terrain-v2/tilequery/{lon},{lat}.json"
-        params = {
-            "layers": "contour",
-            "limit": 50,
-            "access_token": MAPBOX_TOKEN
-        }
-        r = requests.get(url, params=params)
-        data = r.json()
-        return data["features"][0]["properties"]["ele"]
-
-    # ---------- TERRAIN DISTANCE ----------
-    def terrain_distance(p1, p2, samples=25):
-
-        total = 0
-        prev = None
-
-        for i in range(samples + 1):
-            t = i / samples
-            lon = p1["lon"] + (p2["lon"] - p1["lon"]) * t
-            lat = p1["lat"] + (p2["lat"] - p1["lat"]) * t
-            ele = get_elevation(lon, lat)
-
-            current = (lon, lat, ele)
-
-            if prev:
-                dx = (current[0] - prev[0]) * 364000
-                dy = (current[1] - prev[1]) * 364000
-                dz = current[2] - prev[2]
-                total += math.sqrt(dx*dx + dy*dy + dz*dz)
-
-            prev = current
-
-        return total
-
-    # ---------- CALCULATE DISTANCES ----------
     rows = []
-    cumulative = 0
+    cumulative_mi = 0.0
 
-    for i in range(1, len(projected)):
-        d = terrain_distance(projected[i-1], projected[i])
-        cumulative += d
+    for i in range(len(snapped) - 1):
+        a_name, a_idx = snapped[i]
+        b_name, b_idx = snapped[i + 1]
 
-        rows.append({
-            "From": projected[i-1]["name"],
-            "To": projected[i]["name"],
-            "Segment Feet": round(d, 2),
-            "Cumulative Feet": round(cumulative, 2),
-            "Segment Miles": round(d / 5280, 4),
-            "Cumulative Miles": round(cumulative / 5280, 4)
-        })
+        dist_ft = 0.0
+        for j in range(a_idx, b_idx):
+            h = haversine_ft(*center[j], *center[j + 1])
+            v = elevations[j + 1] - elevations[j]
+            dist_ft += math.sqrt(h * h + v * v)
+
+        dist_mi = dist_ft / 5280.0
+        cumulative_mi += dist_mi
+
+        rows.append(
+            {
+                "From": a_name,
+                "To": b_name,
+                "Distance (ft)": round(dist_ft, 2),
+                "Distance (mi)": round(dist_mi, 6),
+                "Cumulative (mi)": round(cumulative_mi, 6),
+            }
+        )
 
     df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True)
 
-    st.dataframe(df)
-
-    csv = df.to_csv(index=False).encode()
     st.download_button(
         "Download CSV",
-        csv,
-        "AGM_Terrain_Distances.csv",
-        "text/csv"
+        df.to_csv(index=False).encode(),
+        file_name="terrain_agm_distances.csv",
+        mime="text/csv",
     )

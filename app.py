@@ -6,17 +6,13 @@ import requests
 from PIL import Image
 import pandas as pd
 
-# ======================
-# CONFIG
-# ======================
 MAPBOX_TOKEN = st.secrets["mapbox"]["token"]
-DENSIFY_FEET = 30
+
 EARTH_R_FT = 20925524.9
 TILE_ZOOM = 14
 
-# ======================
-# GEO HELPERS
-# ======================
+# ---------------- GEO ----------------
+
 def haversine_ft(lat1, lon1, lat2, lon2):
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
@@ -29,20 +25,69 @@ def haversine_ft(lat1, lon1, lat2, lon2):
     return 2 * EARTH_R_FT * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-def densify(line):
-    out = [line[0]]
-    for i in range(len(line) - 1):
-        a, b = line[i], line[i + 1]
-        d = haversine_ft(*a, *b)
-        n = max(1, int(d // DENSIFY_FEET))
-        for j in range(1, n + 1):
-            f = j / n
-            out.append((a[0] + f * (b[0] - a[0]), a[1] + f * (b[1] - a[1])))
-    return out
+# -------- PROJECT POINT ONTO LINE SEGMENTS --------
 
-# ======================
-# MAPBOX TERRAIN
-# ======================
+def project_to_line(lat, lon, line):
+
+    best_dist = float("inf")
+    best_index = 0
+    best_t = 0
+
+    for i in range(len(line) - 1):
+        A = np.array(line[i])
+        B = np.array(line[i + 1])
+        P = np.array([lat, lon])
+
+        AB = B - A
+        t = np.dot(P - A, AB) / np.dot(AB, AB)
+        t = max(0, min(1, t))
+
+        proj = A + t * AB
+        d = haversine_ft(lat, lon, proj[0], proj[1])
+
+        if d < best_dist:
+            best_dist = d
+            best_index = i
+            best_t = t
+
+    return best_index, best_t
+
+
+# -------- DISTANCE ALONG CENTERLINE --------
+
+def distance_between(p1, p2, line, elevations):
+
+    idx1, t1 = p1
+    idx2, t2 = p2
+
+    if (idx1, t1) > (idx2, t2):
+        idx1, t1, idx2, t2 = idx2, t2, idx1, t1
+
+    total = 0.0
+
+    # partial first segment
+    A = line[idx1]
+    B = line[idx1 + 1]
+    seg_len = haversine_ft(*A, *B)
+    total += seg_len * (1 - t1)
+
+    # full segments between
+    for i in range(idx1 + 1, idx2):
+        h = haversine_ft(*line[i], *line[i + 1])
+        v = elevations[i + 1] - elevations[i]
+        total += math.sqrt(h*h + v*v)
+
+    # partial last segment
+    A = line[idx2]
+    B = line[idx2 + 1]
+    seg_len = haversine_ft(*A, *B)
+    total += seg_len * t2
+
+    return total
+
+
+# ---------------- MAPBOX TERRAIN ----------------
+
 tile_cache = {}
 
 def tile_xy(lat, lon, z):
@@ -60,7 +105,6 @@ def get_tile(z, x, y):
 
     url = f"https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}.pngraw?access_token={MAPBOX_TOKEN}"
     r = requests.get(url)
-
     img = Image.open(io.BytesIO(r.content))
     tile_cache[key] = img
     return img
@@ -79,9 +123,9 @@ def elevation_ft(lat, lon):
     meters = -10000 + (R * 256 * 256 + G * 256 + B) * 0.1
     return meters * 3.28084
 
-# ======================
-# KML / KMZ LOAD
-# ======================
+
+# ---------------- KML LOAD ----------------
+
 def load_kml(upload):
     if upload.name.lower().endswith(".kmz"):
         z = zipfile.ZipFile(upload)
@@ -90,15 +134,12 @@ def load_kml(upload):
         kml = upload.read()
     return ET.fromstring(kml)
 
-# ======================
-# ROBUST PARSE
-# ======================
+
 def parse(root):
     ns = {"k": "http://www.opengis.net/kml/2.2"}
     agms = []
     center = []
 
-    # FIND ANY FOLDER THAT CONTAINS "AGM"
     for folder in root.findall(".//k:Folder", ns):
         name = folder.find("k:name", ns)
         if name is None:
@@ -106,19 +147,15 @@ def parse(root):
 
         fname = name.text.lower()
 
-        # -------- FIND AGMS FOLDER --------
         if "agm" in fname:
             for p in folder.findall(".//k:Placemark", ns):
                 pname = p.find("k:name", ns)
                 coords = p.find(".//k:coordinates", ns)
-
                 if pname is None or coords is None:
                     continue
-
                 lon, lat, _ = map(float, coords.text.split(","))
                 agms.append((pname.text.strip(), lat, lon))
 
-        # -------- FIND CENTERLINE --------
         if "center" in fname:
             for ls in folder.findall(".//k:LineString", ns):
                 for c in ls.find("k:coordinates", ns).text.split():
@@ -127,12 +164,12 @@ def parse(root):
 
     return agms, center
 
-# ======================
-# STREAMLIT
-# ======================
+
+# ---------------- STREAMLIT ----------------
+
 st.title("Terrain-Aware AGM Distance Checker")
 
-upload = st.file_uploader("Drag & drop KML or KMZ", ["kml", "kmz"])
+upload = st.file_uploader("Upload KMZ/KML", ["kmz", "kml"])
 
 if upload:
 
@@ -140,45 +177,38 @@ if upload:
     agms, center = parse(root)
 
     if not agms or not center:
-        st.error("Could not find AGMs or Centerline in file")
+        st.error("Missing AGMs or Centerline")
         st.stop()
 
-    center = densify(center)
+    elevations = [elevation_ft(lat, lon) for lat, lon in center]
 
-    elevations = np.array([elevation_ft(lat, lon) for lat, lon in center])
-
-    # SNAP AGMS TO CENTERLINE
-    snapped = []
+    projected = []
     for name, lat, lon in agms:
-        dists = [haversine_ft(lat, lon, p[0], p[1]) for p in center]
-        snapped.append((name, int(np.argmin(dists))))
+        projected.append((name, project_to_line(lat, lon, center)))
 
-    # ORDER BY CENTERLINE POSITION
-    snapped.sort(key=lambda x: x[1])
+    projected.sort(key=lambda x: x[1])
 
     rows = []
-    cumulative_mi = 0.0
+    cumulative = 0
 
-    for i in range(len(snapped) - 1):
-        a_name, a_idx = snapped[i]
-        b_name, b_idx = snapped[i + 1]
+    for i in range(len(projected) - 1):
+        d = distance_between(
+            projected[i][1],
+            projected[i + 1][1],
+            center,
+            elevations,
+        )
 
-        dist_ft = 0.0
-        for j in range(a_idx, b_idx):
-            h = haversine_ft(*center[j], *center[j + 1])
-            v = elevations[j + 1] - elevations[j]
-            dist_ft += math.sqrt(h * h + v * v)
-
-        dist_mi = dist_ft / 5280.0
-        cumulative_mi += dist_mi
+        cumulative += d
 
         rows.append(
             {
-                "From": a_name,
-                "To": b_name,
-                "Distance (ft)": round(dist_ft, 2),
-                "Distance (mi)": round(dist_mi, 6),
-                "Cumulative (mi)": round(cumulative_mi, 6),
+                "From": projected[i][0],
+                "To": projected[i + 1][0],
+                "Segment Feet": round(d, 2),
+                "Cumulative Feet": round(cumulative, 2),
+                "Segment Miles": round(d / 5280, 4),
+                "Cumulative Miles": round(cumulative / 5280, 4),
             }
         )
 
@@ -188,6 +218,6 @@ if upload:
     st.download_button(
         "Download CSV",
         df.to_csv(index=False).encode(),
-        file_name="terrain_agm_distances.csv",
-        mime="text/csv",
+        "AGM_Terrain_Distances.csv",
+        "text/csv",
     )

@@ -362,6 +362,8 @@ if upload:
         stn = station_at(proj, seg_len_3d, cum)
         projected.append((name, proj, stn))
 
+    # Always order AGMs by their station along the (possibly curved) centerline,
+    # starting from the launcher/000 end chosen in _orient_centerline.
     projected.sort(key=lambda x: x[2])
 
     rows = []

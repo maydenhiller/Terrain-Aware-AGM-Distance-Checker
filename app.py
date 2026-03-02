@@ -15,7 +15,7 @@ TILE_ZOOM = 14
 TILE_SIZE = 256
 
 
-ANCHOR_AGM_NAMES = {"000", "launcher", "launcher valve"}  # case-insensitive (exact match)
+ANCHOR_AGM_NAMES = {"000", "launcher", "launcher valve"}  # case-insensitive (exact or substring match for launcher/valve)
 SP_PREFIX = "SP"  # case-sensitive: ignore only "SP*", not "Sp*"
 
 POSITIVE_KEYWORDS = ["agm", "valve", "tap", "mlv"]  # case-insensitive
@@ -210,16 +210,12 @@ def load_kml(upload):
 
 def _include_agm(name: str) -> bool:
     """
-    Decide whether a placemark should be treated as an AGM to be measured.
+    Decide whether a placemark in the AGMs folder should be treated as an AGM to be measured.
 
-    Rules (per user):
-    - Skip any name that starts with exact 'SP' (case-sensitive): e.g. 'SP01', 'SP10'.
-    - Otherwise, include if (case-insensitive):
-        * the name contains 'AGM', 'Valve', 'tap', or 'MLV', OR
-        * the name is an anchor name like '000', 'Launcher', 'Launcher Valve', OR
-        * the name is purely numeric such as '000', '005', '010' (no letters).
-    - Names that only describe things like welds, risers, doors, blowoffs, etc.,
-      and do not match any of the positive conditions above, are excluded.
+    Updated rules:
+    - Always skip names that start with exact 'SP' (case-sensitive), e.g. 'SP01', 'SP10'.
+    - Skip names that contain obvious non-measurement terms like welds, risers, doors, blowoffs, etc.
+    - Everything else in the AGMs folder is treated as a valid AGM, including names like 'S-001'.
     """
     stripped = name.strip()
 
@@ -229,28 +225,28 @@ def _include_agm(name: str) -> bool:
 
     lower = stripped.lower()
 
-    # 2. Always include anchor AGMs
-    if lower in ANCHOR_AGM_NAMES:
-        return True
-
-    # 3. Include purely numeric names (e.g., 000, 005, 010)
-    if stripped.isdigit():
-        return True
-
-    # 4. Include if it contains any positive keyword
-    if any(k in lower for k in POSITIVE_KEYWORDS):
-        return True
-
-    # 5. Exclude if it matches typical non-measured types AND has no positive keyword
+    # 2. Skip obvious non-measurement features (welds, doors, risers, etc.)
     if any(k in lower for k in NEGATIVE_KEYWORDS):
         return False
 
-    # 6. Default: do not measure
-    return False
+    # 3. Otherwise keep it as an AGM
+    return True
 
 
 def _is_anchor_agm(name: str) -> bool:
-    return name.strip().lower() in ANCHOR_AGM_NAMES
+    """
+    Detect the AGM that should define the starting end of the line.
+    We treat anything containing 'launch valve' or 'launcher valve' as anchor,
+    as well as names equal to 'launcher' or '000' (case-insensitive).
+    """
+    lower = name.strip().lower()
+    if lower == "000":
+        return True
+    if "launch valve" in lower or "launcher valve" in lower:
+        return True
+    if lower == "launcher":
+        return True
+    return False
 
 
 def parse(root):
@@ -292,13 +288,26 @@ def parse(root):
 
 
 def _pick_anchor_agm(agms):
-    # Prefer "000", then "launcher valve", then "launcher"
-    preference = ["000", "launcher valve", "launcher"]
-    anchors = [(n, lat, lon) for (n, lat, lon) in agms if _is_anchor_agm(n)]
-    if not anchors:
+    # Prefer "launch valve" (or variants), then "000", then "launcher"
+    ranked = []
+    for n, lat, lon in agms:
+        lower = n.strip().lower()
+        if "launch valve" in lower or "launcher valve" in lower:
+            priority = 0
+        elif lower == "000":
+            priority = 1
+        elif lower == "launcher":
+            priority = 2
+        else:
+            continue
+        ranked.append((priority, n, lat, lon))
+
+    if not ranked:
         return None
-    anchors.sort(key=lambda a: preference.index(a[0].strip().lower()))
-    return anchors[0]
+
+    ranked.sort(key=lambda x: x[0])
+    _prio, n, lat, lon = ranked[0]
+    return n, lat, lon
 
 
 def _orient_centerline(center, agms):

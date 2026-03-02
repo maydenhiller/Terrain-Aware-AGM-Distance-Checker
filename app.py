@@ -14,11 +14,14 @@ EARTH_R_FT = 20925524.9
 TILE_ZOOM = 14
 TILE_SIZE = 256
 
+# Max centerline segment length (ft). Longer segments are subdivided so distances follow bends.
+MAX_CENTERLINE_SEGMENT_FT = 100.0
 
-ANCHOR_AGM_NAMES = {"000", "launcher", "launcher valve"}  # case-insensitive (exact or substring match for launcher/valve)
-SP_PREFIX = "SP"  # case-sensitive: ignore only "SP*", not "Sp*"
 
-POSITIVE_KEYWORDS = ["agm", "valve", "tap", "mlv"]  # case-insensitive
+ANCHOR_AGM_NAMES = {"000", "launcher", "launcher valve"}
+SP_PREFIX = "SP"
+
+POSITIVE_KEYWORDS = ["agm", "valve", "tap", "mlv"]
 NEGATIVE_KEYWORDS = [
     "weld",
     "riser",
@@ -56,7 +59,6 @@ def haversine_ft(lat1, lon1, lat2, lon2):
 
 
 def _to_local_xy_ft(lat, lon, ref_lat_rad):
-    # Equirectangular-ish local mapping in feet (good enough for projection math)
     x = math.radians(lon) * EARTH_R_FT * math.cos(ref_lat_rad)
     y = math.radians(lat) * EARTH_R_FT
     return np.array([x, y], dtype=float)
@@ -68,6 +70,31 @@ def _from_local_xy_ft(xy, ref_lat_rad):
     denom = EARTH_R_FT * math.cos(ref_lat_rad)
     lon = math.degrees(x / denom) if denom != 0 else 0.0
     return lat, lon
+
+
+# -------- CENTERLINE DENSIFY --------
+
+
+def densify_centerline(line, max_seg_ft):
+    """Insert points so no segment exceeds max_seg_ft; path follows bends."""
+    if not line or len(line) < 2 or max_seg_ft <= 0:
+        return line
+    out = [line[0]]
+    for i in range(len(line) - 1):
+        a_lat, a_lon = line[i]
+        b_lat, b_lon = line[i + 1]
+        h = haversine_ft(a_lat, a_lon, b_lat, b_lon)
+        if h <= max_seg_ft:
+            out.append((b_lat, b_lon))
+            continue
+        n = max(2, int(math.ceil(h / max_seg_ft)))
+        for k in range(1, n):
+            t = k / n
+            lat = a_lat + t * (b_lat - a_lat)
+            lon = a_lon + t * (b_lon - a_lon)
+            out.append((lat, lon))
+        out.append((b_lat, b_lon))
+    return out
 
 
 # -------- PROJECT POINT ONTO LINE SEGMENTS --------
@@ -134,6 +161,15 @@ def station_at(proj, seg_len_3d, cum):
         idx = len(seg_len_3d) - 1
         t = 1.0
     return cum[idx] + seg_len_3d[idx] * t
+
+
+def segment_distance_along_centerline(stn_a, stn_b, total_length):
+    """
+    Shortest path along centerline from station stn_a to stn_b.
+    If centerline loops, use the shorter of the two directions.
+    """
+    raw = abs(stn_b - stn_a)
+    return min(raw, total_length - raw)
 
 
 # ---------------- MAPBOX TERRAIN ----------------
@@ -209,36 +245,16 @@ def load_kml(upload):
 
 
 def _include_agm(name: str) -> bool:
-    """
-    Decide whether a placemark in the AGMs folder should be treated as an AGM to be measured.
-
-    Updated rules:
-    - Always skip names that start with exact 'SP' (case-sensitive), e.g. 'SP01', 'SP10'.
-    - Skip names that contain obvious non-measurement terms like welds, risers, doors, blowoffs, etc.
-    - Everything else in the AGMs folder is treated as a valid AGM, including names like 'S-001'.
-    """
     stripped = name.strip()
-
-    # 1. Hard skip SP* (exact, case-sensitive)
     if stripped.startswith(SP_PREFIX):
         return False
-
     lower = stripped.lower()
-
-    # 2. Skip obvious non-measurement features (welds, doors, risers, etc.)
     if any(k in lower for k in NEGATIVE_KEYWORDS):
         return False
-
-    # 3. Otherwise keep it as an AGM
     return True
 
 
 def _is_anchor_agm(name: str) -> bool:
-    """
-    Detect the AGM that should define the starting end of the line.
-    We treat anything containing 'launch valve' or 'launcher valve' as anchor,
-    as well as names equal to 'launcher' or '000' (case-insensitive).
-    """
     lower = name.strip().lower()
     if lower == "000":
         return True
@@ -252,7 +268,7 @@ def _is_anchor_agm(name: str) -> bool:
 def parse(root):
     ns = {"k": "http://www.opengis.net/kml/2.2"}
     agms = []
-    center = []
+    centerline_strings = []
 
     for folder in root.findall(".//k:Folder", ns):
         name = folder.find("k:name", ns)
@@ -280,9 +296,17 @@ def parse(root):
                 coord_node = ls.find("k:coordinates", ns)
                 if coord_node is None or not coord_node.text:
                     continue
+                pts = []
                 for c in coord_node.text.split():
                     lon, lat, *_rest = map(float, c.split(","))
-                    center.append((lat, lon))
+                    pts.append((lat, lon))
+                if len(pts) >= 2:
+                    centerline_strings.append(pts)
+
+    # Use only the single longest LineString so we don't mix two paths (e.g. red + blue).
+    center = []
+    if centerline_strings:
+        center = max(centerline_strings, key=lambda pts: sum(haversine_ft(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1]) for i in range(len(pts) - 1)))
 
     return agms, center
 
@@ -292,7 +316,6 @@ def _is_numeric_label(name: str) -> bool:
 
 
 def _pick_anchor_agm(agms):
-    # Prefer "launch valve" (or variants), then "000", then "launcher"
     ranked = []
     for n, lat, lon in agms:
         lower = n.strip().lower()
@@ -315,7 +338,6 @@ def _pick_anchor_agm(agms):
 
 
 def _orient_centerline(center, agms):
-    # Ensure stationing starts from the end that has the anchor AGM.
     anchor = _pick_anchor_agm(agms)
     if not anchor or len(center) < 2:
         return center
@@ -350,6 +372,7 @@ if upload:
         st.stop()
 
     center = _orient_centerline(center, agms)
+    center = densify_centerline(center, MAX_CENTERLINE_SEGMENT_FT)
 
     if not token:
         st.error("Mapbox token missing. Add it to Streamlit secrets or paste it above.")
@@ -359,6 +382,7 @@ if upload:
         elevations = [elevation_ft(lat, lon, token) for lat, lon in center]
 
     seg_len_3d, cum = compute_stationing(center, elevations)
+    total_length = cum[-1]
 
     projected = []
     all_numeric = True
@@ -369,12 +393,6 @@ if upload:
         if not _is_numeric_label(name):
             all_numeric = False
 
-    # Ordering rule:
-    # - If ALL AGM names are purely numeric (e.g., 000, 010, 015, ...),
-    #   assume that numeric label order represents the intended pipeline order.
-    #   In that case, sort by numeric value of the name.
-    # - Otherwise, fall back to geometric stationing along the centerline
-    #   starting from the launcher/000 end chosen in _orient_centerline.
     if all_numeric:
         projected.sort(key=lambda x: int(x[0].strip()))
     else:
@@ -383,9 +401,9 @@ if upload:
     rows = []
     cumulative = 0.0
     for i in range(len(projected) - 1):
-        d = projected[i + 1][2] - projected[i][2]
-        if d < 0:
-            d = abs(d)
+        stn_a = projected[i][2]
+        stn_b = projected[i + 1][2]
+        d = segment_distance_along_centerline(stn_a, stn_b, total_length)
         cumulative += d
 
         rows.append(

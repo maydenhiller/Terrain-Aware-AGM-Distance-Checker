@@ -287,6 +287,10 @@ def parse(root):
     return agms, center
 
 
+def _is_numeric_label(name: str) -> bool:
+    return name.strip().isdigit()
+
+
 def _pick_anchor_agm(agms):
     # Prefer "launch valve" (or variants), then "000", then "launcher"
     ranked = []
@@ -357,21 +361,30 @@ if upload:
     seg_len_3d, cum = compute_stationing(center, elevations)
 
     projected = []
+    all_numeric = True
     for name, lat, lon in agms:
         proj = project_to_line(lat, lon, center)
         stn = station_at(proj, seg_len_3d, cum)
         projected.append((name, proj, stn))
+        if not _is_numeric_label(name):
+            all_numeric = False
 
-    # Always order AGMs by their station along the (possibly curved) centerline,
-    # starting from the launcher/000 end chosen in _orient_centerline.
-    projected.sort(key=lambda x: x[2])
+    # Ordering rule:
+    # - If ALL AGM names are purely numeric (e.g., 000, 010, 015, ...),
+    #   assume that numeric label order represents the intended pipeline order.
+    #   In that case, sort by numeric value of the name.
+    # - Otherwise, fall back to geometric stationing along the centerline
+    #   starting from the launcher/000 end chosen in _orient_centerline.
+    if all_numeric:
+        projected.sort(key=lambda x: int(x[0].strip()))
+    else:
+        projected.sort(key=lambda x: x[2])
 
     rows = []
     cumulative = 0.0
     for i in range(len(projected) - 1):
         d = projected[i + 1][2] - projected[i][2]
         if d < 0:
-            # Shouldn't happen after sorting, but keep safe
             d = abs(d)
         cumulative += d
 

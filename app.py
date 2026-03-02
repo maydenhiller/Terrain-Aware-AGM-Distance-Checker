@@ -7,7 +7,8 @@ import requests
 
 st.title("Terrain-Aware AGM Distance Checker")
 
-MAPBOX_TOKEN = st.secrets["MAPBOX_TOKEN"]
+# RESTORED — EXACT ORIGINAL TOKEN METHOD
+MAPBOX_TOKEN = st.secrets["mapbox"]["token"]
 
 # ------------------ HAVERSINE ------------------
 
@@ -86,7 +87,7 @@ def parse_kmz(path):
         point = pm.find(".//kml:Point/kml:coordinates", ns)
         if point is not None:
             if name.startswith("SP"):
-                continue  # IGNORE SP
+                continue
 
             lon, lat, *_ = map(float, point.text.strip().split(","))
             agms.append({"name": name, "coord": (lat, lon)})
@@ -143,10 +144,8 @@ if uploaded:
     for a in agms:
         a["chain"] = project(a["coord"], centerline, cum)
 
-    # ---- SORT BY CENTERLINE POSITION ----
     agms.sort(key=lambda x: x["chain"])
 
-    # ---- FIND START POINT ----
     start_keywords = ["000", "launcher", "launcher valve", "launch valve"]
 
     start_index = None
@@ -161,7 +160,6 @@ if uploaded:
 
     agms = agms[start_index:] + agms[:start_index]
 
-    # ---- MEASURE ----
     rows = []
     cumulative_dist = 0
 
@@ -180,7 +178,6 @@ if uploaded:
         ])
 
     st.success("Done")
-
     st.dataframe(rows)
 
     csv = "From,To,Segment_ft,Cumulative_ft\n"

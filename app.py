@@ -3,11 +3,13 @@ import zipfile
 import tempfile
 import xml.etree.ElementTree as ET
 import math
-import csv
+import requests
 
 st.title("Terrain-Aware AGM Distance Checker")
 
-# ---------- Helpers ----------
+MAPBOX_TOKEN = st.secrets["MAPBOX_TOKEN"]
+
+# ------------------ HAVERSINE ------------------
 
 def haversine(p1, p2):
     R = 6371000
@@ -15,10 +17,47 @@ def haversine(p1, p2):
     lat2, lon2 = map(math.radians, p2)
     dlat = lat2 - lat1
     dlon = lon2 - lon1
-
     a = math.sin(dlat/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2)**2
     return 2 * R * math.asin(math.sqrt(a))
 
+
+# ------------------ MAPBOX ELEVATION ------------------
+
+@st.cache_data(show_spinner=False)
+def get_elevation(lat, lon):
+    url = f"https://api.mapbox.com/v4/mapbox.terrain-rgb/tilequery/{lon},{lat}.json"
+    params = {"layers": "contour", "limit": 50, "access_token": MAPBOX_TOKEN}
+    r = requests.get(url, params=params)
+    if r.status_code != 200:
+        return 0
+    data = r.json()
+    if "features" not in data or not data["features"]:
+        return 0
+    return data["features"][0]["properties"]["ele"]
+
+
+def terrain_distance(p1, p2, samples=10):
+    total = 0
+    prev = p1
+    prev_z = get_elevation(*p1)
+
+    for i in range(1, samples + 1):
+        t = i / samples
+        lat = p1[0] + (p2[0] - p1[0]) * t
+        lon = p1[1] + (p2[1] - p1[1]) * t
+        z = get_elevation(lat, lon)
+
+        horizontal = haversine(prev, (lat, lon))
+        dz = z - prev_z
+        total += math.sqrt(horizontal**2 + dz**2)
+
+        prev = (lat, lon)
+        prev_z = z
+
+    return total
+
+
+# ------------------ KMZ PARSER ------------------
 
 def parse_kmz(path):
     with zipfile.ZipFile(path) as z:
@@ -37,7 +76,6 @@ def parse_kmz(path):
 
         name = name_el.text.strip()
 
-        # ---- LineString (centerline)
         line = pm.find(".//kml:LineString/kml:coordinates", ns)
         if line is not None:
             coords = line.text.strip().split()
@@ -45,11 +83,10 @@ def parse_kmz(path):
                 lon, lat, *_ = map(float, c.split(","))
                 centerline.append((lat, lon))
 
-        # ---- Point (AGMs)
         point = pm.find(".//kml:Point/kml:coordinates", ns)
         if point is not None:
-            if name.startswith("SP"):   # IGNORE SP points (capital only)
-                continue
+            if name.startswith("SP"):
+                continue  # IGNORE SP
 
             lon, lat, *_ = map(float, point.text.strip().split(","))
             agms.append({"name": name, "coord": (lat, lon)})
@@ -57,36 +94,35 @@ def parse_kmz(path):
     return centerline, agms
 
 
-def cumulative_distances(line):
-    dists = [0]
+# ------------------ PROJECT TO CENTERLINE ------------------
+
+def cumulative(line):
+    d = [0]
     for i in range(1, len(line)):
-        dists.append(dists[-1] + haversine(line[i-1], line[i]))
-    return dists
+        d.append(d[-1] + haversine(line[i-1], line[i]))
+    return d
 
 
-def project_to_line(point, line, cum_dists):
-    best_dist = float("inf")
-    best_chain = 0
+def project(point, line, cum):
+    best = float("inf")
+    chain = 0
 
-    for i in range(len(line) - 1):
-        p1 = line[i]
-        p2 = line[i+1]
+    for i in range(len(line)-1):
+        d1 = haversine(point, line[i])
+        d2 = haversine(point, line[i+1])
 
-        d1 = haversine(point, p1)
-        d2 = haversine(point, p2)
+        if d1 < best:
+            best = d1
+            chain = cum[i]
 
-        if d1 < best_dist:
-            best_dist = d1
-            best_chain = cum_dists[i]
+        if d2 < best:
+            best = d2
+            chain = cum[i+1]
 
-        if d2 < best_dist:
-            best_dist = d2
-            best_chain = cum_dists[i+1]
-
-    return best_chain
+    return chain
 
 
-# ---------- Processing ----------
+# ------------------ MAIN ------------------
 
 uploaded = st.file_uploader("Upload KMZ", type=["kmz"])
 
@@ -99,66 +135,56 @@ if uploaded:
     centerline, agms = parse_kmz(kmz_path)
 
     if not centerline or not agms:
-        st.error("Missing centerline or AGM points")
+        st.error("Missing Centerline or AGMs folder.")
         st.stop()
 
-    cum_line = cumulative_distances(centerline)
+    cum = cumulative(centerline)
 
-    # ---- Project AGMs onto centerline
     for a in agms:
-        a["chain"] = project_to_line(a["coord"], centerline, cum_line)
+        a["chain"] = project(a["coord"], centerline, cum)
 
-    # ---- Find starting AGM
+    # ---- SORT BY CENTERLINE POSITION ----
+    agms.sort(key=lambda x: x["chain"])
+
+    # ---- FIND START POINT ----
     start_keywords = ["000", "launcher", "launcher valve", "launch valve"]
 
-    start_agm = None
-    for a in agms:
+    start_index = None
+    for i, a in enumerate(agms):
         name_lower = a["name"].lower()
         if any(k in name_lower for k in start_keywords):
-            start_agm = a
+            start_index = i
             break
 
-    if start_agm is None:
-        start_agm = min(agms, key=lambda x: x["chain"])
+    if start_index is None:
+        start_index = 0
 
-    # ---- Sort AGMs along centerline
-    agms_sorted = sorted(agms, key=lambda x: x["chain"])
+    agms = agms[start_index:] + agms[:start_index]
 
-    # ---- Rotate so start AGM is first
-    start_index = agms_sorted.index(start_agm)
-    agms_ordered = agms_sorted[start_index:] + agms_sorted[:start_index]
-
-    # ---------- Measure ----------
+    # ---- MEASURE ----
     rows = []
-    cumulative = 0
+    cumulative_dist = 0
 
-    for i in range(len(agms_ordered) - 1):
-        a1 = agms_ordered[i]
-        a2 = agms_ordered[i+1]
+    for i in range(len(agms) - 1):
+        a1 = agms[i]
+        a2 = agms[i+1]
 
-        seg = abs(a2["chain"] - a1["chain"])
-        cumulative += seg
+        dist = terrain_distance(a1["coord"], a2["coord"])
+        cumulative_dist += dist
 
         rows.append([
             a1["name"],
             a2["name"],
-            round(seg * 3.28084, 2),
-            round(cumulative * 3.28084, 2)
+            round(dist * 3.28084, 2),
+            round(cumulative_dist * 3.28084, 2)
         ])
 
-    # ---------- Output ----------
-    st.success("Processing complete")
+    st.success("Done")
 
-    st.write("### Distances (feet)")
     st.dataframe(rows)
 
-    csv_data = "From,To,Segment_ft,Cumulative_ft\n"
+    csv = "From,To,Segment_ft,Cumulative_ft\n"
     for r in rows:
-        csv_data += ",".join(map(str, r)) + "\n"
+        csv += ",".join(map(str, r)) + "\n"
 
-    st.download_button(
-        "Download CSV",
-        csv_data,
-        "agm_distances.csv",
-        "text/csv"
-    )
+    st.download_button("Download CSV", csv, "agm_distances.csv")

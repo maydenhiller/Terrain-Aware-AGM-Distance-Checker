@@ -7,10 +7,9 @@ import requests
 
 st.title("Terrain-Aware AGM Distance Checker")
 
-# RESTORED — EXACT ORIGINAL TOKEN METHOD
 MAPBOX_TOKEN = st.secrets["mapbox"]["token"]
 
-# ------------------ HAVERSINE ------------------
+# ---------------- HAVERSINE ----------------
 
 def haversine(p1, p2):
     R = 6371000
@@ -22,7 +21,7 @@ def haversine(p1, p2):
     return 2 * R * math.asin(math.sqrt(a))
 
 
-# ------------------ MAPBOX ELEVATION ------------------
+# ---------------- MAPBOX ----------------
 
 @st.cache_data(show_spinner=False)
 def get_elevation(lat, lon):
@@ -58,7 +57,7 @@ def terrain_distance(p1, p2, samples=10):
     return total
 
 
-# ------------------ KMZ PARSER ------------------
+# ---------------- KMZ PARSE ----------------
 
 def parse_kmz(path):
     with zipfile.ZipFile(path) as z:
@@ -87,7 +86,7 @@ def parse_kmz(path):
         point = pm.find(".//kml:Point/kml:coordinates", ns)
         if point is not None:
             if name.startswith("SP"):
-                continue
+                continue  # IGNORE SP ONLY
 
             lon, lat, *_ = map(float, point.text.strip().split(","))
             agms.append({"name": name, "coord": (lat, lon)})
@@ -95,7 +94,7 @@ def parse_kmz(path):
     return centerline, agms
 
 
-# ------------------ PROJECT TO CENTERLINE ------------------
+# ---------------- CHAINAGE ----------------
 
 def cumulative(line):
     d = [0]
@@ -123,7 +122,7 @@ def project(point, line, cum):
     return chain
 
 
-# ------------------ MAIN ------------------
+# ---------------- MAIN ----------------
 
 uploaded = st.file_uploader("Upload KMZ", type=["kmz"])
 
@@ -141,25 +140,25 @@ if uploaded:
 
     cum = cumulative(centerline)
 
+    # --- project AGMs to centerline ---
     for a in agms:
         a["chain"] = project(a["coord"], centerline, cum)
 
+    # --- FORCE TRUE CENTERLINE ORDER ---
     agms.sort(key=lambda x: x["chain"])
 
+    # --- FIND START ---
     start_keywords = ["000", "launcher", "launcher valve", "launch valve"]
 
-    start_index = None
+    start_index = 0
     for i, a in enumerate(agms):
-        name_lower = a["name"].lower()
-        if any(k in name_lower for k in start_keywords):
+        if a["name"].lower() in start_keywords:
             start_index = i
             break
 
-    if start_index is None:
-        start_index = 0
-
     agms = agms[start_index:] + agms[:start_index]
 
+    # --- MEASURE IN ORDER ---
     rows = []
     cumulative_dist = 0
 
@@ -170,18 +169,20 @@ if uploaded:
         dist = terrain_distance(a1["coord"], a2["coord"])
         cumulative_dist += dist
 
-        rows.append([
-            a1["name"],
-            a2["name"],
-            round(dist * 3.28084, 2),
-            round(cumulative_dist * 3.28084, 2)
-        ])
+        rows.append({
+            "From": a1["name"],
+            "To": a2["name"],
+            "Segment Distance (ft)": round(dist * 3.28084, 2),
+            "Cumulative Distance (ft)": round(cumulative_dist * 3.28084, 2)
+        })
 
     st.success("Done")
     st.dataframe(rows)
 
-    csv = "From,To,Segment_ft,Cumulative_ft\n"
-    for r in rows:
-        csv += ",".join(map(str, r)) + "\n"
+    import csv, io
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=rows[0].keys())
+    writer.writeheader()
+    writer.writerows(rows)
 
-    st.download_button("Download CSV", csv, "agm_distances.csv")
+    st.download_button("Download CSV", output.getvalue(), "agm_distances.csv")

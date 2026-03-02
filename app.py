@@ -18,6 +18,19 @@ TILE_SIZE = 256
 ANCHOR_AGM_NAMES = {"000", "launcher", "launcher valve"}  # case-insensitive (exact match)
 SP_PREFIX = "SP"  # case-sensitive: ignore only "SP*", not "Sp*"
 
+POSITIVE_KEYWORDS = ["agm", "valve", "tap", "mlv"]  # case-insensitive
+NEGATIVE_KEYWORDS = [
+    "weld",
+    "riser",
+    "launch bo",
+    "launch blowoff",
+    "launch door",
+    "pig sig",
+    "u/s blowoff",
+    "door",
+    "nominal",
+]
+
 
 def _get_mapbox_token() -> str | None:
     try:
@@ -196,9 +209,44 @@ def load_kml(upload):
 
 
 def _include_agm(name: str) -> bool:
-    # Ignore only names that start with exact "SP" (case-sensitive).
-    # Example ignored: "SP01", "SP10"; example NOT ignored: "Sp01"
-    return not name.strip().startswith(SP_PREFIX)
+    """
+    Decide whether a placemark should be treated as an AGM to be measured.
+
+    Rules (per user):
+    - Skip any name that starts with exact 'SP' (case-sensitive): e.g. 'SP01', 'SP10'.
+    - Otherwise, include if (case-insensitive):
+        * the name contains 'AGM', 'Valve', 'tap', or 'MLV', OR
+        * the name is an anchor name like '000', 'Launcher', 'Launcher Valve', OR
+        * the name is purely numeric such as '000', '005', '010' (no letters).
+    - Names that only describe things like welds, risers, doors, blowoffs, etc.,
+      and do not match any of the positive conditions above, are excluded.
+    """
+    stripped = name.strip()
+
+    # 1. Hard skip SP* (exact, case-sensitive)
+    if stripped.startswith(SP_PREFIX):
+        return False
+
+    lower = stripped.lower()
+
+    # 2. Always include anchor AGMs
+    if lower in ANCHOR_AGM_NAMES:
+        return True
+
+    # 3. Include purely numeric names (e.g., 000, 005, 010)
+    if stripped.isdigit():
+        return True
+
+    # 4. Include if it contains any positive keyword
+    if any(k in lower for k in POSITIVE_KEYWORDS):
+        return True
+
+    # 5. Exclude if it matches typical non-measured types AND has no positive keyword
+    if any(k in lower for k in NEGATIVE_KEYWORDS):
+        return False
+
+    # 6. Default: do not measure
+    return False
 
 
 def _is_anchor_agm(name: str) -> bool:

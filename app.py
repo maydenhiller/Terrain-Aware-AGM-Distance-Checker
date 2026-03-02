@@ -14,8 +14,8 @@ EARTH_R_FT = 20925524.9
 TILE_ZOOM = 14
 TILE_SIZE = 256
 
-# Max centerline segment length (ft). Longer segments are subdivided so distances follow bends.
-MAX_CENTERLINE_SEGMENT_FT = 100.0
+# Sub-meter densification: 1 meter ≈ 3.28 ft. No segment longer than this so path follows bends closely.
+MAX_CENTERLINE_SEGMENT_FT = 3.28
 
 
 ANCHOR_AGM_NAMES = {"000", "launcher", "launcher valve"}
@@ -163,13 +163,12 @@ def station_at(proj, seg_len_3d, cum):
     return cum[idx] + seg_len_3d[idx] * t
 
 
-def segment_distance_along_centerline(stn_a, stn_b, total_length):
-    """
-    Shortest path along centerline from station stn_a to stn_b.
-    If centerline loops, use the shorter of the two directions.
-    """
-    raw = abs(stn_b - stn_a)
-    return min(raw, total_length - raw)
+def segment_distance_forward(stn_a, stn_b, total_length):
+    """Forward distance from stn_a to stn_b along the centerline (anchor → downstream)."""
+    d = stn_b - stn_a
+    if d >= 0:
+        return d
+    return total_length - stn_a + stn_b
 
 
 # ---------------- MAPBOX TERRAIN ----------------
@@ -244,6 +243,69 @@ def load_kml(upload):
     return ET.fromstring(kml)
 
 
+def _get_style_colors(root, ns):
+    """Build map style_id -> LineStyle color (aabbggrr hex)."""
+    colors = {}
+    for style in root.findall(".//k:Style", ns):
+        sid = style.get("id")
+        if not sid:
+            continue
+        line_style = style.find("k:LineStyle", ns)
+        if line_style is not None:
+            color_el = line_style.find("k:color", ns)
+            if color_el is not None and color_el.text:
+                colors[sid] = color_el.text.strip().lower()
+    return colors
+
+
+def _get_stylemap_normal_style_url(root, ns):
+    """Build map stylemap_id -> styleUrl for normal state (so we resolve StyleMap -> Style)."""
+    normal = {}
+    for stylemap in root.findall(".//k:StyleMap", ns):
+        smid = stylemap.get("id")
+        if not smid:
+            continue
+        for pair in stylemap.findall("k:Pair", ns):
+            key = pair.find("k:key", ns)
+            if key is not None and key.text and key.text.strip().lower() == "normal":
+                url_el = pair.find("k:styleUrl", ns)
+                if url_el is not None and url_el.text:
+                    normal[smid] = url_el.text.strip()
+                break
+    return normal
+
+
+def _resolve_line_color(style_url, style_colors, stylemap_normal):
+    """Resolve styleUrl to LineStyle color string (aabbggrr). Returns None if not found."""
+    if not style_url or not style_url.strip():
+        return None
+    url = style_url.strip()
+    if "#" in url:
+        style_id = url.split("#")[-1].strip()
+    else:
+        style_id = url.split("/")[-1].strip() if "/" in url else url
+    if not style_id:
+        return None
+    if style_id in style_colors:
+        return style_colors[style_id]
+    if style_id in stylemap_normal:
+        return _resolve_line_color(stylemap_normal[style_id], style_colors, stylemap_normal)
+    return None
+
+
+def _is_red_line_color(color_str):
+    """KML color is aabbggrr (hex). Red = high R, zero G, zero B."""
+    if not color_str or len(color_str) < 8:
+        return False
+    color_str = color_str.lower().replace(" ", "")[:8]
+    if len(color_str) != 8:
+        return False
+    r = color_str[6:8]
+    g = color_str[4:6]
+    b = color_str[2:4]
+    return r == "ff" and g == "00" and b == "00"
+
+
 def _include_agm(name: str) -> bool:
     stripped = name.strip()
     if stripped.startswith(SP_PREFIX):
@@ -270,6 +332,9 @@ def parse(root):
     agms = []
     centerline_strings = []
 
+    style_colors = _get_style_colors(root, ns)
+    stylemap_normal = _get_stylemap_normal_style_url(root, ns)
+
     for folder in root.findall(".//k:Folder", ns):
         name = folder.find("k:name", ns)
         if name is None or not name.text:
@@ -292,6 +357,32 @@ def parse(root):
                 agms.append((agm_name, lat, lon))
 
         if "center" in fname:
+            for pm in folder.findall(".//k:Placemark", ns):
+                ls = pm.find("k:LineString", ns)
+                if ls is None:
+                    continue
+                style_url_el = pm.find("k:styleUrl", ns)
+                if style_url_el is None or not style_url_el.text:
+                    style_url_el = folder.find("k:styleUrl", ns)
+                style_url = style_url_el.text.strip() if style_url_el is not None and style_url_el.text else None
+                line_color = _resolve_line_color(style_url, style_colors, stylemap_normal) if style_url else None
+                if line_color is None or not _is_red_line_color(line_color):
+                    continue
+                coord_node = ls.find("k:coordinates", ns)
+                if coord_node is None or not coord_node.text:
+                    continue
+                pts = []
+                for c in coord_node.text.split():
+                    lon, lat, *_rest = map(float, c.split(","))
+                    pts.append((lat, lon))
+                if len(pts) >= 2:
+                    centerline_strings.append(pts)
+
+    if not centerline_strings:
+        for folder in root.findall(".//k:Folder", ns):
+            name = folder.find("k:name", ns)
+            if name is None or not name.text or "center" not in name.text.lower():
+                continue
             for ls in folder.findall(".//k:LineString", ns):
                 coord_node = ls.find("k:coordinates", ns)
                 if coord_node is None or not coord_node.text:
@@ -303,10 +394,20 @@ def parse(root):
                 if len(pts) >= 2:
                     centerline_strings.append(pts)
 
-    # Use only the single longest LineString so we don't mix two paths (e.g. red + blue).
     center = []
-    if centerline_strings:
-        center = max(centerline_strings, key=lambda pts: sum(haversine_ft(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1]) for i in range(len(pts) - 1)))
+    if centerline_strings and agms:
+        anchor = _pick_anchor_agm(agms)
+        if anchor:
+            _name, alat, alon = anchor
+            def min_dist_to_ends(pts):
+                d_first = haversine_ft(alat, alon, pts[0][0], pts[0][1])
+                d_last = haversine_ft(alat, alon, pts[-1][0], pts[-1][1])
+                return min(d_first, d_last)
+            center = min(centerline_strings, key=min_dist_to_ends)
+        else:
+            center = max(centerline_strings, key=lambda pts: sum(haversine_ft(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1]) for i in range(len(pts) - 1)))
+    elif centerline_strings:
+        center = centerline_strings[0]
 
     return agms, center
 
@@ -403,7 +504,7 @@ if upload:
     for i in range(len(projected) - 1):
         stn_a = projected[i][2]
         stn_b = projected[i + 1][2]
-        d = segment_distance_along_centerline(stn_a, stn_b, total_length)
+        d = segment_distance_forward(stn_a, stn_b, total_length)
         cumulative += d
 
         rows.append(

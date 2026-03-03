@@ -100,17 +100,13 @@ def densify_centerline(line, max_seg_ft):
 # -------- PROJECT POINT ONTO LINE SEGMENTS --------
 
 
-def project_to_line(lat, lon, line, min_segment_index=0):
-    """
-    Project (lat, lon) onto the closest point on the centerline.
-    If min_segment_index > 0, only consider segments from that index onward
-    so stations increase in pipeline order (avoids two AGMs projecting to the same spot).
-    """
+def project_to_line(lat, lon, line):
+    """Snap (lat, lon) to the closest point on the centerline. Returns (segment_index, t)."""
     best_dist = float("inf")
-    best_index = min_segment_index
+    best_index = 0
     best_t = 0.0
 
-    for i in range(min_segment_index, len(line) - 1):
+    for i in range(len(line) - 1):
         a_lat, a_lon = line[i]
         b_lat, b_lon = line[i + 1]
         ref_lat = math.radians((a_lat + b_lat) / 2.0)
@@ -168,15 +164,37 @@ def station_at(proj, seg_len_3d, cum):
     return cum[idx] + seg_len_3d[idx] * t
 
 
-def segment_distance_forward_only(stn_a, stn_b, total_length):
+def path_length_along_centerline(proj_a, proj_b, seg_len_3d, total_length):
     """
-    Distance from A to B along the centerline in the forward direction (launcher → end).
-    Use this when AGMs are in pipeline order and we projected with min_segment constraint.
+    Distance along the centerline (every bend, terrain) from snapped point A to snapped point B.
+    Sums 3D segment lengths between the two projected points. Uses the shorter of the two directions.
     """
-    d = stn_b - stn_a
-    if d >= 0:
-        return d
-    return total_length - stn_a + stn_b
+    idx_a, t_a = int(proj_a[0]), float(proj_a[1])
+    idx_b, t_b = int(proj_b[0]), float(proj_b[1])
+    idx_a = max(0, min(idx_a, len(seg_len_3d) - 1))
+    idx_b = max(0, min(idx_b, len(seg_len_3d) - 1))
+    t_a = max(0.0, min(1.0, t_a))
+    t_b = max(0.0, min(1.0, t_b))
+
+    if idx_a == idx_b:
+        same_seg = abs(t_b - t_a) * seg_len_3d[idx_a]
+        other = total_length - same_seg
+        return min(same_seg, other)
+
+    if idx_a < idx_b:
+        forward = (1.0 - t_a) * seg_len_3d[idx_a]
+        for i in range(idx_a + 1, idx_b):
+            forward += seg_len_3d[i]
+        forward += t_b * seg_len_3d[idx_b]
+        backward = total_length - forward
+        return min(forward, backward)
+    else:
+        backward = (1.0 - t_b) * seg_len_3d[idx_b]
+        for i in range(idx_b + 1, idx_a):
+            backward += seg_len_3d[i]
+        backward += t_a * seg_len_3d[idx_a]
+        forward = total_length - backward
+        return min(forward, backward)
 
 
 # ---------------- MAPBOX TERRAIN ----------------
@@ -493,31 +511,24 @@ if upload:
     seg_len_3d, cum = compute_stationing(center, elevations)
     total_length = cum[-1]
 
-    all_numeric = all(_is_numeric_label(name) for name, _, _ in agms)
+    projected = []
+    for name, lat, lon in agms:
+        proj = project_to_line(lat, lon, center)
+        stn = station_at(proj, seg_len_3d, cum)
+        projected.append((name, proj, stn))
 
+    all_numeric = all(_is_numeric_label(name) for name, _, _ in agms)
     if all_numeric:
-        agms_sorted = sorted(agms, key=lambda x: int(x[0].strip()))
-        projected = []
-        min_idx = 0
-        for name, lat, lon in agms_sorted:
-            proj = project_to_line(lat, lon, center, min_segment_index=min_idx)
-            min_idx = proj[0]
-            stn = station_at(proj, seg_len_3d, cum)
-            projected.append((name, proj, stn))
+        projected.sort(key=lambda x: int(x[0].strip()))
     else:
-        projected = []
-        for name, lat, lon in agms:
-            proj = project_to_line(lat, lon, center)
-            stn = station_at(proj, seg_len_3d, cum)
-            projected.append((name, proj, stn))
         projected.sort(key=lambda x: x[2])
 
     rows = []
     cumulative = 0.0
     for i in range(len(projected) - 1):
-        stn_a = projected[i][2]
-        stn_b = projected[i + 1][2]
-        d = segment_distance_forward_only(stn_a, stn_b, total_length)
+        d = path_length_along_centerline(
+            projected[i][1], projected[i + 1][1], seg_len_3d, total_length
+        )
         cumulative += d
 
         rows.append(
@@ -543,20 +554,18 @@ if upload:
 
 
 def _self_test():
-    """Verify distance along centerline: project two points, get stations, distance = shorter path."""
+    """Verify: snap two points to centerline, distance = path length along line (3D)."""
     line = [(30.0, -90.0), (30.001, -90.0), (30.002, -90.0)]
     elevations = [0.0, 0.0, 0.0]
     seg_len_3d, cum = compute_stationing(line, elevations)
     total = cum[-1]
-    idx1, t1 = project_to_line(30.0, -90.0, line)
-    idx2, t2 = project_to_line(30.002, -90.0, line)
-    stn1 = station_at((idx1, t1), seg_len_3d, cum)
-    stn2 = station_at((idx2, t2), seg_len_3d, cum)
-    d = segment_distance_forward_only(stn1, stn2, total)
+    proj1 = project_to_line(30.0, -90.0, line)
+    proj2 = project_to_line(30.002, -90.0, line)
+    d = path_length_along_centerline(proj1, proj2, seg_len_3d, total)
     expected_ft = haversine_ft(30.0, -90.0, 30.002, -90.0)
     assert abs(d - expected_ft) < 1.0, f"expected ~{expected_ft}, got {d}"
     assert d > 0, "segment distance must be positive"
-    print("Self-test passed: segment distance along centerline is correct.")
+    print("Self-test passed: path length along centerline is correct.")
 
 
 if __name__ == "__main__":

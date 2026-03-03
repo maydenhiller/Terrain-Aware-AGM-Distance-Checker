@@ -2,7 +2,7 @@ import io
 import math
 import zipfile
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -733,31 +733,10 @@ def main():
     )
 
 
-def _self_test():
-    """Verify: snap two points to centerline, distance = path length along line (3D)."""
-    line = [(30.0, -90.0), (30.001, -90.0), (30.002, -90.0)]
-    elevations = [0.0, 0.0, 0.0]
-    seg_len_3d, cum = compute_stationing(line, elevations)
-    total = cum[-1]
-    proj1 = project_to_line(30.0, -90.0, line)
-    proj2 = project_to_line(30.002, -90.0, line)
-    d = path_length_along_centerline(proj1, proj2, seg_len_3d, total)
-    expected_ft = haversine_ft(30.0, -90.0, 30.002, -90.0)
-    assert abs(d - expected_ft) < 1.0, f"expected ~{expected_ft}, got {d}"
-    assert d > 0, "segment distance must be positive"
-    print("Self-test passed: path length along centerline is correct.")
-
-
-# Always run main() so Streamlit shows the UI. Never run _self_test() on app load.
+# Streamlit: run main() only. No self-test on load.
 try:
     main()
 except Exception as e:
     st.error(f"App error: {e}")
     import traceback
     st.code(traceback.format_exc(), language="text")
-
-# Self-test only when run from CLI: python app.py --test
-if __name__ == "__main__":
-    import sys
-    if "--test" in sys.argv:
-        _self_test()

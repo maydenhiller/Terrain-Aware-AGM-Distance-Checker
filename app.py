@@ -113,14 +113,18 @@ def densify_centerline(line, max_seg_ft):
 # -------- PROJECT POINT ONTO LINE SEGMENTS --------
 
 
-def project_to_line(lat, lon, line):
-    """Snap (lat, lon) to the closest point on the centerline (anywhere on a segment, not just vertices).
-    Returns (segment_index, t) with t in [0,1] for interpolation along the segment."""
+def project_to_line(lat, lon, line, min_seg_index=0, min_t=0.0):
+    """Snap (lat, lon) to closest point on centerline. If min_seg_index/min_t given, only consider
+    points at or after that position (so AGMs project forward along the path)."""
     best_dist = float("inf")
     best_index = 0
     best_t = 0.0
 
     for i in range(len(line) - 1):
+        if i < min_seg_index:
+            continue
+        if i == min_seg_index and min_t >= 1.0:
+            continue
         a_lat, a_lon = line[i]
         b_lat, b_lon = line[i + 1]
         ref_lat = math.radians((a_lat + b_lat) / 2.0)
@@ -135,7 +139,9 @@ def project_to_line(lat, lon, line):
             t = 0.0
         else:
             t = float(np.dot(P - A, AB) / denom)
-            t = max(0.0, min(1.0, t))  # closest point on segment (between vertices)
+            t = max(0.0, min(1.0, t))
+        if i == min_seg_index and t < min_t - 1e-9:
+            continue
 
         proj_xy = A + t * AB
         proj_lat, proj_lon = _from_local_xy_ft(proj_xy, ref_lat)
@@ -147,6 +153,14 @@ def project_to_line(lat, lon, line):
             best_t = t
 
     return best_index, best_t
+
+
+def point_on_line(line, proj):
+    """Return (lat, lon) at segment index and t in [0,1]."""
+    idx = max(0, min(int(proj[0]), len(line) - 2))
+    t = max(0.0, min(1.0, float(proj[1])))
+    a, b = line[idx], line[idx + 1]
+    return (a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]))
 
 
 # -------- STATIONING (TERRAIN-AWARE) --------
@@ -382,6 +396,28 @@ def parse(root):
 
         fname = name.text.lower()
 
+        # Red LineString = actual pipeline (check every folder; CENTERLINE folder may hold access/blue)
+        for pm in folder.findall(".//k:Placemark", ns):
+            ls = pm.find("k:LineString", ns)
+            if ls is None:
+                continue
+            style_url_el = pm.find("k:styleUrl", ns)
+            if style_url_el is None or not style_url_el.text:
+                style_url_el = folder.find("k:styleUrl", ns)
+            style_url = style_url_el.text.strip() if style_url_el is not None and style_url_el.text else None
+            line_color = _resolve_line_color(style_url, style_colors, stylemap_normal) if style_url else None
+            if line_color is None or not _is_red_line_color(line_color):
+                continue
+            coord_node = ls.find("k:coordinates", ns)
+            if coord_node is None or not coord_node.text:
+                continue
+            pts = []
+            for c in coord_node.text.split():
+                lon, lat, *_rest = map(float, c.split(","))
+                pts.append((lat, lon))
+            if len(pts) >= 2:
+                centerline_strings.append(pts)
+
         if "agm" in fname:
             for p in folder.findall(".//k:Placemark", ns):
                 pname = p.find("k:name", ns)
@@ -396,28 +432,7 @@ def parse(root):
                 lon, lat, *_rest = map(float, coords.text.split(","))
                 agms.append((agm_name, lat, lon))
 
-        if "center" in fname:
-            for pm in folder.findall(".//k:Placemark", ns):
-                ls = pm.find("k:LineString", ns)
-                if ls is None:
-                    continue
-                style_url_el = pm.find("k:styleUrl", ns)
-                if style_url_el is None or not style_url_el.text:
-                    style_url_el = folder.find("k:styleUrl", ns)
-                style_url = style_url_el.text.strip() if style_url_el is not None and style_url_el.text else None
-                line_color = _resolve_line_color(style_url, style_colors, stylemap_normal) if style_url else None
-                if line_color is None or not _is_red_line_color(line_color):
-                    continue
-                coord_node = ls.find("k:coordinates", ns)
-                if coord_node is None or not coord_node.text:
-                    continue
-                pts = []
-                for c in coord_node.text.split():
-                    lon, lat, *_rest = map(float, c.split(","))
-                    pts.append((lat, lon))
-                if len(pts) >= 2:
-                    centerline_strings.append(pts)
-
+    # Fallback: if no red line found, use CENTERLINE folder (may be access/blue if mislabeled)
     if not centerline_strings:
         for folder in root.findall(".//k:Folder", ns):
             name = folder.find("k:name", ns)
@@ -439,15 +454,21 @@ def parse(root):
         anchor = _pick_anchor_agm(agms)
         if anchor:
             _name, alat, alon = anchor
-            # Pick the LineString whose FIRST vertex is closest to the launcher.
-            def dist_to_start(pts):
-                return haversine_ft(alat, alon, pts[0][0], pts[0][1])
-            start_line = min(centerline_strings, key=dist_to_start)
-            center = list(start_line)
-            remaining = [pts for pts in centerline_strings if pts is not start_line]
-            tol_ft = 100.0
-            # Never append a segment that would bring the path back to the launcher (no loop).
-            anchor_ft = 150.0
+            # Pick the segment the launcher lies on. If several are close, use the longest (main line not stub).
+            def dist_to_line(pts):
+                proj = project_to_line(alat, alon, pts)
+                pt = point_on_line(pts, proj)
+                return haversine_ft(alat, alon, pt[0], pt[1])
+            def length_ft(pts):
+                return sum(haversine_ft(pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1]) for i in range(len(pts)-1))
+            near = [pts for pts in centerline_strings if dist_to_line(pts) <= 100.0]
+            start_line = max(near, key=length_ft) if near else min(centerline_strings, key=dist_to_line)
+            d0 = haversine_ft(alat, alon, start_line[0][0], start_line[0][1])
+            d1 = haversine_ft(alat, alon, start_line[-1][0], start_line[-1][1])
+            center = list(start_line) if d0 <= d1 else list(reversed(start_line))
+            remaining = [p for p in centerline_strings if p is not start_line]
+            tol_ft = 150.0  # connect segments that share a junction (stub to main line)
+            anchor_ft = 200.0
             while remaining:
                 end_pt = center[-1]
                 best = None
@@ -458,14 +479,10 @@ def parse(root):
                     d_end = haversine_ft(end_pt[0], end_pt[1], pts[-1][0], pts[-1][1])
                     if d_start < best_dist:
                         if haversine_ft(alat, alon, pts[-1][0], pts[-1][1]) > anchor_ft:
-                            best_dist = d_start
-                            best = pts
-                            append_forward = True
+                            best_dist, best, append_forward = d_start, pts, True
                     if d_end < best_dist:
                         if haversine_ft(alat, alon, pts[0][0], pts[0][1]) > anchor_ft:
-                            best_dist = d_end
-                            best = pts
-                            append_forward = False
+                            best_dist, best, append_forward = d_end, pts, False
                 if best is None:
                     break
                 if append_forward:
@@ -474,7 +491,7 @@ def parse(root):
                     center.extend(list(reversed(best))[1:])
                 remaining = [p for p in remaining if p is not best]
         else:
-            center = max(centerline_strings, key=lambda pts: sum(haversine_ft(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1]) for i in range(len(pts) - 1)))
+            center = list(centerline_strings[0])
     elif centerline_strings:
         center = list(centerline_strings[0])
 
@@ -543,6 +560,18 @@ if upload:
 
     center = _orient_centerline(center, agms)
     center = dedupe_centerline(center, min_sep_ft=1.0)
+    # Trim centerline to start at launcher (measure from there, no pre-000).
+    anchor = _pick_anchor_agm(agms)
+    if anchor and len(center) >= 2:
+        _name, alat, alon = anchor
+        proj = project_to_line(alat, alon, center)
+        idx, t = int(proj[0]), float(proj[1])
+        if idx > 0 or t > 0.001:
+            pt = point_on_line(center, proj)
+            center = [pt] + center[idx + 1:]
+    if len(center) < 2:
+        st.error("Centerline too short after trim")
+        st.stop()
     center = densify_centerline(center, MAX_CENTERLINE_SEGMENT_FT)
 
     if not token:
@@ -555,26 +584,31 @@ if upload:
     seg_len_3d, cum = compute_stationing(center, elevations)
     total_length = cum[-1]
 
-    projected = []
-    for name, lat, lon in agms:
-        proj = project_to_line(lat, lon, center)
-        stn = station_at(proj, seg_len_3d, cum)
-        projected.append((name, proj, stn))
-
     all_numeric = all(_is_numeric_label(name) for name, _, _ in agms)
     if all_numeric:
-        projected.sort(key=lambda x: int(x[0].strip()))
+        ordered_agms = sorted(agms, key=lambda x: int(x[0].strip()))
     else:
-        projected.sort(key=lambda x: x[2])
+        pre = [(n, station_at(project_to_line(lat, lon, center), seg_len_3d, cum)) for n, lat, lon in agms]
+        ordered_agms = sorted(agms, key=lambda a: next(s for n, s in pre if n == a[0]))
 
+    projected = []
+    min_idx, min_t = 0, 0.0
+    for name, lat, lon in ordered_agms:
+        proj = project_to_line(lat, lon, center, min_seg_index=min_idx, min_t=min_t)
+        stn = station_at(proj, seg_len_3d, cum)
+        projected.append((name, proj, stn))
+        min_idx, min_t = int(proj[0]), float(proj[1])
+
+    agm_pos = {name: (lat, lon) for name, lat, lon in ordered_agms}
     rows = []
     cumulative = 0.0
     for i in range(len(projected) - 1):
-        # Linear pipeline: distance = station difference (direction of travel 000 -> 010 -> ...).
-        # Do NOT use "shorter direction" — that assumes a loop and breaks.
         stn_a = projected[i][2]
         stn_b = projected[i + 1][2]
         d = abs(stn_b - stn_a)
+        if d < 1.0 and projected[i][0] in agm_pos and projected[i + 1][0] in agm_pos:
+            a, b = projected[i][0], projected[i + 1][0]
+            d = max(d, haversine_ft(agm_pos[a][0], agm_pos[a][1], agm_pos[b][0], agm_pos[b][1]))
         cumulative += d
 
         rows.append(

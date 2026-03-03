@@ -17,8 +17,8 @@ TILE_SIZE = 256
 
 # Sub-meter densification: 1 meter ≈ 3.28 ft. No segment longer than this so path follows bends closely.
 MAX_CENTERLINE_SEGMENT_FT = 3.28
-# Sample elevation every this many ft along raw centerline to keep load under ~1 min
-ELEVATION_SAMPLE_INTERVAL_FT = 500.0
+# Sample elevation every this many ft along raw centerline (higher = fewer tiles, faster load)
+ELEVATION_SAMPLE_INTERVAL_FT = 1000.0
 
 
 ANCHOR_AGM_NAMES = {"000", "launcher", "launcher valve"}

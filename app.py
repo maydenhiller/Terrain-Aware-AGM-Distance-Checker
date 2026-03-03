@@ -425,15 +425,40 @@ def parse(root):
         anchor = _pick_anchor_agm(agms)
         if anchor:
             _name, alat, alon = anchor
-            def min_dist_to_ends(pts):
-                d_first = haversine_ft(alat, alon, pts[0][0], pts[0][1])
-                d_last = haversine_ft(alat, alon, pts[-1][0], pts[-1][1])
-                return min(d_first, d_last)
-            center = min(centerline_strings, key=min_dist_to_ends)
+            # Pick the LineString whose FIRST vertex is closest to the launcher.
+            def dist_to_start(pts):
+                return haversine_ft(alat, alon, pts[0][0], pts[0][1])
+            start_line = min(centerline_strings, key=dist_to_start)
+            center = list(start_line)
+            remaining = [pts for pts in centerline_strings if pts is not start_line]
+            tol_ft = 100.0
+            while remaining:
+                end_pt = center[-1]
+                best = None
+                best_dist = tol_ft
+                append_forward = True
+                for pts in remaining:
+                    d_start = haversine_ft(end_pt[0], end_pt[1], pts[0][0], pts[0][1])
+                    d_end = haversine_ft(end_pt[0], end_pt[1], pts[-1][0], pts[-1][1])
+                    if d_start < best_dist:
+                        best_dist = d_start
+                        best = pts
+                        append_forward = True
+                    if d_end < best_dist:
+                        best_dist = d_end
+                        best = pts
+                        append_forward = False
+                if best is None:
+                    break
+                if append_forward:
+                    center.extend(best[1:])
+                else:
+                    center.extend(list(reversed(best))[1:])
+                remaining = [p for p in remaining if p is not best]
         else:
             center = max(centerline_strings, key=lambda pts: sum(haversine_ft(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1]) for i in range(len(pts) - 1)))
     elif centerline_strings:
-        center = centerline_strings[0]
+        center = list(centerline_strings[0])
 
     return agms, center
 

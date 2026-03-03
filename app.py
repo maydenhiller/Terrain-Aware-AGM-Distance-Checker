@@ -75,6 +75,19 @@ def _from_local_xy_ft(xy, ref_lat_rad):
 # -------- CENTERLINE DENSIFY --------
 
 
+def dedupe_centerline(line, min_sep_ft=1.0):
+    """Remove consecutive points that are within min_sep_ft so no zero-length segments."""
+    if not line or len(line) < 2:
+        return line
+    out = [line[0]]
+    for i in range(1, len(line)):
+        if haversine_ft(out[-1][0], out[-1][1], line[i][0], line[i][1]) >= min_sep_ft:
+            out.append(line[i])
+    if len(out) < 2:
+        return line
+    return out
+
+
 def densify_centerline(line, max_seg_ft):
     """Insert points so no segment exceeds max_seg_ft; path follows bends."""
     if not line or len(line) < 2 or max_seg_ft <= 0:
@@ -101,7 +114,8 @@ def densify_centerline(line, max_seg_ft):
 
 
 def project_to_line(lat, lon, line):
-    """Snap (lat, lon) to the closest point on the centerline. Returns (segment_index, t)."""
+    """Snap (lat, lon) to the closest point on the centerline (anywhere on a segment, not just vertices).
+    Returns (segment_index, t) with t in [0,1] for interpolation along the segment."""
     best_dist = float("inf")
     best_index = 0
     best_t = 0.0
@@ -121,7 +135,7 @@ def project_to_line(lat, lon, line):
             t = 0.0
         else:
             t = float(np.dot(P - A, AB) / denom)
-            t = max(0.0, min(1.0, t))
+            t = max(0.0, min(1.0, t))  # closest point on segment (between vertices)
 
         proj_xy = A + t * AB
         proj_lat, proj_lon = _from_local_xy_ft(proj_xy, ref_lat)
@@ -432,6 +446,8 @@ def parse(root):
             center = list(start_line)
             remaining = [pts for pts in centerline_strings if pts is not start_line]
             tol_ft = 100.0
+            # Never append a segment that would bring the path back to the launcher (no loop).
+            anchor_ft = 150.0
             while remaining:
                 end_pt = center[-1]
                 best = None
@@ -441,13 +457,15 @@ def parse(root):
                     d_start = haversine_ft(end_pt[0], end_pt[1], pts[0][0], pts[0][1])
                     d_end = haversine_ft(end_pt[0], end_pt[1], pts[-1][0], pts[-1][1])
                     if d_start < best_dist:
-                        best_dist = d_start
-                        best = pts
-                        append_forward = True
+                        if haversine_ft(alat, alon, pts[-1][0], pts[-1][1]) > anchor_ft:
+                            best_dist = d_start
+                            best = pts
+                            append_forward = True
                     if d_end < best_dist:
-                        best_dist = d_end
-                        best = pts
-                        append_forward = False
+                        if haversine_ft(alat, alon, pts[0][0], pts[0][1]) > anchor_ft:
+                            best_dist = d_end
+                            best = pts
+                            append_forward = False
                 if best is None:
                     break
                 if append_forward:
@@ -524,6 +542,7 @@ if upload:
         st.stop()
 
     center = _orient_centerline(center, agms)
+    center = dedupe_centerline(center, min_sep_ft=1.0)
     center = densify_centerline(center, MAX_CENTERLINE_SEGMENT_FT)
 
     if not token:

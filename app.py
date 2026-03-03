@@ -163,12 +163,13 @@ def station_at(proj, seg_len_3d, cum):
     return cum[idx] + seg_len_3d[idx] * t
 
 
-def segment_distance_forward(stn_a, stn_b, total_length):
-    """Forward distance from stn_a to stn_b along the centerline (anchor → downstream)."""
-    d = stn_b - stn_a
-    if d >= 0:
-        return d
-    return total_length - stn_a + stn_b
+def segment_distance_along_centerline(stn_a, stn_b, total_length):
+    """
+    Distance along the centerline from projected point of AGM A to projected point of AGM B.
+    Uses the shorter of the two paths (centerline may loop). No long-way wrap.
+    """
+    raw = abs(stn_b - stn_a)
+    return min(raw, total_length - raw)
 
 
 # ---------------- MAPBOX TERRAIN ----------------
@@ -504,7 +505,7 @@ if upload:
     for i in range(len(projected) - 1):
         stn_a = projected[i][2]
         stn_b = projected[i + 1][2]
-        d = segment_distance_forward(stn_a, stn_b, total_length)
+        d = segment_distance_along_centerline(stn_a, stn_b, total_length)
         cumulative += d
 
         rows.append(
@@ -527,3 +528,25 @@ if upload:
         "AGM_Terrain_Distances.csv",
         "text/csv",
     )
+
+
+def _self_test():
+    """Verify distance along centerline: project two points, get stations, distance = shorter path."""
+    line = [(30.0, -90.0), (30.001, -90.0), (30.002, -90.0)]
+    elevations = [0.0, 0.0, 0.0]
+    seg_len_3d, cum = compute_stationing(line, elevations)
+    total = cum[-1]
+    idx1, t1 = project_to_line(30.0, -90.0, line)
+    idx2, t2 = project_to_line(30.002, -90.0, line)
+    stn1 = station_at((idx1, t1), seg_len_3d, cum)
+    stn2 = station_at((idx2, t2), seg_len_3d, cum)
+    d = segment_distance_along_centerline(stn1, stn2, total)
+    expected_ft = haversine_ft(30.0, -90.0, 30.002, -90.0)
+    assert abs(d - expected_ft) < 1.0, f"expected ~{expected_ft}, got {d}"
+    assert d > 0, "segment distance must be positive"
+    assert d == min(abs(stn2 - stn1), total - abs(stn2 - stn1)), "shortest path"
+    print("Self-test passed: segment distance along centerline is correct.")
+
+
+if __name__ == "__main__":
+    _self_test()

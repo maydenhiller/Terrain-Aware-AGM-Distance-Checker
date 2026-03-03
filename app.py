@@ -88,25 +88,34 @@ def dedupe_centerline(line, min_sep_ft=1.0):
     return out
 
 
-def densify_centerline(line, max_seg_ft):
-    """Insert points so no segment exceeds max_seg_ft; path follows bends."""
+def densify_centerline(line, max_seg_ft, elevations=None):
+    """Insert points so no segment exceeds max_seg_ft. If elevations (len=len(line)) given, return (out_pts, out_elevs) with interpolated elevs."""
     if not line or len(line) < 2 or max_seg_ft <= 0:
-        return line
+        return (line, elevations) if elevations is not None and len(elevations) == len(line) else line
     out = [line[0]]
+    out_elev = [elevations[0]] if elevations is not None and len(elevations) == len(line) else None
     for i in range(len(line) - 1):
         a_lat, a_lon = line[i]
         b_lat, b_lon = line[i + 1]
+        elev_a = elevations[i] if out_elev is not None else None
+        elev_b = elevations[i + 1] if out_elev is not None else None
         h = haversine_ft(a_lat, a_lon, b_lat, b_lon)
         if h <= max_seg_ft:
             out.append((b_lat, b_lon))
+            if out_elev is not None:
+                out_elev.append(elev_b)
             continue
         n = max(2, int(math.ceil(h / max_seg_ft)))
         for k in range(1, n):
             t = k / n
-            lat = a_lat + t * (b_lat - a_lat)
-            lon = a_lon + t * (b_lon - a_lon)
-            out.append((lat, lon))
+            out.append((a_lat + t * (b_lat - a_lat), a_lon + t * (b_lon - a_lon)))
+            if out_elev is not None:
+                out_elev.append(elev_a + t * (elev_b - elev_a))
         out.append((b_lat, b_lon))
+        if out_elev is not None:
+            out_elev.append(elev_b)
+    if out_elev is not None:
+        return out, out_elev
     return out
 
 
@@ -572,14 +581,15 @@ if upload:
     if len(center) < 2:
         st.error("Centerline too short after trim")
         st.stop()
-    center = densify_centerline(center, MAX_CENTERLINE_SEGMENT_FT)
 
     if not token:
         st.error("Mapbox token missing. Add it to Streamlit secrets or paste it above.")
         st.stop()
 
-    with st.spinner("Sampling terrain elevations along centerline..."):
-        elevations = [elevation_ft(lat, lon, token) for lat, lon in center]
+    # Sample elevation on raw centerline only (thousands of points, not 100k+), then densify with interpolated elevs
+    with st.spinner("Sampling terrain elevations (raw centerline)..."):
+        raw_elevations = [elevation_ft(lat, lon, token) for lat, lon in center]
+    center, elevations = densify_centerline(center, MAX_CENTERLINE_SEGMENT_FT, raw_elevations)
 
     seg_len_3d, cum = compute_stationing(center, elevations)
     total_length = cum[-1]
@@ -623,7 +633,7 @@ if upload:
         )
 
     df = pd.DataFrame(rows)
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df, width="stretch")
 
     st.download_button(
         "Download CSV",

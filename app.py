@@ -551,9 +551,11 @@ if upload:
     rows = []
     cumulative = 0.0
     for i in range(len(projected) - 1):
-        d = path_length_along_centerline(
-            projected[i][1], projected[i + 1][1], seg_len_3d, total_length
-        )
+        # Linear pipeline: distance = station difference (direction of travel 000 -> 010 -> ...).
+        # Do NOT use "shorter direction" — that assumes a loop and breaks.
+        stn_a = projected[i][2]
+        stn_b = projected[i + 1][2]
+        d = abs(stn_b - stn_a)
         cumulative += d
 
         rows.append(

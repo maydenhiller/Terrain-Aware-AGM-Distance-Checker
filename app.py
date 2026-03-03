@@ -2,6 +2,7 @@ import io
 import math
 import zipfile
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -16,6 +17,8 @@ TILE_SIZE = 256
 
 # Sub-meter densification: 1 meter ≈ 3.28 ft. No segment longer than this so path follows bends closely.
 MAX_CENTERLINE_SEGMENT_FT = 3.28
+# Sample elevation every this many ft along raw centerline to keep load under ~1 min
+ELEVATION_SAMPLE_INTERVAL_FT = 500.0
 
 
 ANCHOR_AGM_NAMES = {"000", "launcher", "launcher valve"}
@@ -271,6 +274,39 @@ def get_tile(z, x, y, token: str):
     img = Image.open(io.BytesIO(r.content)).convert("RGBA")
     tile_cache[key] = img
     return img
+
+
+def _tile_keys_for_line(line, z=TILE_ZOOM):
+    """Set of (z, x, y) tile keys needed for all points on the line."""
+    keys = set()
+    for lat, lon in line:
+        wx, wy = _world_pixel_xy(lat, lon, z)
+        tx, ty = int(wx // TILE_SIZE), int(wy // TILE_SIZE)
+        keys.add((z, tx, ty))
+    return keys
+
+
+def _fetch_tile(args):
+    z, x, y, token = args
+    get_tile(z, x, y, token)
+    return (z, x, y)
+
+
+def _elevation_from_tile(lat, lon):
+    """Read elevation at (lat, lon) from already-cached tile. No network."""
+    wx, wy = _world_pixel_xy(lat, lon, TILE_ZOOM)
+    tx, ty = int(wx // TILE_SIZE), int(wy // TILE_SIZE)
+    key = (TILE_ZOOM, tx, ty)
+    if key not in tile_cache:
+        return None
+    img = tile_cache[key]
+    px = img.load()
+    w, h = img.size
+    fx = max(0, min(int(wx - tx * TILE_SIZE), w - 1))
+    fy = max(0, min(int(wy - ty * TILE_SIZE), h - 1))
+    R, G, B, _ = px[fx, fy]
+    meters = -10000 + (R * 256 * 256 + G * 256 + B) * 0.1
+    return meters * 3.28084
 
 
 def elevation_ft(lat, lon, token: str):
@@ -586,9 +622,58 @@ if upload:
         st.error("Mapbox token missing. Add it to Streamlit secrets or paste it above.")
         st.stop()
 
-    # Sample elevation on raw centerline only (thousands of points, not 100k+), then densify with interpolated elevs
-    with st.spinner("Sampling terrain elevations (raw centerline)..."):
-        raw_elevations = [elevation_ft(lat, lon, token) for lat, lon in center]
+    # Fast terrain: sample elevation every ELEVATION_SAMPLE_INTERVAL_FT, fetch tiles in parallel, interpolate
+    with st.spinner("Loading terrain (sampled + parallel tiles)..."):
+        cum2d = [0.0]
+        for i in range(len(center) - 1):
+            cum2d.append(cum2d[-1] + haversine_ft(*center[i], *center[i + 1]))
+        total2d = cum2d[-1]
+        sample_dists = []
+        sample_pts = []
+        d = 0.0
+        while d <= total2d:
+            sample_dists.append(d)
+            # (lat, lon) at distance d along centerline
+            for i in range(len(center) - 1):
+                seg_len = cum2d[i + 1] - cum2d[i]
+                if seg_len <= 0:
+                    continue
+                if d <= cum2d[i + 1]:
+                    t = (d - cum2d[i]) / seg_len if seg_len > 0 else 0.0
+                    t = max(0.0, min(1.0, t))
+                    lat = center[i][0] + t * (center[i + 1][0] - center[i][0])
+                    lon = center[i][1] + t * (center[i + 1][1] - center[i][1])
+                    sample_pts.append((lat, lon))
+                    break
+            else:
+                sample_pts.append(center[-1])
+            d += ELEVATION_SAMPLE_INTERVAL_FT
+        if not sample_pts:
+            sample_pts = [center[0], center[-1]]
+            sample_dists = [0.0, total2d]
+
+        tile_keys = _tile_keys_for_line(sample_pts)
+        need = [(*k, token) for k in tile_keys if k not in tile_cache]
+        if need:
+            with ThreadPoolExecutor(max_workers=12) as ex:
+                list(ex.map(_fetch_tile, need))
+        sample_elevs = [_elevation_from_tile(lat, lon) for lat, lon in sample_pts]
+        if None in sample_elevs:
+            sample_elevs = [elevation_ft(lat, lon, token) for lat, lon in sample_pts]
+
+        def interp_elev(cum_d):
+            if cum_d <= sample_dists[0]:
+                return sample_elevs[0]
+            if cum_d >= sample_dists[-1]:
+                return sample_elevs[-1]
+            for j in range(len(sample_dists) - 1):
+                if sample_dists[j] <= cum_d <= sample_dists[j + 1]:
+                    span = sample_dists[j + 1] - sample_dists[j]
+                    t = (cum_d - sample_dists[j]) / span if span > 0 else 0.0
+                    return sample_elevs[j] + t * (sample_elevs[j + 1] - sample_elevs[j])
+            return sample_elevs[-1]
+
+        raw_elevations = [interp_elev(cum2d[i]) for i in range(len(center))]
     center, elevations = densify_centerline(center, MAX_CENTERLINE_SEGMENT_FT, raw_elevations)
 
     seg_len_3d, cum = compute_stationing(center, elevations)

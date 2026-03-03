@@ -582,26 +582,31 @@ def _orient_centerline(center, agms):
 
 # ---------------- STREAMLIT ----------------
 
+st.set_page_config(page_title="AGM Terrain Distances", layout="wide")
 
-st.title("Terrain-Aware AGM Distance Checker")
+def main():
+    st.title("Terrain-Aware AGM Distance Checker")
 
-token = _get_mapbox_token()
-if not token:
-    token = st.text_input("Mapbox token (required for terrain)", type="password").strip() or None
+    token = _get_mapbox_token()
+    if not token:
+        token = st.text_input("Mapbox token (required for terrain)", type="password", key="token").strip() or None
 
-upload = st.file_uploader("Upload KMZ/KML", ["kmz", "kml"])
+    upload = st.file_uploader("Upload KMZ/KML", ["kmz", "kml"], key="upload")
 
-if upload:
+    if not upload:
+        st.info("Upload a KMZ or KML file to compute terrain-aware distances between AGMs along the centerline.")
+        return
+
     try:
         root = load_kml(upload)
         agms, center = parse(root)
     except Exception as e:
         st.error(f"Failed to read file: {e}")
-        st.stop()
+        return
 
     if not agms or not center:
         st.error("Missing AGMs or Centerline")
-        st.stop()
+        return
 
     center = _orient_centerline(center, agms)
     center = dedupe_centerline(center, min_sep_ft=1.0)
@@ -616,11 +621,11 @@ if upload:
             center = [pt] + center[idx + 1:]
     if len(center) < 2:
         st.error("Centerline too short after trim")
-        st.stop()
+        return
 
     if not token:
         st.error("Mapbox token missing. Add it to Streamlit secrets or paste it above.")
-        st.stop()
+        return
 
     # Fast terrain: sample elevation every ELEVATION_SAMPLE_INTERVAL_FT, fetch tiles in parallel, interpolate
     with st.spinner("Loading terrain (sampled + parallel tiles)..."):
@@ -655,7 +660,7 @@ if upload:
         tile_keys = _tile_keys_for_line(sample_pts)
         need = [(*k, token) for k in tile_keys if k not in tile_cache]
         if need:
-            with ThreadPoolExecutor(max_workers=12) as ex:
+            with ThreadPoolExecutor(max_workers=6) as ex:
                 list(ex.map(_fetch_tile, need))
         sample_elevs = [_elevation_from_tile(lat, lon) for lat, lon in sample_pts]
         if None in sample_elevs:
@@ -743,7 +748,17 @@ def _self_test():
     print("Self-test passed: path length along centerline is correct.")
 
 
-if __name__ == "__main__":
-    import sys
-    if "--test" in sys.argv:
-        _self_test()
+# Run app (Streamlit Cloud runs this file; catch errors so they show in UI)
+try:
+    if __name__ == "__main__":
+        import sys
+        if "--test" in sys.argv:
+            _self_test()
+        else:
+            main()
+    else:
+        main()
+except Exception as e:
+    st.error(f"App error: {e}")
+    import traceback
+    st.code(traceback.format_exc(), language="text")

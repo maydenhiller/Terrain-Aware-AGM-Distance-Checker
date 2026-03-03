@@ -166,10 +166,14 @@ def station_at(proj, seg_len_3d, cum):
 def segment_distance_along_centerline(stn_a, stn_b, total_length):
     """
     Distance along the centerline from projected point of AGM A to projected point of AGM B.
-    Uses the shorter of the two paths (centerline may loop). No long-way wrap.
+    Uses the shorter of the two paths when the centerline loops.
+    When the two points are at opposite ends (raw ≈ total_length), return raw so we don't get 0.
     """
     raw = abs(stn_b - stn_a)
-    return min(raw, total_length - raw)
+    d = min(raw, total_length - raw)
+    if d <= 0.0 and raw > 0.0:
+        d = raw
+    return d
 
 
 # ---------------- MAPBOX TERRAIN ----------------
@@ -549,4 +553,6 @@ def _self_test():
 
 
 if __name__ == "__main__":
-    _self_test()
+    import sys
+    if "--test" in sys.argv:
+        _self_test()

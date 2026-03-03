@@ -748,17 +748,16 @@ def _self_test():
     print("Self-test passed: path length along centerline is correct.")
 
 
-# Run app (Streamlit Cloud runs this file; catch errors so they show in UI)
+# Always run main() so Streamlit shows the UI. Never run _self_test() on app load.
 try:
-    if __name__ == "__main__":
-        import sys
-        if "--test" in sys.argv:
-            _self_test()
-        else:
-            main()
-    else:
-        main()
+    main()
 except Exception as e:
     st.error(f"App error: {e}")
     import traceback
     st.code(traceback.format_exc(), language="text")
+
+# Self-test only when run from CLI: python app.py --test
+if __name__ == "__main__":
+    import sys
+    if "--test" in sys.argv:
+        _self_test()

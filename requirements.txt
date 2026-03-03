@@ -1,9 +1,5 @@
 streamlit
 pandas
 numpy
-shapely
-pyproj
 requests
 Pillow
-zipfile36
-fastkml

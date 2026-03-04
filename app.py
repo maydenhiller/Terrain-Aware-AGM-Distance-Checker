@@ -15,10 +15,11 @@ EARTH_R_FT = 20925524.9
 TILE_ZOOM = 14
 TILE_SIZE = 256
 
-# Sub-meter densification: 1 meter ≈ 3.28 ft. No segment longer than this so path follows bends closely.
-MAX_CENTERLINE_SEGMENT_FT = 3.28
-# Sample elevation every this many ft along raw centerline (higher = fewer tiles, faster load)
-ELEVATION_SAMPLE_INTERVAL_FT = 1000.0
+# Centerline segment length: 5 m ≈ 16.4 ft. Balances path fidelity with speed (was 3.28 ft).
+MAX_CENTERLINE_SEGMENT_FT = 16.4
+# Sample elevation every this many ft (higher = fewer Mapbox tiles, faster)
+ELEVATION_SAMPLE_INTERVAL_FT = 2000.0
+TERRAIN_MAX_WORKERS = 10
 
 
 ANCHOR_AGM_NAMES = {"000", "launcher", "launcher valve"}
@@ -627,102 +628,103 @@ def main():
         st.error("Mapbox token missing. Add it to Streamlit secrets or paste it above.")
         return
 
-    # Fast terrain: sample elevation every ELEVATION_SAMPLE_INTERVAL_FT, fetch tiles in parallel, interpolate
-    with st.spinner("Loading terrain (sampled + parallel tiles)..."):
-        cum2d = [0.0]
+    # Terrain: sample elevation every ELEVATION_SAMPLE_INTERVAL_FT, fetch tiles in parallel
+    cum2d = [0.0]
+    for i in range(len(center) - 1):
+        cum2d.append(cum2d[-1] + haversine_ft(*center[i], *center[i + 1]))
+    total2d = cum2d[-1]
+    sample_dists = []
+    sample_pts = []
+    d = 0.0
+    while d <= total2d:
+        sample_dists.append(d)
         for i in range(len(center) - 1):
-            cum2d.append(cum2d[-1] + haversine_ft(*center[i], *center[i + 1]))
-        total2d = cum2d[-1]
-        sample_dists = []
-        sample_pts = []
-        d = 0.0
-        while d <= total2d:
-            sample_dists.append(d)
-            # (lat, lon) at distance d along centerline
-            for i in range(len(center) - 1):
-                seg_len = cum2d[i + 1] - cum2d[i]
-                if seg_len <= 0:
-                    continue
-                if d <= cum2d[i + 1]:
-                    t = (d - cum2d[i]) / seg_len if seg_len > 0 else 0.0
-                    t = max(0.0, min(1.0, t))
-                    lat = center[i][0] + t * (center[i + 1][0] - center[i][0])
-                    lon = center[i][1] + t * (center[i + 1][1] - center[i][1])
-                    sample_pts.append((lat, lon))
-                    break
-            else:
-                sample_pts.append(center[-1])
-            d += ELEVATION_SAMPLE_INTERVAL_FT
-        if not sample_pts:
-            sample_pts = [center[0], center[-1]]
-            sample_dists = [0.0, total2d]
+            seg_len = cum2d[i + 1] - cum2d[i]
+            if seg_len <= 0:
+                continue
+            if d <= cum2d[i + 1]:
+                t = (d - cum2d[i]) / seg_len if seg_len > 0 else 0.0
+                t = max(0.0, min(1.0, t))
+                lat = center[i][0] + t * (center[i + 1][0] - center[i][0])
+                lon = center[i][1] + t * (center[i + 1][1] - center[i][1])
+                sample_pts.append((lat, lon))
+                break
+        else:
+            sample_pts.append(center[-1])
+        d += ELEVATION_SAMPLE_INTERVAL_FT
+    if not sample_pts:
+        sample_pts = [center[0], center[-1]]
+        sample_dists = [0.0, total2d]
 
-        tile_keys = _tile_keys_for_line(sample_pts)
-        need = [(*k, token) for k in tile_keys if k not in tile_cache]
-        if need:
-            with ThreadPoolExecutor(max_workers=6) as ex:
+    tile_keys = _tile_keys_for_line(sample_pts)
+    need = [(*k, token) for k in tile_keys if k not in tile_cache]
+    n_tiles = len(need)
+    if need:
+        with st.spinner(f"Fetching {n_tiles} terrain tiles ({TERRAIN_MAX_WORKERS} parallel)..."):
+            with ThreadPoolExecutor(max_workers=TERRAIN_MAX_WORKERS) as ex:
                 list(ex.map(_fetch_tile, need))
-        sample_elevs = [_elevation_from_tile(lat, lon) for lat, lon in sample_pts]
-        if None in sample_elevs:
-            sample_elevs = [elevation_ft(lat, lon, token) for lat, lon in sample_pts]
+    sample_elevs = [_elevation_from_tile(lat, lon) for lat, lon in sample_pts]
+    if None in sample_elevs:
+        sample_elevs = [elevation_ft(lat, lon, token) for lat, lon in sample_pts]
 
-        def interp_elev(cum_d):
-            if cum_d <= sample_dists[0]:
-                return sample_elevs[0]
-            if cum_d >= sample_dists[-1]:
-                return sample_elevs[-1]
-            for j in range(len(sample_dists) - 1):
-                if sample_dists[j] <= cum_d <= sample_dists[j + 1]:
-                    span = sample_dists[j + 1] - sample_dists[j]
-                    t = (cum_d - sample_dists[j]) / span if span > 0 else 0.0
-                    return sample_elevs[j] + t * (sample_elevs[j + 1] - sample_elevs[j])
+    def interp_elev(cum_d):
+        if cum_d <= sample_dists[0]:
+            return sample_elevs[0]
+        if cum_d >= sample_dists[-1]:
             return sample_elevs[-1]
+        for j in range(len(sample_dists) - 1):
+            if sample_dists[j] <= cum_d <= sample_dists[j + 1]:
+                span = sample_dists[j + 1] - sample_dists[j]
+                t = (cum_d - sample_dists[j]) / span if span > 0 else 0.0
+                return sample_elevs[j] + t * (sample_elevs[j + 1] - sample_elevs[j])
+        return sample_elevs[-1]
 
-        raw_elevations = [interp_elev(cum2d[i]) for i in range(len(center))]
-    center, elevations = densify_centerline(center, MAX_CENTERLINE_SEGMENT_FT, raw_elevations)
+    raw_elevations = [interp_elev(cum2d[i]) for i in range(len(center))]
 
-    seg_len_3d, cum = compute_stationing(center, elevations)
-    total_length = cum[-1]
+    with st.spinner("Building centerline and computing distances..."):
+        center, elevations = densify_centerline(center, MAX_CENTERLINE_SEGMENT_FT, raw_elevations)
+        seg_len_3d, cum = compute_stationing(center, elevations)
+        total_length = cum[-1]
 
-    all_numeric = all(_is_numeric_label(name) for name, _, _ in agms)
-    if all_numeric:
-        ordered_agms = sorted(agms, key=lambda x: int(x[0].strip()))
-    else:
-        pre = [(n, station_at(project_to_line(lat, lon, center), seg_len_3d, cum)) for n, lat, lon in agms]
-        ordered_agms = sorted(agms, key=lambda a: next(s for n, s in pre if n == a[0]))
+        all_numeric = all(_is_numeric_label(name) for name, _, _ in agms)
+        if all_numeric:
+            ordered_agms = sorted(agms, key=lambda x: int(x[0].strip()))
+        else:
+            pre = [(n, station_at(project_to_line(lat, lon, center), seg_len_3d, cum)) for n, lat, lon in agms]
+            ordered_agms = sorted(agms, key=lambda a: next(s for n, s in pre if n == a[0]))
 
-    projected = []
-    min_idx, min_t = 0, 0.0
-    for name, lat, lon in ordered_agms:
-        proj = project_to_line(lat, lon, center, min_seg_index=min_idx, min_t=min_t)
-        stn = station_at(proj, seg_len_3d, cum)
-        projected.append((name, proj, stn))
-        min_idx, min_t = int(proj[0]), float(proj[1])
+        projected = []
+        min_idx, min_t = 0, 0.0
+        for name, lat, lon in ordered_agms:
+            proj = project_to_line(lat, lon, center, min_seg_index=min_idx, min_t=min_t)
+            stn = station_at(proj, seg_len_3d, cum)
+            projected.append((name, proj, stn))
+            min_idx, min_t = int(proj[0]), float(proj[1])
 
-    agm_pos = {name: (lat, lon) for name, lat, lon in ordered_agms}
-    rows = []
-    cumulative = 0.0
-    for i in range(len(projected) - 1):
-        stn_a = projected[i][2]
-        stn_b = projected[i + 1][2]
-        d = abs(stn_b - stn_a)
-        if d < 1.0 and projected[i][0] in agm_pos and projected[i + 1][0] in agm_pos:
-            a, b = projected[i][0], projected[i + 1][0]
-            d = max(d, haversine_ft(agm_pos[a][0], agm_pos[a][1], agm_pos[b][0], agm_pos[b][1]))
-        cumulative += d
+        agm_pos = {name: (lat, lon) for name, lat, lon in ordered_agms}
+        rows = []
+        cumulative = 0.0
+        for i in range(len(projected) - 1):
+            stn_a = projected[i][2]
+            stn_b = projected[i + 1][2]
+            d = abs(stn_b - stn_a)
+            if d < 1.0 and projected[i][0] in agm_pos and projected[i + 1][0] in agm_pos:
+                a, b = projected[i][0], projected[i + 1][0]
+                d = max(d, haversine_ft(agm_pos[a][0], agm_pos[a][1], agm_pos[b][0], agm_pos[b][1]))
+            cumulative += d
 
-        rows.append(
-            {
-                "From": projected[i][0],
-                "To": projected[i + 1][0],
-                "Segment Feet": round(d, 2),
-                "Cumulative Feet": round(cumulative, 2),
-                "Segment Miles": round(d / 5280, 4),
-                "Cumulative Miles": round(cumulative / 5280, 4),
-            }
-        )
+            rows.append(
+                {
+                    "From": projected[i][0],
+                    "To": projected[i + 1][0],
+                    "Segment Feet": round(d, 2),
+                    "Cumulative Feet": round(cumulative, 2),
+                    "Segment Miles": round(d / 5280, 4),
+                    "Cumulative Miles": round(cumulative / 5280, 4),
+                }
+            )
 
-    df = pd.DataFrame(rows)
+        df = pd.DataFrame(rows)
     st.dataframe(df, width="stretch")
 
     st.download_button(

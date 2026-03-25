@@ -22,7 +22,7 @@ MAX_CENTERLINE_SEGMENT_FT = 16.4
 # Sample elevation every this many ft along 2D chainage (higher = fewer Mapbox tiles)
 ELEVATION_SAMPLE_INTERVAL_FT = 2000.0
 # Odd window >= 3; moving average on sampled-then-interpolated elevations to reduce DEM pixel noise (0 = off)
-ELEVATION_SMOOTH_WINDOW = 9
+ELEVATION_SMOOTH_WINDOW = 15
 TERRAIN_MAX_WORKERS = 10
 
 # Polyline merge: endpoints closer than this are treated as one junction (ft)
@@ -200,17 +200,55 @@ def compute_stationing_3d(line, elevations):
     return seg_len_3d, cum
 
 
-def station_at(proj, seg_len_3d, cum):
-    idx, t = proj
+def station_at_3d(proj, line, elevations, cum_vertex):
+    """3D chainage to projected point. Uses horizontal arc length along each segment (Haversine A→P),
+    not planar projection parameter × segment length — that mismatch inflated segment gaps vs Google Earth."""
+    idx, _t = proj
+    n = len(line)
+    if n < 2:
+        return 0.0
     idx = int(idx)
-    t = float(t)
-    if idx < 0:
-        idx = 0
-        t = 0.0
-    if idx >= len(seg_len_3d):
-        idx = len(seg_len_3d) - 1
-        t = 1.0
-    return cum[idx] + seg_len_3d[idx] * t
+    idx = max(0, min(idx, n - 2))
+    a = line[idx]
+    b = line[idx + 1]
+    za = elevations[idx]
+    zb = elevations[idx + 1]
+    p = point_on_line(line, proj)
+    H = haversine_ft(a[0], a[1], b[0], b[1])
+    if H < 1e-6:
+        return cum_vertex[idx]
+    h_ap = haversine_ft(a[0], a[1], p[0], p[1])
+    frac = min(1.0, max(0.0, h_ap / H))
+    zp = za + frac * (zb - za)
+    partial_3d = math.sqrt(h_ap * h_ap + (zp - za) * (zp - za))
+    return cum_vertex[idx] + partial_3d
+
+
+def station_at_horizontal(proj, line, cum_vertex_2d):
+    """Horizontal chainage to projected point (for comparison column)."""
+    idx, _t = proj
+    n = len(line)
+    if n < 2:
+        return 0.0
+    idx = int(idx)
+    idx = max(0, min(idx, n - 2))
+    a = line[idx]
+    b = line[idx + 1]
+    p = point_on_line(line, proj)
+    H = haversine_ft(a[0], a[1], b[0], b[1])
+    if H < 1e-6:
+        return cum_vertex_2d[idx]
+    h_ap = haversine_ft(a[0], a[1], p[0], p[1])
+    return cum_vertex_2d[idx] + min(H, max(0.0, h_ap))
+
+
+def compute_stationing_2d_cum(line):
+    """Cumulative horizontal distance to each vertex (for station_at_horizontal)."""
+    seg = [haversine_ft(*line[i], *line[i + 1]) for i in range(len(line) - 1)]
+    cum = [0.0]
+    for L in seg:
+        cum.append(cum[-1] + L)
+    return cum
 
 
 def path_length_along_centerline(proj_a, proj_b, seg_len_3d, total_length):
@@ -823,11 +861,13 @@ def _densify_with_elevations(center: list, raw_elevations: list) -> tuple[list, 
 
 
 def _build_distance_table_terrain(agms, center_densified: list, elevations: list):
-    seg_len_3d, cum = compute_stationing_3d(center_densified, elevations)
+    _seg_len_3d, cum3 = compute_stationing_3d(center_densified, elevations)
+    cum2 = compute_stationing_2d_cum(center_densified)
+
     station_rows = []
     for i, (name, lat, lon) in enumerate(agms):
         proj = project_to_line(lat, lon, center_densified)
-        stn = station_at(proj, seg_len_3d, cum)
+        stn = station_at_3d(proj, center_densified, elevations, cum3)
         station_rows.append((stn, name, i, lat, lon))
     station_rows.sort(key=lambda r: (r[0], r[2]))
     ordered_agms = [(name, lat, lon) for _st, name, _i, lat, lon in station_rows]
@@ -835,20 +875,26 @@ def _build_distance_table_terrain(agms, center_densified: list, elevations: list
     projected = []
     for name, lat, lon in ordered_agms:
         proj = project_to_line(lat, lon, center_densified)
-        stn = station_at(proj, seg_len_3d, cum)
-        projected.append((name, proj, stn))
+        st3 = station_at_3d(proj, center_densified, elevations, cum3)
+        st2 = station_at_horizontal(proj, center_densified, cum2)
+        projected.append((name, proj, st3, st2))
 
     agm_pos = {name: (lat, lon) for name, lat, lon in ordered_agms}
     rows = []
     cumulative = 0.0
+    cum_h = 0.0
     for i in range(len(projected) - 1):
-        stn_a = projected[i][2]
-        stn_b = projected[i + 1][2]
-        d = abs(stn_b - stn_a)
+        stn3_a = projected[i][2]
+        stn3_b = projected[i + 1][2]
+        stn2_a = projected[i][3]
+        stn2_b = projected[i + 1][3]
+        d = abs(stn3_b - stn3_a)
+        dh = abs(stn2_b - stn2_a)
         if d < 1.0 and projected[i][0] in agm_pos and projected[i + 1][0] in agm_pos:
             a, b = projected[i][0], projected[i + 1][0]
             d = max(d, haversine_ft(agm_pos[a][0], agm_pos[a][1], agm_pos[b][0], agm_pos[b][1]))
         cumulative += d
+        cum_h += dh
         rows.append(
             {
                 "From": projected[i][0],
@@ -857,9 +903,11 @@ def _build_distance_table_terrain(agms, center_densified: list, elevations: list
                 "Cumulative Feet": round(cumulative, 2),
                 "Segment Miles": round(d / 5280, 4),
                 "Cumulative Miles": round(cumulative / 5280, 4),
+                "Horiz Seg Miles": round(dh / 5280, 4),
+                "Horiz Cum Miles": round(cum_h / 5280, 4),
             }
         )
-    return pd.DataFrame(rows), cum[-1]
+    return pd.DataFrame(rows), cum3[-1]
 
 
 def validate_kmz_on_disk(path: str, token: str) -> None:
@@ -904,9 +952,8 @@ def main():
     st.set_page_config(page_title="AGM Terrain Distances", layout="wide")
     st.title("Terrain-Aware AGM Distance Checker")
     st.caption(
-        "Segment lengths are **3D path distance** along the centerline (ground distance + elevation) "
-        "from Mapbox terrain-RGB, bilinear-sampled and lightly smoothed — comparable to measuring a path "
-        "with terrain in Google Earth. This is not plan-only distance."
+        "3D segment miles use **arc-length** along each segment (Haversine A→P + elevation linear in that "
+        "fraction), not planar projection × segment length. **Horiz** columns are ground-only for comparison."
     )
 
     token = _get_mapbox_token()

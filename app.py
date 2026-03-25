@@ -1,5 +1,7 @@
 import io
 import math
+import os
+import sys
 import zipfile
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
@@ -17,8 +19,10 @@ TILE_SIZE = 256
 
 # Centerline segment length: 5 m ≈ 16.4 ft. Balances path fidelity with speed (was 3.28 ft).
 MAX_CENTERLINE_SEGMENT_FT = 16.4
-# Sample elevation every this many ft (higher = fewer Mapbox tiles, faster)
+# Sample elevation every this many ft along 2D chainage (higher = fewer Mapbox tiles)
 ELEVATION_SAMPLE_INTERVAL_FT = 2000.0
+# Odd window >= 3; moving average on sampled-then-interpolated elevations to reduce DEM pixel noise (0 = off)
+ELEVATION_SMOOTH_WINDOW = 9
 TERRAIN_MAX_WORKERS = 10
 
 # Polyline merge: endpoints closer than this are treated as one junction (ft)
@@ -175,10 +179,15 @@ def point_on_line(line, proj):
     return (a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]))
 
 
-# -------- STATIONING (TERRAIN-AWARE) --------
+# -------- STATIONING (3D TERRAIN PATH — Google Earth style) --------
 
 
-def compute_stationing(line, elevations):
+def compute_stationing_3d(line, elevations):
+    """Cumulative **slope** distance: each segment = sqrt(horizontal² + Δelev²).
+
+    Horizontal leg uses ellipsoidal great-circle distance (Haversine on WGS84-like sphere) in feet;
+    that is the ground distance between vertices, not a separate “Haversine output.”
+    """
     seg_len_3d = []
     for i in range(len(line) - 1):
         h = haversine_ft(*line[i], *line[i + 1])
@@ -205,10 +214,7 @@ def station_at(proj, seg_len_3d, cum):
 
 
 def path_length_along_centerline(proj_a, proj_b, seg_len_3d, total_length):
-    """
-    Distance along the centerline (every bend, terrain) from snapped point A to snapped point B.
-    Sums 3D segment lengths between the two projected points. Uses the shorter of the two directions.
-    """
+    """3D distance along the polyline between two projected points (shorter of two ways on a loop)."""
     idx_a, t_a = int(proj_a[0]), float(proj_a[1])
     idx_b, t_b = int(proj_b[0]), float(proj_b[1])
     idx_a = max(0, min(idx_a, len(seg_len_3d) - 1))
@@ -235,6 +241,20 @@ def path_length_along_centerline(proj_a, proj_b, seg_len_3d, total_length):
         backward += t_a * seg_len_3d[idx_a]
         forward = total_length - backward
         return min(forward, backward)
+
+
+def _smooth_elevations_1d(elev: list[float], window: int) -> list[float]:
+    """Moving average (odd window) to reduce DEM speckle before 3D length accumulation."""
+    if window < 3 or len(elev) < window or (window % 2) == 0:
+        return elev
+    half = window // 2
+    out = []
+    n = len(elev)
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        out.append(float(sum(elev[lo:hi]) / (hi - lo)))
+    return out
 
 
 # ---------------- MAPBOX TERRAIN ----------------
@@ -292,21 +312,48 @@ def _fetch_tile(args):
     return (z, x, y)
 
 
+def _rgb_to_elevation_ft(r, g, b) -> float:
+    meters = -10000.0 + (float(r) * 256.0 * 256.0 + float(g) * 256.0 + float(b)) * 0.1
+    return meters * 3.28084
+
+
+def _elevation_from_img_bilinear(img: Image.Image, px: float, py: float) -> float:
+    """Bilinear sample in tile pixel space (reduces nearest-neighbor DEM chatter vs Google Earth)."""
+    arr = np.asarray(img, dtype=np.float64)
+    h, w = arr.shape[0], arr.shape[1]
+    px = max(0.0, min(float(px), w - 1.001))
+    py = max(0.0, min(float(py), h - 1.001))
+    x0 = int(math.floor(px))
+    y0 = int(math.floor(py))
+    x1 = min(x0 + 1, w - 1)
+    y1 = min(y0 + 1, h - 1)
+    fx = px - x0
+    fy = py - y0
+
+    def el(ix, iy):
+        r, g, b = arr[iy, ix, 0], arr[iy, ix, 1], arr[iy, ix, 2]
+        return _rgb_to_elevation_ft(r, g, b)
+
+    e00 = el(x0, y0)
+    e10 = el(x1, y0)
+    e01 = el(x0, y1)
+    e11 = el(x1, y1)
+    e0 = e00 * (1.0 - fx) + e10 * fx
+    e1 = e01 * (1.0 - fx) + e11 * fx
+    return e0 * (1.0 - fy) + e1 * fy
+
+
 def _elevation_from_tile(lat, lon):
-    """Read elevation at (lat, lon) from already-cached tile. No network."""
+    """Elevation (ft) from cached tile, bilinear. No network."""
     wx, wy = _world_pixel_xy(lat, lon, TILE_ZOOM)
     tx, ty = int(wx // TILE_SIZE), int(wy // TILE_SIZE)
     key = (TILE_ZOOM, tx, ty)
     if key not in tile_cache:
         return None
     img = tile_cache[key]
-    px = img.load()
-    w, h = img.size
-    fx = max(0, min(int(wx - tx * TILE_SIZE), w - 1))
-    fy = max(0, min(int(wy - ty * TILE_SIZE), h - 1))
-    R, G, B, _ = px[fx, fy]
-    meters = -10000 + (R * 256 * 256 + G * 256 + B) * 0.1
-    return meters * 3.28084
+    lx = wx - tx * TILE_SIZE
+    ly = wy - ty * TILE_SIZE
+    return _elevation_from_img_bilinear(img, lx, ly)
 
 
 def elevation_ft(lat, lon, token: str):
@@ -314,17 +361,9 @@ def elevation_ft(lat, lon, token: str):
     tx = int(wx // TILE_SIZE)
     ty = int(wy // TILE_SIZE)
     img = get_tile(TILE_ZOOM, tx, ty, token)
-
-    px = img.load()
-    w, h = img.size
-    fx = int(wx - tx * TILE_SIZE)
-    fy = int(wy - ty * TILE_SIZE)
-    fx = max(0, min(w - 1, fx))
-    fy = max(0, min(h - 1, fy))
-
-    R, G, B, _A = px[fx, fy]
-    meters = -10000 + (R * 256 * 256 + G * 256 + B) * 0.1
-    return meters * 3.28084
+    lx = wx - tx * TILE_SIZE
+    ly = wy - ty * TILE_SIZE
+    return _elevation_from_img_bilinear(img, lx, ly)
 
 
 # ---------------- KML LOAD ----------------
@@ -704,36 +743,11 @@ def _orient_centerline(center, agms):
 
 # ---------------- STREAMLIT ----------------
 
-st.set_page_config(page_title="AGM Terrain Distances", layout="wide")
 
-
-def main():
-    st.title("Terrain-Aware AGM Distance Checker")
-
-    token = _get_mapbox_token()
-    if not token:
-        token = st.text_input("Mapbox token (required for terrain)", type="password", key="token").strip() or None
-
-    upload = st.file_uploader("Upload KMZ/KML", ["kmz", "kml"], key="upload")
-
-    if not upload:
-        st.info("Upload a KMZ or KML file to compute terrain-aware distances between AGMs along the centerline.")
-        return
-
-    try:
-        root = load_kml(upload)
-        agms, center = parse(root)
-    except Exception as e:
-        st.error(f"Failed to read file: {e}")
-        return
-
-    if not agms or not center:
-        st.error("Missing AGMs or Centerline")
-        return
-
+def _prepare_centerline(agms, center):
+    """Orient, dedupe, trim at launcher — shared by Streamlit and CLI validation."""
     center = _orient_centerline(center, agms)
     center = dedupe_centerline(center, min_sep_ft=1.0)
-    # Trim centerline to start at launcher (measure from there, no pre-000).
     anchor = _pick_anchor_agm(agms)
     if anchor and len(center) >= 2:
         _name, alat, alon = anchor
@@ -742,15 +756,11 @@ def main():
         if idx > 0 or t > 0.001:
             pt = point_on_line(center, proj)
             center = [pt] + center[idx + 1 :]
-    if len(center) < 2:
-        st.error("Centerline too short after trim")
-        return
+    return center
 
-    if not token:
-        st.error("Mapbox token missing. Add it to Streamlit secrets or paste it above.")
-        return
 
-    # Terrain: sample elevation every ELEVATION_SAMPLE_INTERVAL_FT, fetch tiles in parallel
+def _terrain_sample_and_elevations(center: list, token: str) -> list[float]:
+    """Sample Mapbox terrain-RGB along centerline; return elevation (ft) at each vertex (same len as center)."""
     cum2d = [0.0]
     for i in range(len(center) - 1):
         cum2d.append(cum2d[-1] + haversine_ft(*center[i], *center[i + 1]))
@@ -780,11 +790,9 @@ def main():
 
     tile_keys = _tile_keys_for_line(sample_pts)
     need = [(*k, token) for k in tile_keys if k not in tile_cache]
-    n_tiles = len(need)
     if need:
-        with st.spinner(f"Fetching {n_tiles} terrain tiles ({TERRAIN_MAX_WORKERS} parallel)..."):
-            with ThreadPoolExecutor(max_workers=TERRAIN_MAX_WORKERS) as ex:
-                list(ex.map(_fetch_tile, need))
+        with ThreadPoolExecutor(max_workers=TERRAIN_MAX_WORKERS) as ex:
+            list(ex.map(_fetch_tile, need))
     sample_elevs = [_elevation_from_tile(lat, lon) for lat, lon in sample_pts]
     if None in sample_elevs:
         sample_elevs = [elevation_ft(lat, lon, token) for lat, lon in sample_pts]
@@ -802,53 +810,144 @@ def main():
         return sample_elevs[-1]
 
     raw_elevations = [interp_elev(cum2d[i]) for i in range(len(center))]
+    if ELEVATION_SMOOTH_WINDOW >= 3:
+        raw_elevations = _smooth_elevations_1d(raw_elevations, ELEVATION_SMOOTH_WINDOW)
+    return raw_elevations
 
-    with st.spinner("Building centerline and computing distances..."):
-        center, elevations = densify_centerline(center, MAX_CENTERLINE_SEGMENT_FT, raw_elevations)
-        seg_len_3d, cum = compute_stationing(center, elevations)
 
-        # Order AGMs by true chainage along the merged centerline (never by numeric label alone).
-        # Unconstrained closest-point projection — "forward-only" projection caused huge errors
-        # when label order disagreed with map order.
-        station_rows = []
-        for i, (name, lat, lon) in enumerate(agms):
-            proj = project_to_line(lat, lon, center)
-            stn = station_at(proj, seg_len_3d, cum)
-            station_rows.append((stn, name, i, lat, lon))
-        station_rows.sort(key=lambda r: (r[0], r[2]))
-        ordered_agms = [(name, lat, lon) for _st, name, _i, lat, lon in station_rows]
+def _densify_with_elevations(center: list, raw_elevations: list) -> tuple[list, list]:
+    res = densify_centerline(center, MAX_CENTERLINE_SEGMENT_FT, raw_elevations)
+    if isinstance(res, tuple):
+        return res[0], res[1]
+    return res, None
 
-        projected = []
-        for name, lat, lon in ordered_agms:
-            proj = project_to_line(lat, lon, center)
-            stn = station_at(proj, seg_len_3d, cum)
-            projected.append((name, proj, stn))
 
-        agm_pos = {name: (lat, lon) for name, lat, lon in ordered_agms}
-        rows = []
-        cumulative = 0.0
-        for i in range(len(projected) - 1):
-            stn_a = projected[i][2]
-            stn_b = projected[i + 1][2]
-            # Ordered by increasing chainage; use station difference (not min around a loop).
-            d = abs(stn_b - stn_a)
-            if d < 1.0 and projected[i][0] in agm_pos and projected[i + 1][0] in agm_pos:
-                a, b = projected[i][0], projected[i + 1][0]
-                d = max(d, haversine_ft(agm_pos[a][0], agm_pos[a][1], agm_pos[b][0], agm_pos[b][1]))
-            cumulative += d
+def _build_distance_table_terrain(agms, center_densified: list, elevations: list):
+    seg_len_3d, cum = compute_stationing_3d(center_densified, elevations)
+    station_rows = []
+    for i, (name, lat, lon) in enumerate(agms):
+        proj = project_to_line(lat, lon, center_densified)
+        stn = station_at(proj, seg_len_3d, cum)
+        station_rows.append((stn, name, i, lat, lon))
+    station_rows.sort(key=lambda r: (r[0], r[2]))
+    ordered_agms = [(name, lat, lon) for _st, name, _i, lat, lon in station_rows]
 
-            rows.append(
-                {
-                    "From": projected[i][0],
-                    "To": projected[i + 1][0],
-                    "Segment Feet": round(d, 2),
-                    "Cumulative Feet": round(cumulative, 2),
-                    "Segment Miles": round(d / 5280, 4),
-                    "Cumulative Miles": round(cumulative / 5280, 4),
-                }
-            )
+    projected = []
+    for name, lat, lon in ordered_agms:
+        proj = project_to_line(lat, lon, center_densified)
+        stn = station_at(proj, seg_len_3d, cum)
+        projected.append((name, proj, stn))
 
-        df = pd.DataFrame(rows)
+    agm_pos = {name: (lat, lon) for name, lat, lon in ordered_agms}
+    rows = []
+    cumulative = 0.0
+    for i in range(len(projected) - 1):
+        stn_a = projected[i][2]
+        stn_b = projected[i + 1][2]
+        d = abs(stn_b - stn_a)
+        if d < 1.0 and projected[i][0] in agm_pos and projected[i + 1][0] in agm_pos:
+            a, b = projected[i][0], projected[i + 1][0]
+            d = max(d, haversine_ft(agm_pos[a][0], agm_pos[a][1], agm_pos[b][0], agm_pos[b][1]))
+        cumulative += d
+        rows.append(
+            {
+                "From": projected[i][0],
+                "To": projected[i + 1][0],
+                "Segment Feet": round(d, 2),
+                "Cumulative Feet": round(cumulative, 2),
+                "Segment Miles": round(d / 5280, 4),
+                "Cumulative Miles": round(cumulative / 5280, 4),
+            }
+        )
+    return pd.DataFrame(rows), cum[-1]
+
+
+def validate_kmz_on_disk(path: str, token: str) -> None:
+    """CLI: print every segment (3D terrain path). Set AGM_VALIDATE_KMZ and MAPBOX_TOKEN."""
+    with open(path, "rb") as f:
+        raw = f.read()
+
+    class _U:
+        name = "file.kmz" if path.lower().endswith(".kmz") else "file.kml"
+
+        def read(self):
+            return raw
+
+    root = load_kml(_U())
+    agms, center = parse(root)
+    if not agms or not center:
+        print("Missing AGMs or Centerline")
+        return
+    center = _prepare_centerline(agms, center)
+    if len(center) < 2:
+        print("Centerline too short after trim")
+        return
+    if not token:
+        print("Set MAPBOX_TOKEN in the environment for terrain validation.")
+        return
+    raw_elev = _terrain_sample_and_elevations(center, token)
+    center_d, elevs = _densify_with_elevations(center, raw_elev)
+    if elevs is None:
+        print("Densify failed to return elevations")
+        return
+    df, total_ft = _build_distance_table_terrain(agms, center_d, elevs)
+    print(f"File: {path}")
+    print(f"Total 3D terrain path length: {total_ft:.2f} ft ({total_ft / 5280:.4f} mi)")
+    print()
+    for _, row in df.iterrows():
+        print(
+            f"{row['From']:>5} -> {row['To']:<5}  {row['Segment Miles']:>8.4f} mi  ({row['Segment Feet']:>10.2f} ft)"
+        )
+
+
+def main():
+    st.set_page_config(page_title="AGM Terrain Distances", layout="wide")
+    st.title("Terrain-Aware AGM Distance Checker")
+    st.caption(
+        "Segment lengths are **3D path distance** along the centerline (ground distance + elevation) "
+        "from Mapbox terrain-RGB, bilinear-sampled and lightly smoothed — comparable to measuring a path "
+        "with terrain in Google Earth. This is not plan-only distance."
+    )
+
+    token = _get_mapbox_token()
+    if not token:
+        token = st.text_input("Mapbox token (required for terrain-RGB elevation)", type="password", key="token").strip() or None
+
+    upload = st.file_uploader("Upload KMZ/KML", ["kmz", "kml"], key="upload")
+
+    if not upload:
+        st.info("Upload a KMZ or KML to compute 3D terrain-aware distances between AGMs along the centerline.")
+        return
+
+    try:
+        root = load_kml(upload)
+        agms, center = parse(root)
+    except Exception as e:
+        st.error(f"Failed to read file: {e}")
+        return
+
+    if not agms or not center:
+        st.error("Missing AGMs or Centerline")
+        return
+
+    center = _prepare_centerline(agms, center)
+    if len(center) < 2:
+        st.error("Centerline too short after trim")
+        return
+
+    if not token:
+        st.error("Mapbox token missing. Add it to Streamlit secrets or paste it above.")
+        return
+
+    with st.spinner("Fetching terrain tiles and computing 3D distances..."):
+        raw_elev = _terrain_sample_and_elevations(center, token)
+        center_d, elevs = _densify_with_elevations(center, raw_elev)
+        if elevs is None:
+            st.error("Internal error: elevations missing after densify")
+            return
+        df, total_ft = _build_distance_table_terrain(agms, center_d, elevs)
+
+    st.metric("Total 3D path length along centerline (mi)", f"{total_ft / 5280:.4f}")
     st.dataframe(df, width="stretch")
 
     st.download_button(
@@ -859,11 +958,22 @@ def main():
     )
 
 
-# Streamlit: run main() only. No self-test on load.
-try:
-    main()
-except Exception as e:
-    st.error(f"App error: {e}")
-    import traceback
+if __name__ == "__main__":
+    v = os.environ.get("AGM_VALIDATE_KMZ")
+    if v:
+        try:
+            validate_kmz_on_disk(v, os.environ.get("MAPBOX_TOKEN", "").strip())
+        except Exception as e:
+            print(f"Validation error: {e}")
+            import traceback
 
-    st.code(traceback.format_exc(), language="text")
+            traceback.print_exc()
+            sys.exit(1)
+        sys.exit(0)
+    try:
+        main()
+    except Exception as e:
+        st.error(f"App error: {e}")
+        import traceback
+
+        st.code(traceback.format_exc(), language="text")

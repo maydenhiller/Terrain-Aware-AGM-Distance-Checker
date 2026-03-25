@@ -27,6 +27,10 @@ TERRAIN_MAX_WORKERS = 10
 
 # Polyline merge: endpoints closer than this are treated as one junction (ft)
 MERGE_ENDPOINT_TOL_FT = 150.0
+# Many KMZs style tiny LineStrings (crosses, ticks) the same red as the pipeline. Merging them inflates
+# chainage vs measuring the main line in Google Earth. Verified on 106A: 200 ft drops 000→010 from ~1.22 mi to ~1.09 mi.
+MIN_RED_LINE_HORIZONTAL_FT = 200.0
+
 SP_PREFIX = "SP"
 
 NEGATIVE_KEYWORDS = [
@@ -525,6 +529,18 @@ def _placemark_style_url(pm, folder, ns):
     return None
 
 
+def _polyline_horizontal_length_ft(pts: list[tuple[float, float]]) -> float:
+    if len(pts) < 2:
+        return 0.0
+    return sum(haversine_ft(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1]) for i in range(len(pts) - 1))
+
+
+def _filter_polylines_by_min_length(
+    segments: list[list[tuple[float, float]]], min_ft: float
+) -> list[list[tuple[float, float]]]:
+    return [s for s in segments if _polyline_horizontal_length_ft(s) >= min_ft]
+
+
 def _dedupe_polylines(segments: list[list[tuple[float, float]]], tol_ft: float = 2.0):
     """Drop duplicate polylines (same vertex count and vertices within tol)."""
     uniq = []
@@ -718,6 +734,12 @@ def parse(root):
     if doc is not None:
         for pm in doc.findall("k:Placemark", ns):
             try_add_red_line(pm, None)
+
+    if centerline_strings and MIN_RED_LINE_HORIZONTAL_FT > 0:
+        filtered = _filter_polylines_by_min_length(centerline_strings, MIN_RED_LINE_HORIZONTAL_FT)
+        if filtered:
+            centerline_strings = filtered
+        # If every red fragment was shorter than min_ft, keep unfiltered so we don't drop the whole line
 
     # Fallback: CENTERLINE folder — any LineString (color may not be red in some exports)
     if not centerline_strings:
@@ -952,8 +974,10 @@ def main():
     st.set_page_config(page_title="AGM Terrain Distances", layout="wide")
     st.title("Terrain-Aware AGM Distance Checker")
     st.caption(
-        "3D segment miles use **arc-length** along each segment (Haversine A→P + elevation linear in that "
-        "fraction), not planar projection × segment length. **Horiz** columns are ground-only for comparison."
+        "Red LineStrings shorter than "
+        f"{MIN_RED_LINE_HORIZONTAL_FT:.0f} ft are ignored — many KMZs duplicate the pipeline style on tiny "
+        "markers; merging those was inflating miles vs Google Earth. "
+        "3D segments use arc-length along each edge (ground A→P + elevation). **Horiz** = ground-only."
     )
 
     token = _get_mapbox_token()

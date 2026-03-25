@@ -21,11 +21,10 @@ MAX_CENTERLINE_SEGMENT_FT = 16.4
 ELEVATION_SAMPLE_INTERVAL_FT = 2000.0
 TERRAIN_MAX_WORKERS = 10
 
-
-ANCHOR_AGM_NAMES = {"000", "launcher", "launcher valve"}
+# Polyline merge: endpoints closer than this are treated as one junction (ft)
+MERGE_ENDPOINT_TOL_FT = 150.0
 SP_PREFIX = "SP"
 
-POSITIVE_KEYWORDS = ["agm", "valve", "tap", "mlv"]
 NEGATIVE_KEYWORDS = [
     "weld",
     "riser",
@@ -127,8 +126,8 @@ def densify_centerline(line, max_seg_ft, elevations=None):
 
 
 def project_to_line(lat, lon, line, min_seg_index=0, min_t=0.0):
-    """Snap (lat, lon) to closest point on centerline. If min_seg_index/min_t given, only consider
-    points at or after that position (so AGMs project forward along the path)."""
+    """Snap (lat, lon) to closest point on centerline. Optional min_seg_index/min_t restrict to
+    'forward' along the polyline (legacy); use defaults for unconstrained closest point."""
     best_dist = float("inf")
     best_index = 0
     best_t = 0.0
@@ -427,6 +426,175 @@ def _is_anchor_agm(name: str) -> bool:
     return False
 
 
+def _coords_from_linestring(ls, ns):
+    coord_node = ls.find("k:coordinates", ns)
+    if coord_node is None or not coord_node.text:
+        return None
+    pts = []
+    for c in coord_node.text.split():
+        lon, lat, *_rest = map(float, c.split(","))
+        pts.append((lat, lon))
+    return pts if len(pts) >= 2 else None
+
+
+def _placemark_style_url(pm, folder, ns):
+    el = pm.find("k:styleUrl", ns)
+    if el is not None and el.text and el.text.strip():
+        return el.text.strip()
+    if folder is not None:
+        el = folder.find("k:styleUrl", ns)
+        if el is not None and el.text and el.text.strip():
+            return el.text.strip()
+    return None
+
+
+def _dedupe_polylines(segments: list[list[tuple[float, float]]], tol_ft: float = 2.0):
+    """Drop duplicate polylines (same vertex count and vertices within tol)."""
+    uniq = []
+    for seg in segments:
+        dup = False
+        for u in uniq:
+            if len(u) != len(seg):
+                continue
+            if all(haversine_ft(a[0], a[1], b[0], b[1]) < tol_ft for a, b in zip(u, seg)):
+                dup = True
+                break
+        if not dup:
+            uniq.append(seg)
+    return uniq
+
+
+def _append_fwd(chain: list, pts: list) -> None:
+    """chain[-1] meets pts[0]; extend with pts[1:] (drop duplicate joint)."""
+    if haversine_ft(chain[-1][0], chain[-1][1], pts[0][0], pts[0][1]) < 1.0:
+        chain.extend(pts[1:])
+    else:
+        chain.extend(pts)
+
+
+def _append_rev(chain: list, pts: list) -> None:
+    """chain[-1] meets pts[-1]; extend backward along pts."""
+    rp = list(reversed(pts))
+    _append_fwd(chain, rp)
+
+
+def _prepend_fwd(chain: list, pts: list) -> None:
+    """pts[-1] meets chain[0]; prepend pts[0]..pts[-2] in order."""
+    if haversine_ft(chain[0][0], chain[0][1], pts[-1][0], pts[-1][1]) < 1.0:
+        for k in range(len(pts) - 2, -1, -1):
+            chain.insert(0, pts[k])
+    else:
+        for k in range(len(pts) - 1, -1, -1):
+            chain.insert(0, pts[k])
+
+
+def _prepend_rev(chain: list, pts: list) -> None:
+    """pts[0] meets chain[0]; prepend pts[1], pts[2], ... before chain."""
+    if haversine_ft(chain[0][0], chain[0][1], pts[0][0], pts[0][1]) < 1.0:
+        for k in range(1, len(pts)):
+            chain.insert(k - 1, pts[k])
+    else:
+        for k in range(len(pts) - 1, -1, -1):
+            chain.insert(0, pts[k])
+
+
+def merge_centerline_segments(
+    segments: list[list[tuple[float, float]]],
+    anchor_lat: float,
+    anchor_lon: float,
+    tol_ft: float = MERGE_ENDPOINT_TOL_FT,
+) -> list[tuple[float, float]]:
+    """
+    Order and stitch multiple LineStrings into one continuous centerline.
+    Extends from both ends of the growing chain so stubs and mainline order correctly.
+    """
+    segs = [list(s) for s in segments if s and len(s) >= 2]
+    segs = _dedupe_polylines(segs)
+    if not segs:
+        return []
+    if len(segs) == 1:
+        seg = segs[0]
+        d0 = haversine_ft(anchor_lat, anchor_lon, seg[0][0], seg[0][1])
+        d1 = haversine_ft(anchor_lat, anchor_lon, seg[-1][0], seg[-1][1])
+        return list(seg) if d0 <= d1 else list(reversed(seg))
+
+    def dist_to_line(pts):
+        proj = project_to_line(anchor_lat, anchor_lon, pts)
+        pt = point_on_line(pts, proj)
+        return haversine_ft(anchor_lat, anchor_lon, pt[0], pt[1])
+
+    def length_ft(pts):
+        return sum(
+            haversine_ft(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1]) for i in range(len(pts) - 1)
+        )
+
+    near = [pts for pts in segs if dist_to_line(pts) <= max(100.0, tol_ft * 3)]
+    start_seg = max(near, key=length_ft) if near else min(segs, key=dist_to_line)
+    d0 = haversine_ft(anchor_lat, anchor_lon, start_seg[0][0], start_seg[0][1])
+    d1 = haversine_ft(anchor_lat, anchor_lon, start_seg[-1][0], start_seg[-1][1])
+    chain = list(start_seg) if d0 <= d1 else list(reversed(start_seg))
+    remaining = [p for p in segs if p is not start_seg]
+
+    def best_connection(chain_pts, cand, limit: float | None):
+        best_d = float("inf")
+        best_how = None
+        opts = [
+            (haversine_ft(chain_pts[-1][0], chain_pts[-1][1], cand[0][0], cand[0][1]), "append_fwd"),
+            (haversine_ft(chain_pts[-1][0], chain_pts[-1][1], cand[-1][0], cand[-1][1]), "append_rev"),
+            (haversine_ft(chain_pts[0][0], chain_pts[0][1], cand[-1][0], cand[-1][1]), "prepend_fwd"),
+            (haversine_ft(chain_pts[0][0], chain_pts[0][1], cand[0][0], cand[0][1]), "prepend_rev"),
+        ]
+        for d, how in opts:
+            if limit is not None and d > limit:
+                continue
+            if d < best_d:
+                best_d, best_how = d, how
+        return best_d, best_how
+
+    while remaining:
+        best_i = None
+        best_d = float("inf")
+        best_how = None
+        for i, pts in enumerate(remaining):
+            d, how = best_connection(chain, pts, tol_ft)
+            if how is not None and d < best_d:
+                best_d, best_i, best_how = d, i, how
+        if best_i is None:
+            break
+        pts = remaining.pop(best_i)
+        if best_how == "append_fwd":
+            _append_fwd(chain, pts)
+        elif best_how == "append_rev":
+            _append_rev(chain, pts)
+        elif best_how == "prepend_fwd":
+            _prepend_fwd(chain, pts)
+        else:
+            _prepend_rev(chain, pts)
+
+    if remaining:
+        while remaining:
+            best_i = None
+            best_d = float("inf")
+            best_how = None
+            for i, pts in enumerate(remaining):
+                d, how = best_connection(chain, pts, None)
+                if how is not None and d < best_d:
+                    best_d, best_i, best_how = d, i, how
+            if best_i is None:
+                break
+            pts = remaining.pop(best_i)
+            if best_how == "append_fwd":
+                _append_fwd(chain, pts)
+            elif best_how == "append_rev":
+                _append_rev(chain, pts)
+            elif best_how == "prepend_fwd":
+                _prepend_fwd(chain, pts)
+            else:
+                _prepend_rev(chain, pts)
+
+    return chain
+
+
 def parse(root):
     ns = {"k": "http://www.opengis.net/kml/2.2"}
     agms = []
@@ -435,34 +603,24 @@ def parse(root):
     style_colors = _get_style_colors(root, ns)
     stylemap_normal = _get_stylemap_normal_style_url(root, ns)
 
+    def try_add_red_line(pm, folder):
+        ls = pm.find("k:LineString", ns)
+        if ls is None:
+            return
+        style_url = _placemark_style_url(pm, folder, ns)
+        line_color = _resolve_line_color(style_url, style_colors, stylemap_normal) if style_url else None
+        if line_color is None or not _is_red_line_color(line_color):
+            return
+        pts = _coords_from_linestring(ls, ns)
+        if pts:
+            centerline_strings.append(pts)
+
     for folder in root.findall(".//k:Folder", ns):
-        name = folder.find("k:name", ns)
-        if name is None or not name.text:
-            continue
+        fname_el = folder.find("k:name", ns)
+        fname = fname_el.text.lower() if fname_el is not None and fname_el.text else ""
 
-        fname = name.text.lower()
-
-        # Red LineString = actual pipeline (check every folder; CENTERLINE folder may hold access/blue)
         for pm in folder.findall(".//k:Placemark", ns):
-            ls = pm.find("k:LineString", ns)
-            if ls is None:
-                continue
-            style_url_el = pm.find("k:styleUrl", ns)
-            if style_url_el is None or not style_url_el.text:
-                style_url_el = folder.find("k:styleUrl", ns)
-            style_url = style_url_el.text.strip() if style_url_el is not None and style_url_el.text else None
-            line_color = _resolve_line_color(style_url, style_colors, stylemap_normal) if style_url else None
-            if line_color is None or not _is_red_line_color(line_color):
-                continue
-            coord_node = ls.find("k:coordinates", ns)
-            if coord_node is None or not coord_node.text:
-                continue
-            pts = []
-            for c in coord_node.text.split():
-                lon, lat, *_rest = map(float, c.split(","))
-                pts.append((lat, lon))
-            if len(pts) >= 2:
-                centerline_strings.append(pts)
+            try_add_red_line(pm, folder)
 
         if "agm" in fname:
             for p in folder.findall(".//k:Placemark", ns):
@@ -470,82 +628,45 @@ def parse(root):
                 coords = p.find(".//k:coordinates", ns)
                 if pname is None or coords is None or not pname.text or not coords.text:
                     continue
-
+                if p.find("k:LineString", ns) is not None:
+                    continue
                 agm_name = pname.text.strip()
                 if not _include_agm(agm_name):
                     continue
-
                 lon, lat, *_rest = map(float, coords.text.split(","))
                 agms.append((agm_name, lat, lon))
 
-    # Fallback: if no red line found, use CENTERLINE folder (may be access/blue if mislabeled)
+    # Document-level Placemarks (not always inside a Folder)
+    doc = root.find("k:Document", ns)
+    if doc is not None:
+        for pm in doc.findall("k:Placemark", ns):
+            try_add_red_line(pm, None)
+
+    # Fallback: CENTERLINE folder — any LineString (color may not be red in some exports)
     if not centerline_strings:
         for folder in root.findall(".//k:Folder", ns):
             name = folder.find("k:name", ns)
             if name is None or not name.text or "center" not in name.text.lower():
                 continue
             for ls in folder.findall(".//k:LineString", ns):
-                coord_node = ls.find("k:coordinates", ns)
-                if coord_node is None or not coord_node.text:
-                    continue
-                pts = []
-                for c in coord_node.text.split():
-                    lon, lat, *_rest = map(float, c.split(","))
-                    pts.append((lat, lon))
-                if len(pts) >= 2:
+                pts = _coords_from_linestring(ls, ns)
+                if pts:
                     centerline_strings.append(pts)
 
-    center = []
+    center: list[tuple[float, float]] = []
     if centerline_strings and agms:
         anchor = _pick_anchor_agm(agms)
         if anchor:
             _name, alat, alon = anchor
-            # Pick the segment the launcher lies on. If several are close, use the longest (main line not stub).
-            def dist_to_line(pts):
-                proj = project_to_line(alat, alon, pts)
-                pt = point_on_line(pts, proj)
-                return haversine_ft(alat, alon, pt[0], pt[1])
-            def length_ft(pts):
-                return sum(haversine_ft(pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1]) for i in range(len(pts)-1))
-            near = [pts for pts in centerline_strings if dist_to_line(pts) <= 100.0]
-            start_line = max(near, key=length_ft) if near else min(centerline_strings, key=dist_to_line)
-            d0 = haversine_ft(alat, alon, start_line[0][0], start_line[0][1])
-            d1 = haversine_ft(alat, alon, start_line[-1][0], start_line[-1][1])
-            center = list(start_line) if d0 <= d1 else list(reversed(start_line))
-            remaining = [p for p in centerline_strings if p is not start_line]
-            tol_ft = 150.0  # connect segments that share a junction (stub to main line)
-            anchor_ft = 200.0
-            while remaining:
-                end_pt = center[-1]
-                best = None
-                best_dist = tol_ft
-                append_forward = True
-                for pts in remaining:
-                    d_start = haversine_ft(end_pt[0], end_pt[1], pts[0][0], pts[0][1])
-                    d_end = haversine_ft(end_pt[0], end_pt[1], pts[-1][0], pts[-1][1])
-                    if d_start < best_dist:
-                        if haversine_ft(alat, alon, pts[-1][0], pts[-1][1]) > anchor_ft:
-                            best_dist, best, append_forward = d_start, pts, True
-                    if d_end < best_dist:
-                        if haversine_ft(alat, alon, pts[0][0], pts[0][1]) > anchor_ft:
-                            best_dist, best, append_forward = d_end, pts, False
-                if best is None:
-                    break
-                if append_forward:
-                    center.extend(best[1:])
-                else:
-                    center.extend(list(reversed(best))[1:])
-                remaining = [p for p in remaining if p is not best]
+            center = merge_centerline_segments(centerline_strings, alat, alon)
         else:
-            center = list(centerline_strings[0])
+            merged = merge_centerline_segments(centerline_strings, centerline_strings[0][0][0], centerline_strings[0][0][1])
+            center = merged if merged else list(centerline_strings[0])
     elif centerline_strings:
-        center = list(centerline_strings[0])
+        merged = merge_centerline_segments(centerline_strings, centerline_strings[0][0][0], centerline_strings[0][0][1])
+        center = merged if merged else list(centerline_strings[0])
 
     return agms, center
-
-
-def _is_numeric_label(name: str) -> bool:
-    return name.strip().isdigit()
 
 
 def _pick_anchor_agm(agms):
@@ -585,6 +706,7 @@ def _orient_centerline(center, agms):
 
 st.set_page_config(page_title="AGM Terrain Distances", layout="wide")
 
+
 def main():
     st.title("Terrain-Aware AGM Distance Checker")
 
@@ -619,7 +741,7 @@ def main():
         idx, t = int(proj[0]), float(proj[1])
         if idx > 0 or t > 0.001:
             pt = point_on_line(center, proj)
-            center = [pt] + center[idx + 1:]
+            center = [pt] + center[idx + 1 :]
     if len(center) < 2:
         st.error("Centerline too short after trim")
         return
@@ -684,22 +806,23 @@ def main():
     with st.spinner("Building centerline and computing distances..."):
         center, elevations = densify_centerline(center, MAX_CENTERLINE_SEGMENT_FT, raw_elevations)
         seg_len_3d, cum = compute_stationing(center, elevations)
-        total_length = cum[-1]
 
-        all_numeric = all(_is_numeric_label(name) for name, _, _ in agms)
-        if all_numeric:
-            ordered_agms = sorted(agms, key=lambda x: int(x[0].strip()))
-        else:
-            pre = [(n, station_at(project_to_line(lat, lon, center), seg_len_3d, cum)) for n, lat, lon in agms]
-            ordered_agms = sorted(agms, key=lambda a: next(s for n, s in pre if n == a[0]))
+        # Order AGMs by true chainage along the merged centerline (never by numeric label alone).
+        # Unconstrained closest-point projection — "forward-only" projection caused huge errors
+        # when label order disagreed with map order.
+        station_rows = []
+        for i, (name, lat, lon) in enumerate(agms):
+            proj = project_to_line(lat, lon, center)
+            stn = station_at(proj, seg_len_3d, cum)
+            station_rows.append((stn, name, i, lat, lon))
+        station_rows.sort(key=lambda r: (r[0], r[2]))
+        ordered_agms = [(name, lat, lon) for _st, name, _i, lat, lon in station_rows]
 
         projected = []
-        min_idx, min_t = 0, 0.0
         for name, lat, lon in ordered_agms:
-            proj = project_to_line(lat, lon, center, min_seg_index=min_idx, min_t=min_t)
+            proj = project_to_line(lat, lon, center)
             stn = station_at(proj, seg_len_3d, cum)
             projected.append((name, proj, stn))
-            min_idx, min_t = int(proj[0]), float(proj[1])
 
         agm_pos = {name: (lat, lon) for name, lat, lon in ordered_agms}
         rows = []
@@ -707,6 +830,7 @@ def main():
         for i in range(len(projected) - 1):
             stn_a = projected[i][2]
             stn_b = projected[i + 1][2]
+            # Ordered by increasing chainage; use station difference (not min around a loop).
             d = abs(stn_b - stn_a)
             if d < 1.0 and projected[i][0] in agm_pos and projected[i + 1][0] in agm_pos:
                 a, b = projected[i][0], projected[i + 1][0]
@@ -741,4 +865,5 @@ try:
 except Exception as e:
     st.error(f"App error: {e}")
     import traceback
+
     st.code(traceback.format_exc(), language="text")

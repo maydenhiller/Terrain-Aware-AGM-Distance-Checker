@@ -27,6 +27,13 @@ TERRAIN_MAX_WORKERS = 10
 
 # Polyline merge: endpoints closer than this are treated as one junction (ft)
 MERGE_ENDPOINT_TOL_FT = 150.0
+# AGMs (e.g. launcher/receiver trap piping) often sit just beyond where the surveyed centerline
+# LineString actually starts/ends. Without this, every AGM beyond the mapped endpoint snaps to the
+# exact same point (station 0 or station = total length), and the table sorts them by whatever order
+# they happened to appear in the KML instead of their true position — the out-of-order/backwards bug.
+# Allow the first/last centerline segment to extrapolate a bounded distance so those AGMs still get a
+# distinct, correctly-ordered station.
+MAX_ENDPOINT_EXTRAPOLATION_FT = 1000.0
 # Many KMZs style tiny LineStrings (crosses, ticks) the same red as the pipeline. Merging them inflates
 # chainage vs measuring the main line in Google Earth. Verified on 106A: 200 ft drops 000→010 from ~1.22 mi to ~1.09 mi.
 MIN_RED_LINE_HORIZONTAL_FT = 200.0
@@ -133,14 +140,21 @@ def densify_centerline(line, max_seg_ft, elevations=None):
 # -------- PROJECT POINT ONTO LINE SEGMENTS --------
 
 
-def project_to_line(lat, lon, line, min_seg_index=0, min_t=0.0):
+def project_to_line(lat, lon, line, min_seg_index=0, min_t=0.0, extrapolate_ends=True):
     """Snap (lat, lon) to closest point on centerline. Optional min_seg_index/min_t restrict to
-    'forward' along the polyline (legacy); use defaults for unconstrained closest point."""
+    'forward' along the polyline (legacy); use defaults for unconstrained closest point.
+
+    extrapolate_ends: when True (default), the first and last segments are allowed to project
+    slightly outside [0, 1] (bounded by MAX_ENDPOINT_EXTRAPOLATION_FT) so AGMs that sit just beyond
+    the mapped centerline's start/end (common for launcher/receiver trap piping) still resolve to a
+    distinct point instead of all collapsing onto the same endpoint vertex.
+    """
     best_dist = float("inf")
     best_index = 0
     best_t = 0.0
+    n_segs = len(line) - 1
 
-    for i in range(len(line) - 1):
+    for i in range(n_segs):
         if i < min_seg_index:
             continue
         if i == min_seg_index and min_t >= 1.0:
@@ -159,7 +173,14 @@ def project_to_line(lat, lon, line, min_seg_index=0, min_t=0.0):
             t = 0.0
         else:
             t = float(np.dot(P - A, AB) / denom)
-            t = max(0.0, min(1.0, t))
+            t_lo, t_hi = 0.0, 1.0
+            if extrapolate_ends:
+                seg_ft = math.sqrt(denom)
+                if i == 0 and seg_ft > 0:
+                    t_lo = -MAX_ENDPOINT_EXTRAPOLATION_FT / seg_ft
+                if i == n_segs - 1 and seg_ft > 0:
+                    t_hi = 1.0 + MAX_ENDPOINT_EXTRAPOLATION_FT / seg_ft
+            t = max(t_lo, min(t_hi, t))
         if i == min_seg_index and t < min_t - 1e-9:
             continue
 
@@ -176,9 +197,11 @@ def project_to_line(lat, lon, line, min_seg_index=0, min_t=0.0):
 
 
 def point_on_line(line, proj):
-    """Return (lat, lon) at segment index and t in [0,1]."""
+    """Return (lat, lon) at segment index and t. t is normally in [0,1]; project_to_line may return
+    a slightly out-of-range t on the first/last segment (bounded extrapolation), which is honored
+    here so callers (station_at_3d/station_at_horizontal) can compute a correctly signed offset."""
     idx = max(0, min(int(proj[0]), len(line) - 2))
-    t = max(0.0, min(1.0, float(proj[1])))
+    t = float(proj[1])
     a, b = line[idx], line[idx + 1]
     return (a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]))
 
@@ -206,12 +229,19 @@ def compute_stationing_3d(line, elevations):
 
 def station_at_3d(proj, line, elevations, cum_vertex):
     """3D chainage to projected point. Uses horizontal arc length along each segment (Haversine A→P),
-    not planar projection parameter × segment length — that mismatch inflated segment gaps vs Google Earth."""
-    idx, _t = proj
+    not planar projection parameter × segment length — that mismatch inflated segment gaps vs Google Earth.
+
+    proj's t is normally in [0,1]; project_to_line may return a bounded out-of-range t on the very
+    first/last segment (see MAX_ENDPOINT_EXTRAPOLATION_FT), in which case the returned station goes
+    below 0 (before the centerline start) or above the total length (past the end) instead of
+    clamping to the endpoint — that clamping is what caused AGMs beyond the mapped centerline to tie
+    at the same station and sort out of order."""
+    idx, t = proj
     n = len(line)
     if n < 2:
         return 0.0
     idx = int(idx)
+    t = float(t)
     idx = max(0, min(idx, n - 2))
     a = line[idx]
     b = line[idx + 1]
@@ -222,19 +252,28 @@ def station_at_3d(proj, line, elevations, cum_vertex):
     if H < 1e-6:
         return cum_vertex[idx]
     h_ap = haversine_ft(a[0], a[1], p[0], p[1])
-    frac = min(1.0, max(0.0, h_ap / H))
+    if t < 0.0:
+        # p is on the far side of A from B — signed distance is negative (before the centerline start).
+        h_ap = -h_ap
+        frac = t
+    else:
+        frac = h_ap / H
     zp = za + frac * (zb - za)
     partial_3d = math.sqrt(h_ap * h_ap + (zp - za) * (zp - za))
+    if h_ap < 0:
+        partial_3d = -partial_3d
     return cum_vertex[idx] + partial_3d
 
 
 def station_at_horizontal(proj, line, cum_vertex_2d):
-    """Horizontal chainage to projected point (for comparison column)."""
-    idx, _t = proj
+    """Horizontal chainage to projected point (for comparison column). See station_at_3d for the
+    sign handling used when t extrapolates past the centerline's first/last segment."""
+    idx, t = proj
     n = len(line)
     if n < 2:
         return 0.0
     idx = int(idx)
+    t = float(t)
     idx = max(0, min(idx, n - 2))
     a = line[idx]
     b = line[idx + 1]
@@ -243,7 +282,9 @@ def station_at_horizontal(proj, line, cum_vertex_2d):
     if H < 1e-6:
         return cum_vertex_2d[idx]
     h_ap = haversine_ft(a[0], a[1], p[0], p[1])
-    return cum_vertex_2d[idx] + min(H, max(0.0, h_ap))
+    if t < 0.0:
+        h_ap = -h_ap
+    return cum_vertex_2d[idx] + h_ap
 
 
 def compute_stationing_2d_cum(line):
@@ -496,15 +537,26 @@ def _include_agm(name: str) -> bool:
     return True
 
 
-def _is_anchor_agm(name: str) -> bool:
+def _anchor_agm_priority(name: str) -> int | None:
+    """Rank how well an AGM name identifies the launcher (station-0 reference point). Lower is
+    better; None means the name doesn't look like a launcher AGM at all.
+
+    Real-world KMZs rarely have a bare 'Launcher' or '000' placemark — they instead have several
+    launcher-assembly components ('Launcher Oversize', 'Launcher Pigsig', 'Launcher Pull Port', ...).
+    Those all sit within a few feet of each other, so any one of them is a fine anchor; without this
+    fallback tier _pick_anchor_agm returned None for such files, which skipped centerline
+    orientation/trimming entirely and left the resulting direction up to chance — a second source of
+    the 'measures backwards' bug alongside the endpoint-extrapolation issue."""
     lower = name.strip().lower()
-    if lower == "000":
-        return True
     if "launch valve" in lower or "launcher valve" in lower:
-        return True
+        return 0
+    if lower == "000":
+        return 1
     if lower == "launcher":
-        return True
-    return False
+        return 2
+    if lower.startswith("launcher"):
+        return 3
+    return None
 
 
 def _coords_from_linestring(ls, ns):
@@ -771,14 +823,8 @@ def parse(root):
 def _pick_anchor_agm(agms):
     ranked = []
     for n, lat, lon in agms:
-        lower = n.strip().lower()
-        if "launch valve" in lower or "launcher valve" in lower:
-            priority = 0
-        elif lower == "000":
-            priority = 1
-        elif lower == "launcher":
-            priority = 2
-        else:
+        priority = _anchor_agm_priority(n)
+        if priority is None:
             continue
         ranked.append((priority, n, lat, lon))
 

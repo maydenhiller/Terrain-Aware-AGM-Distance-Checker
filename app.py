@@ -44,7 +44,9 @@ NEGATIVE_KEYWORDS = [
     "weld",
     "riser",
     "launch bo",
+    "launcher bo",
     "launch blowoff",
+    "launcher blowoff",
     "launch door",
     "pig sig",
     "u/s blowoff",
@@ -546,7 +548,15 @@ def _anchor_agm_priority(name: str) -> int | None:
     Those all sit within a few feet of each other, so any one of them is a fine anchor; without this
     fallback tier _pick_anchor_agm returned None for such files, which skipped centerline
     orientation/trimming entirely and left the resulting direction up to chance — a second source of
-    the 'measures backwards' bug alongside the endpoint-extrapolation issue."""
+    the 'measures backwards' bug alongside the endpoint-extrapolation issue.
+
+    Never anchor on a name that _include_agm() would exclude (e.g. 'Launcher Blowoff', 'Launcher
+    Weld') — those are non-AGM launcher-assembly components, not measurement points, and using one
+    as the station-0 reference would orient/trim the centerline to the wrong spot. This is checked
+    here in addition to the NEGATIVE_KEYWORDS list so a future keyword-list gap can't silently turn
+    an excluded component into the anchor."""
+    if not _include_agm(name):
+        return None
     lower = name.strip().lower()
     if "launch valve" in lower or "launcher valve" in lower:
         return 0

@@ -1,6 +1,7 @@
 import io
 import math
 import os
+import re
 import sys
 import zipfile
 import xml.etree.ElementTree as ET
@@ -44,7 +45,9 @@ NEGATIVE_KEYWORDS = [
     "weld",
     "riser",
     "launch bo",
+    "launcher bo",
     "launch blowoff",
+    "launcher blowoff",
     "launch door",
     "pig sig",
     "u/s blowoff",
@@ -546,7 +549,15 @@ def _anchor_agm_priority(name: str) -> int | None:
     Those all sit within a few feet of each other, so any one of them is a fine anchor; without this
     fallback tier _pick_anchor_agm returned None for such files, which skipped centerline
     orientation/trimming entirely and left the resulting direction up to chance — a second source of
-    the 'measures backwards' bug alongside the endpoint-extrapolation issue."""
+    the 'measures backwards' bug alongside the endpoint-extrapolation issue.
+
+    Never anchor on a name that _include_agm() would exclude (e.g. 'Launcher Blowoff', 'Launcher
+    Weld') — those are non-AGM launcher-assembly components, not measurement points, and using one
+    as the station-0 reference would orient/trim the centerline to the wrong spot. This is checked
+    here in addition to the NEGATIVE_KEYWORDS list so a future keyword-list gap can't silently turn
+    an excluded component into the anchor."""
+    if not _include_agm(name):
+        return None
     lower = name.strip().lower()
     if "launch valve" in lower or "launcher valve" in lower:
         return 0
@@ -557,6 +568,15 @@ def _anchor_agm_priority(name: str) -> int | None:
     if lower.startswith("launcher"):
         return 3
     return None
+
+
+def _agm_station_number(name: str) -> float | None:
+    """Pull the leading reference-point/station number out of an AGM name, e.g. 'RP 0000 PFA' ->
+    0.0, 'RP 0140 AGM' -> 140.0, 'XC-001' -> 1.0. Returns None if the name has no digits."""
+    match = re.search(r"\d+(?:\.\d+)?", name)
+    if not match:
+        return None
+    return float(match.group())
 
 
 def _coords_from_linestring(ls, ns):
@@ -821,6 +841,19 @@ def parse(root):
 
 
 def _pick_anchor_agm(agms):
+    """Pick the AGM to use as the station-0 reference point, which determines both which way the
+    centerline gets oriented and where it gets trimmed. See _anchor_agm_priority for the
+    'Launcher ...'-keyword tiers.
+
+    Not every KMZ names its launcher-side AGMs with 'Launcher' at all — some use a plain
+    reference-point/milepost numbering scheme instead (e.g. 'RP 0000 PFA', 'RP 0005 PFA', ...,
+    'RP 0160 PFA', with no placemark named 'Launcher' or '000' anywhere). Without any keyword
+    anchor, _pick_anchor_agm used to return None, which skipped orientation entirely and left the
+    centerline in whatever direction it happened to be digitized in — for one such file this
+    produced a fully reversed, backwards result (station 0 at the RP 0160 end instead of RP 0000).
+    As a last-resort fallback, use the AGM whose name contains the smallest station number:
+    industry numbering conventions count up from the origin/launcher end, so the lowest-numbered
+    AGM is the best available proxy for station 0 when no launcher keyword is present."""
     ranked = []
     for n, lat, lon in agms:
         priority = _anchor_agm_priority(n)
@@ -828,11 +861,23 @@ def _pick_anchor_agm(agms):
             continue
         ranked.append((priority, n, lat, lon))
 
-    if not ranked:
+    if ranked:
+        ranked.sort(key=lambda x: x[0])
+        _prio, n, lat, lon = ranked[0]
+        return n, lat, lon
+
+    numbered = []
+    for n, lat, lon in agms:
+        if not _include_agm(n):
+            continue
+        num = _agm_station_number(n)
+        if num is not None:
+            numbered.append((num, n, lat, lon))
+    if not numbered:
         return None
 
-    ranked.sort(key=lambda x: x[0])
-    _prio, n, lat, lon = ranked[0]
+    numbered.sort(key=lambda x: x[0])
+    _num, n, lat, lon = numbered[0]
     return n, lat, lon
 
 
